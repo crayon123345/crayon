@@ -86,3 +86,8 @@ crayon-goals-v1
   substring matching then needs a more specific reference.
 - Step references must be non-empty: an empty/whitespace step reference
   refuses with zero effects instead of guessing a step.
+- Reactivating a closed goal (abandoned/done -> active/paused) RE-ENTERS
+  the live set and therefore passes through the live-cap check: at 100
+  live goals the transition refuses with zero effects and the goal keeps
+  its closed status. Closed goals are never silently dropped - make room
+  first, then reactivate.
