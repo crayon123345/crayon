@@ -68,16 +68,37 @@ automation of any personal number, no paid routes.
   failed key requires retry=True - a deliberate act that increments
   attempts and preserves the full prior-attempt history atomically inside
   the claim.
-- PER-CODE FAILURE CLASSIFICATION: 4xx failures are classified
-  definitive vs retryable by META ERROR CODE (not by status class),
-  grounded in the official Cloud API error-codes reference
-  (https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes):
-  codes whose official guidance says "try again later/wait and retry"
-  (80007, 130429, 131048, 131056, 131064, 133016, 131000) are retryable;
-  do-not-retry/fix-first codes (incl. 130403, 131047, 131050, 131030,
-  132001, 141006, 141010) are definitive; UNLISTED codes default to
-  definitive (fail closed). The class is recorded on the outbox record
-  and carried in the error guidance.
+- PER-CODE FAILURE CLASSIFICATION: 4xx failures are classified by META
+  ERROR CODE (not by status class), grounded in the official Cloud API
+  error-codes reference
+  (https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes,
+  live-checked 2026-10-10):
+  RETRYABLE - the reference's own line says try-again-later:
+  "80007 ... Try again later or reduce the frequency or amount of API
+  queries the app is making."; "130429 ... Try again later or reduce the
+  frequency with which the app sends messages."; "131056 ... Wait and
+  retry the operation, if you intend to send messages to the same phone
+  number."; "131000 Message failed to send due to an unknown error. Try
+  again. If the error persists, open a Direct Support ticket." (also
+  131048/131064/133016, whose limits lift).
+  DEFINITIVE - the reference says do-not-retry or fix-the-cause:
+  "130403 ... Do not retry. Unblock the WhatsApp user to resume sending
+  messages to them."; "131050 ... Do not retry sending messages to this
+  user as they will not be received."; "131047 ... Send the recipient a
+  template message instead."; "131049 ... Doing so will only result in
+  another error response..." (plus parameter/permission/config codes:
+  100, 130472, 131005, 131008, 131009, 131021, 131026, 131030, 131042,
+  131045, 131051, 132001).
+  UNKNOWN - codes the reference does NOT clearly classify: NO RETRY
+  PERMITTED, not even an explicit one (unknown_failure_no_retry); the
+  failure is diagnosed from the actual Meta response before any resend.
+  141006 and 141010 are in this bucket: neither code appears in the
+  current error-codes reference (live-checked 2026-10-10), so the
+  reference supplies no do-not-retry line for them. The card-free
+  141006 guidance above comes from the Cloud API overview "Test
+  resources" section (quoted there), NOT from the error-codes reference.
+  The class is recorded on the outbox record and carried in the error
+  guidance.
 - Durable outbox with ATOMIC CLAIM and ATOMIC PUBLISH: exclusive flock on
   a sidecar lock file around read-modify-write, write-temp-then-rename
   with fsync(file)+fsync(dir), reload on every op. FAILS CLOSED
@@ -105,12 +126,15 @@ automation of any personal number, no paid routes.
   all (verified: exactly one locked write for a multi-message batch).
   Dedupe by message id over the retry horizon is PERSISTED (survives
   restart, tested). Status receipts are persisted DURABLY as rcpt:<wamid>
-  rows and never open windows; RECONCILIATION BOUNDARY: the adapter only
-  persists raw receipts and exposes receipt(wamid)/statuses - matching
-  receipts to outbox records and resolving 'unknown' sends is the
-  canonical engine's job at activation. Media messages normalize with
-  their type and NO fetched content: media download is an explicit
-  SCAFFOLD LIMITATION (no media fetch exists).
+  rows and never open windows.
+- !!! RECEIPT STORAGE IS NOT RECONCILIATION !!! The durable raw receipt
+  rows (rcpt:<wamid>, exposed via receipt(wamid)/statuses) are ONLY
+  storage. The adapter performs NO reconciliation: matching receipts to
+  outbox records, confirming delivery of 'unknown' sends, or turning a
+  receipt into any send decision is EXCLUSIVELY the canonical engine's
+  job at activation. A stored receipt never changes adapter behavior.
+  Media messages normalize with their type and NO fetched content: media
+  download is an explicit SCAFFOLD LIMITATION (no media fetch exists).
 - The 24h service window is MONOTONIC and PERSISTED: an older-timestamped
   inbound only ever extends a window forward - it can never regress or
   close a newer open window (tested at T vs T-1h, and against clock
@@ -124,7 +148,7 @@ Activation gates live with the canonical engine.
 
 ## Tests
 
-`pytest ports/whatsapp` - 66 synthetic tests, the review-fix repros
+`pytest ports/whatsapp` - 69 synthetic tests, the review-fix repros
 counting EFFECTS (transport calls), not just state: owner-verified
 recipient binding + cap, window logic, template vs free-form, 141006
 card-free guidance, 131000-as-generic-unknown, signature validation,
@@ -159,4 +183,8 @@ definitive, 1 unlisted-fail-closed); whole-batch application in exactly
 ONE locked store write (spy-verified) with dedupe+window atomic, and a
 rejected batch leaving the store byte-identical; status receipts durable
 across a fresh instance on the same store file (receipt lookup by wamid,
-still no window).
+still no window). Classification-tightening repros: unknown-class
+(141006/141010/unlisted) failures refuse EVEN an explicit retry
+(unknown_failure_no_retry, zero further effects), and the parametrized
+per-code matrix now asserts retryable/definitive/unknown across 9
+codes.

@@ -711,7 +711,9 @@ def test_failed_key_changed_content_conflict_no_overwrite_no_second_effect():
     (131047, "definitive"),    # send a template instead
     (131030, "definitive"),    # not in allowed list
     (131050, "definitive"),    # "Do not retry"
-    (139999, "definitive"),    # unlisted code fails closed
+    (139999, "unknown"),       # unlisted code: unknown, NO retry permitted
+    (141006, "unknown"),       # absent from the current error-codes ref
+    (141010, "unknown"),       # absent from the current error-codes ref
 ])
 def test_failure_classified_per_meta_error_code(code, klass):
     m, a = make(fail={ME: code})
@@ -762,6 +764,19 @@ def test_rejected_batch_writes_nothing(tmp_path):
 
 
 # -- 5: durable receipts + reconciliation boundary ---------------------------
+
+def test_unknown_class_failure_never_retried_even_explicitly():
+    m, a = make(fail={ME: 141006})
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world", idempotency_key="k-unk")
+    assert "UNKNOWN" in e.value.guidance
+    assert a.outbox_record("k-unk")["failure_class"] == "unknown"
+    with pytest.raises(WhatsAppError) as e2:
+        a.send_template(ME, "hello_world", idempotency_key="k-unk",
+                        retry=True)
+    assert e2.value.code == "unknown_failure_no_retry"
+    assert len(m.calls) == 1         # zero further effects, ever
+
 
 def test_status_receipts_durable_across_restart(tmp_path):
     path = str(tmp_path / "outbox.json")

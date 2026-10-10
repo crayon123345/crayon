@@ -95,15 +95,22 @@ DEFINITIVE_CODES = frozenset({
     131050,   # user opted out of marketing: "Do not retry"
     131051,   # unsupported message type
     132001,   # template does not exist in this language
-    141006,   # business-level send block
-    141010,   # business not verified
 })
+# 141006 (business-level send block) and 141010 (business not verified)
+# do NOT appear in the current error-codes reference (live-checked) - the
+# reference gives no do-not-retry line for them, so they are UNKNOWN:
+# no retry permitted. Their card-free guidance below still applies.
 
 
 def failure_class(code):
-    """'retryable' or 'definitive' per the official error-codes reference;
-    unlisted codes are DEFINITIVE (fail closed)."""
-    return "retryable" if code in RETRYABLE_CODES else "definitive"
+    """'retryable' / 'definitive' / 'unknown' per the official error-codes
+    reference. Unlisted codes are UNKNOWN - no retry permitted (fail
+    closed with an honest label, not an unsupported 'definitive')."""
+    if code in RETRYABLE_CODES:
+        return "retryable"
+    if code in DEFINITIVE_CODES:
+        return "definitive"
+    return "unknown"
 
 ERROR_MAP = {
     141006: ("business-level send block (generic payment-method label)",
@@ -285,6 +292,8 @@ class JsonOutboxStore:
             if prior.get("request") != record.get("request"):
                 raise StoreConflict(key)  # compare first: ZERO mutation
             if prior.get("state") == "failed":
+                if prior.get("failure_class") == "unknown":
+                    return "unknown_blocked"  # never resent, even explicit
                 if not allow_retry:
                     return "failed_blocked"
                 record["attempts"] = prior.get("attempts", 0) + 1
@@ -370,6 +379,8 @@ class MemOutboxStore:
             if prior.get("request") != record.get("request"):
                 raise StoreConflict(key)  # compare first: ZERO mutation
             if prior.get("state") == "failed":
+                if prior.get("failure_class") == "unknown":
+                    return "unknown_blocked"  # never resent, even explicit
                 if not allow_retry:
                     return "failed_blocked"
                 record["attempts"] = prior.get("attempts", 0) + 1
@@ -707,6 +718,13 @@ class WhatsAppStagingAdapter:
                 "this idempotency key was already used with DIFFERENT "
                 "content - conflict, never a stale success; pick a new "
                 "key") from None
+        if result == "unknown_blocked":
+            raise WhatsAppError(
+                "unknown_failure_no_retry",
+                "this key's prior failure is UNKNOWN-outcome (the official "
+                "error-codes reference does not clearly classify the "
+                "code) - NO retry is permitted, explicit or otherwise; "
+                "diagnose from the actual Meta response first")
         if result == "failed_blocked":
             raise WhatsAppError(
                 "explicit_retry_required",
@@ -790,11 +808,18 @@ class WhatsAppStagingAdapter:
             meaning, guidance = ERROR_MAP.get(
                 code, (err.get("message", "unknown Meta error"),
                        "Check the official Cloud API error reference."))
-            cls_note = ("Retryable per the official error-codes reference "
+            cls_note = {"retryable":
+                        "Retryable per the official error-codes reference "
                         "(back off, then an EXPLICIT retry may resend the "
-                        "same content)." if fclass == "retryable" else
+                        "same content).",
+                        "definitive":
                         "Definitive per the official error-codes reference "
-                        "(fix the cause first; do not resend unchanged).")
+                        "(fix the cause first; do not resend unchanged).",
+                        "unknown":
+                        "UNKNOWN outcome: the official error-codes "
+                        "reference does not clearly classify this code - "
+                        "no retry is permitted; diagnose from the actual "
+                        "response."}[fclass]
             raise WhatsAppError(code, f"{meaning} - {guidance} {cls_note}")
         wamid = ((data or {}).get("messages") or [{}])[0].get("id")
         record["state"] = "sent"
