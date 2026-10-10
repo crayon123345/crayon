@@ -48,11 +48,6 @@ REQUIRED_REDEEM_FIELDS = ("lease_id", "request_id", "conversation_id",
 # Contract bounds: server-provided caps may only tighten these, never widen.
 CONTRACT_MAX_SECONDS = 600
 CONTRACT_MAX_BYTES = 20000000
-# Adapter-side origin allowlist (exact origins only). Deployments override.
-DEFAULT_ALLOWED_ORIGINS = frozenset({
-    "https://crayon-web.onrender.com",
-    "https://itsppm76.github.io",
-})
 
 
 class TransportTimeout(Exception):
@@ -110,10 +105,18 @@ class VoiceAdapter:
     """One adapter instance per deployment; one Lease per redeemed ticket."""
 
     def __init__(self, transport, credential, clock=time.time,
-                 allowed_origins=DEFAULT_ALLOWED_ORIGINS):
+                 allowed_origins=None):
         """transport(method, path, headers, body) -> (status, dict);
         may raise TransportTimeout/TimeoutError/OSError when no response
-        arrives. allowed_origins: exact https origins redeem may bind to."""
+        arrives. allowed_origins: REQUIRED non-empty iterable of the exact
+        https origins redeem may bind to - the confirmed merged-deployment
+        configuration. There is NO default: an absent or empty allowlist
+        fails closed at construction, because a shipped default cannot
+        establish origin authority."""
+        if not allowed_origins:
+            raise ValueError(
+                "allowed_origins is required: explicit merged-deployment "
+                "configuration, fail closed when absent")
         self._t = transport
         self._cred = credential
         self._clock = clock
@@ -220,17 +223,31 @@ class VoiceAdapter:
         return self.revalidate(lease)
 
     def run_turn(self, lease, work, sleep=time.sleep):
-        """Active cadence loop with WALL-CLOCK cadence: work(lease) runs ONCE
-        on a worker thread and may block; the calling thread keeps
-        revalidating every lease.revalidate_seconds of wall-clock time
-        regardless of how long work blocks. The first failed check closes
-        the lease and raises; the worker's next adapter call then fails on
-        the closed lease. Returns work's result; re-raises work errors."""
+        """Active cadence loop with WALL-CLOCK cadence and cooperative
+        cancellation. Order of operations is load-bearing:
+
+        1. The FIRST validation (drive_once: caps + revalidate) completes
+           BEFORE any worker/provider work begins - a denied startup means
+           the worker is never started, so no effect can exist.
+        2. work(lease, cancel) then runs ONCE on a worker thread and may
+           block; the calling thread keeps revalidating every
+           lease.revalidate_seconds of wall-clock time regardless of how
+           long work blocks.
+        3. On ANY failed check the lease closes, `cancel` (a
+           threading.Event) is set, and the worker is JOINED before the
+           error propagates - work must observe `cancel` cooperatively, so
+           no effect lands after close. On normal completion the worker is
+           joined the same way (cleanup).
+
+        Returns work's result; re-raises work errors."""
+        # (a) validate first: a denial here means the worker never runs.
+        self.drive_once(lease)
+        cancel = threading.Event()
         outcome = {}
 
         def runner():
             try:
-                outcome["value"] = work(lease)
+                outcome["value"] = work(lease, cancel)
             except BaseException as e:  # propagate after the loop exits
                 outcome["error"] = e
             finally:
@@ -238,16 +255,22 @@ class VoiceAdapter:
 
         t = threading.Thread(target=runner, daemon=True)
         t.start()
-        next_check = self._clock()
-        while True:
-            now = self._clock()
-            if now >= next_check:
-                self.drive_once(lease)  # raises -> lease closed -> propagate
-                next_check = now + lease.revalidate_seconds
-            if outcome.get("finished"):
-                break
-            sleep(min(max(next_check - self._clock(), 0.0), 0.05) or 0.001)
-        t.join(timeout=5)
+        next_check = self._clock() + lease.revalidate_seconds
+        try:
+            while True:
+                now = self._clock()
+                if now >= next_check:
+                    self.drive_once(lease)  # raises -> close -> cancel+join
+                    next_check = now + lease.revalidate_seconds
+                if outcome.get("finished"):
+                    break
+                sleep(min(max(next_check - self._clock(), 0.0), 0.05) or 0.001)
+        except BaseException:
+            cancel.set()                    # (b) cooperative cancellation
+            t.join(timeout=lease.revalidate_seconds)  # joined before raise
+            raise
+        cancel.set()
+        t.join(timeout=lease.revalidate_seconds)      # cleanup join
         if "error" in outcome:
             raise outcome["error"]
         return outcome.get("value", False)

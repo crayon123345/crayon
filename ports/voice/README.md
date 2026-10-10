@@ -15,6 +15,11 @@ no activation. The accepted runtime-contract.md is unchanged.
   or an unavailable validation closes the lease. No grace fallback.
   Ordinary transport failures (builtin `TimeoutError`/`OSError`) fail
   closed exactly like an explicit `TransportTimeout`, on every path.
+  Startup ordering is load-bearing: the FIRST validation completes before
+  the worker is started at all (a denied startup means zero work effects),
+  and on any close the worker is cooperatively cancelled
+  (`work(lease, cancel)` receives a threading.Event) and JOINED before the
+  error propagates - no effect lands after close.
 - Incremental caps: elapsed time from redeem and audio bytes
   (`note_audio_bytes`) are tracked per lease; first breach of the
   600s / 20MB caps ends the turn (CapExceeded, lease closed). Negative or
@@ -24,8 +29,11 @@ no activation. The accepted runtime-contract.md is unchanged.
 - Ticket only in the redeem request body, never in a URL (test-enforced).
 - Local binding validation: observed_origin must parse as a strict https
   origin (non-empty host; no credentials, path, query or fragment) AND be
-  on the adapter's exact-origin allowlist (`allowed_origins`, defaulting to
-  the two deployment origins); canonical redeem responses must carry the
+  on the adapter's exact-origin allowlist. `allowed_origins` is REQUIRED
+  and has NO default - it is the confirmed merged-deployment configuration
+  and construction fails closed without it, because a shipped default
+  cannot establish origin authority. Canonical redeem responses must carry
+  the
   required fields and echo the bound mode/origin; revalidate responses must
   echo the lease's own lease_id, request_id and expires_at (a mismatch
   closes the lease as `bad_binding`); `active:false` on revalidate closes.
@@ -46,7 +54,7 @@ revocation push, erasure, real browser/device/codec/provider roundtrips.
 
 ## Tests
 
-`pytest ports/voice` - 37 synthetic tests, including a genuine threaded
+`pytest ports/voice` - 41 synthetic tests, including a genuine threaded
 redeem race (barrier-synchronized, exactly one winner), a real lost-commit
 (canonical commits, response transport dies -> CommitUnknown + close + no
 replay), exact 120s expiry boundary, incremental 600s/20MB cap enforcement,
@@ -58,4 +66,9 @@ origin parsing (empty host, credentials, path, query, fragment, look-alike
 host) plus allowlist rejection, revalidate request_id/expires_at binding,
 wall-clock cadence under genuinely blocking work (threaded, 15s gap
 asserted) and denial-during-blocking-work close, negative byte-increment
-rejection, and server-cap clamping to contract bounds.
+rejection, and server-cap clamping to contract bounds. REV5 rework
+coverage (effect-recording fakes): denied startup produces ZERO work
+effects (worker never invoked); revocation during blocked work sets
+cancel, joins the worker inside run_turn, and asserts NO effect after
+close; success path joins the worker cleanly; allowlist is mandatory
+(absent/empty construction refuses, no module-level default exists).

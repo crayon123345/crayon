@@ -462,7 +462,7 @@ def test_f4_run_turn_wall_clock_cadence_under_blocking_work():
         return orig(method, path, headers, body)
     a._t = spy
     lease = a.redeem(c.issue(), ORIGIN, "transcribe")
-    def work(l):
+    def work(l, cancel):
         release.wait(10)   # blocks far longer than one cadence interval
         return True
     done = {}
@@ -484,7 +484,7 @@ def test_f4_run_turn_denial_during_blocking_work_closes():
     c, a = make(clock=lambda: now[0])
     lease = a.redeem(c.issue(), ORIGIN, "transcribe")
     release = threading.Event()
-    def work(l):
+    def work(l, cancel):
         release.wait(10)
         return True
     outcome = {}
@@ -524,3 +524,86 @@ def test_f5_server_caps_clamped_to_contract_bounds():
     with pytest.raises(CapExceeded) as e:
         a.progress(lease, "progress", "running")
     assert e.value.which == "seconds"
+
+
+# -- REV5 rework regression tests (re-review findings 6-7) ------------------
+
+def test_f6_denied_startup_worker_never_runs():
+    """First validation happens BEFORE the worker starts: a denied startup
+    must produce ZERO effects - the work callable is never invoked."""
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    c.revoke_lease(lease.lease_id)   # first drive_once will deny
+    effects = []
+    started = []
+    def work(l, cancel):
+        started.append(True)
+        effects.append("effect")
+        return True
+    with pytest.raises(AdapterError):
+        a.run_turn(lease, work)
+    assert started == [] and effects == []
+    assert not lease.active
+
+
+def test_f6_revocation_during_blocked_work_cancels_and_joins():
+    """Revocation mid-work: cancel is observed, the worker is joined inside
+    run_turn, and NO effect is recorded after the lease closed."""
+    now = [1000.0]
+    c, a = make(clock=lambda: now[0])
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    effects, closed_at = [], []
+    def work(l, cancel):
+        while not cancel.is_set():
+            effects.append(now[0])
+            time.sleep(0.005)
+        effects.append("after-cancel-observed")  # in-flight cleanup only
+        return True
+    outcome = {}
+    def run():
+        try:
+            a.run_turn(lease, work,
+                       sleep=lambda s: now.__setitem__(0, now[0] + s))
+        except AdapterError as e:
+            outcome["e"] = e
+    th = threading.Thread(target=run)
+    th.start()
+    deadline = time.time() + 10
+    while len(effects) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    c.revoke_lease(lease.lease_id)
+    th.join(timeout=10)
+    assert not th.is_alive()          # run_turn returned (worker joined)
+    assert isinstance(outcome.get("e"), AdapterError)
+    assert not lease.active
+    # Worker observed cancel and exited; only its own cleanup line may
+    # follow, and NOTHING after run_turn returned:
+    marker = len(effects)
+    time.sleep(0.2)
+    assert len(effects) == marker     # zero effects after close
+    assert effects[-1] == "after-cancel-observed"
+
+
+def test_f6_success_path_joins_worker_cleanly():
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    alive = []
+    def work(l, cancel):
+        alive.append(threading.current_thread())
+        return "turn-result"
+    r = a.run_turn(lease, work)
+    assert r == "turn-result"
+    assert not alive[0].is_alive()    # joined before return
+
+
+def test_f7_allowlist_required_no_implicit_trust():
+    c = FakeCanonical()
+    with pytest.raises(ValueError):
+        VoiceAdapter(c, "scoped-x")                 # absent
+    with pytest.raises(ValueError):
+        VoiceAdapter(c, "scoped-x", allowed_origins=[])   # empty
+    with pytest.raises(ValueError):
+        VoiceAdapter(c, "scoped-x", allowed_origins=None)
+    # no module-level default remains to smuggle authority back in
+    import adapter as mod
+    assert not hasattr(mod, "DEFAULT_ALLOWED_ORIGINS")
