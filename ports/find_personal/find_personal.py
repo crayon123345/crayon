@@ -51,6 +51,10 @@ class RecordLimitReached(FindPersonalError):
     pass
 
 
+class NoRecord(FindPersonalError):
+    pass
+
+
 def _tok(text):
     return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
             if w not in _STOP and len(w) > 1]
@@ -90,6 +94,7 @@ class Record(object):
 class MemPersonalStore(object):
     def __init__(self):
         self.records = {}  # owner -> {rid: Record}
+        self.seq = {}      # owner -> monotonic id sequence (never reused)
 
 
 class FindPersonal(object):
@@ -120,8 +125,10 @@ class FindPersonal(object):
         recs = self._records(owner)
         if len(recs) >= MAX_RECORDS:
             raise RecordLimitReached("record cap %d reached" % MAX_RECORDS)
-        rid = self.id_factory("rec", len(recs) + 1, ts)
+        self.store.seq[owner] = self.store.seq.get(owner, 0) + 1
+        rid = self.id_factory("rec", self.store.seq[owner], ts)
         if rid in recs:
+            self.store.seq[owner] -= 1  # nothing consumed on refusal
             raise FindPersonalError("record id collision: %s" % rid)
         recs[rid] = Record(rid, owner, kind.strip(), text.strip(),
                            source.strip(), ts)
@@ -168,12 +175,40 @@ class FindPersonal(object):
         return out[:limit]
 
     def remove(self, owner, rid):
-        """Delete one record by id (source-edit/forget propagation).
+        """Delete one record by id (source-forget propagation).
         Returns True when a record was removed, False when absent."""
         recs = self.store.records.get(owner)
         if not recs or rid not in recs:
             return False
         del recs[rid]
+        return True
+
+    def replace(self, owner, rid, kind, text, ts, source=""):
+        """ATOMIC edit (source-edit propagation): validate the new
+        content fully BEFORE touching the old record; on success swap
+        in place under the SAME rid; on any refusal the old record is
+        preserved untouched. Returns True. NoMatch when rid is absent -
+        use add() for new records."""
+        recs = self._records(owner)
+        if rid not in recs:
+            raise NoRecord("no such record")
+        # full validation first - the old record survives any failure
+        if not isinstance(kind, str) or not kind.strip():
+            raise FindPersonalError("kind required")
+        if len(kind) > MAX_KIND:
+            raise FindPersonalError("kind over %d chars" % MAX_KIND)
+        if not isinstance(text, str) or not text.strip():
+            raise FindPersonalError("text required")
+        if len(text) > MAX_TEXT:
+            raise FindPersonalError("text over %d chars" % MAX_TEXT)
+        if not isinstance(source, str):
+            raise FindPersonalError("source must be str")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)) \
+                or ts != ts or ts in (float("inf"), float("-inf")):
+            raise FindPersonalError("ts must be a finite number")
+        old = recs[rid]
+        recs[rid] = Record(rid, owner, kind.strip(), text.strip(),
+                           source.strip(), ts)
         return True
 
     def wipe(self, owner):
