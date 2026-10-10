@@ -26,13 +26,13 @@ Design rules (same discipline as ports/memory):
 
 import re
 
-CONTRACT_VERSION = "crayon-reflect-v1"
+CONTRACT_VERSION = "crayon-reflect-v2"
 MAX_FOLLOWUP_TEXT = 200
 
 # Duck-typed FactStore interface (satisfied by ports/memory MemFactStore and
 # its future SQL adapter): list(owner, include_sensitive=False) -> iterable
-# of fact objects with .id, .category, .text, .created, .superseded_by,
-# .sensitive. Mode grounding uses ONLY category == "followup".
+# of fact objects with .id, .category, .text, .created, .source_ts,
+# .superseded_by, .sensitive. Mode grounding uses ONLY category == "followup".
 
 
 class ReflectError(Exception):
@@ -44,7 +44,7 @@ class MemModeStore:
 
     def __init__(self):
         self._mode = {}      # owner -> bool
-        self._last_fid = {}  # owner -> fid of the follow-up last surfaced
+        self._surfaced = {}  # owner -> list of fids already surfaced (ordered)
 
     def get_mode(self, owner):
         return bool(self._mode.get(owner, False))
@@ -52,18 +52,33 @@ class MemModeStore:
     def set_mode(self, owner, value):
         self._mode[owner] = bool(value)
 
-    def get_last_fid(self, owner):
-        return self._last_fid.get(owner)
+    def get_surfaced(self, owner):
+        return list(self._surfaced.get(owner, ()))
 
-    def set_last_fid(self, owner, fid):
-        if fid is None:
-            self._last_fid.pop(owner, None)
-        else:
-            self._last_fid[owner] = fid
+    def add_surfaced(self, owner, fid):
+        hist = self._surfaced.setdefault(owner, [])
+        if fid not in hist:
+            hist.append(fid)
+
+    def clear_surfaced(self, owner):
+        self._surfaced.pop(owner, None)
 
 
 class ReflectiveMode:
-    """Per-owner reflective conversation mode."""
+    """Per-owner reflective conversation mode.
+
+    Recency semantics (EXPLICIT): "most recent" means greatest source_ts -
+    when the user actually said it - falling back to storage time (created),
+    and ties beyond that break by storage-created then id for pure
+    determinism. Ids never carry semantic order; they only stabilize exact
+    timestamp ties. Sort key: (source_ts, created, id), highest wins.
+
+    No-nagging is GLOBAL within a mode session: a surfaced follow-up is
+    never re-surfaced while other candidates exist AND is not re-surfaced
+    even when it is the only one. Surfacing history resets only when the
+    mode is toggled off (or cleared programmatically); a corrected fact
+    gets a new id and therefore becomes surfacable again.
+    """
 
     def __init__(self, mode_store, fact_store=None):
         self.mode = mode_store
@@ -74,7 +89,7 @@ class ReflectiveMode:
     def set_mode(self, owner, enabled):
         self.mode.set_mode(owner, enabled)
         if not enabled:
-            self.mode.set_last_fid(owner, None)  # reset surfacing history
+            self.mode.clear_surfaced(owner)  # reset surfacing history
 
     def is_on(self, owner):
         return self.mode.get_mode(owner)
@@ -82,37 +97,37 @@ class ReflectiveMode:
     # ---------- follow-up grounding ----------
 
     def open_followups(self, owner):
-        """Current, non-sensitive, open follow-up facts, most recent first.
-        Sensitive follow-ups are excluded ALWAYS (never enter the prompt),
-        independent of the owner's sensitive-storage opt-in."""
+        """Current, non-sensitive, open follow-up facts, most recent first
+        by the documented recency semantics. Sensitive follow-ups are
+        excluded ALWAYS (never enter the prompt), independent of the
+        owner's sensitive-storage opt-in."""
         if self.facts is None:
             return []
         cands = [f for f in self.facts.list(owner, include_sensitive=False)
                  if getattr(f, "category", None) == "followup"
                  and getattr(f, "superseded_by", None) is None]
-        cands.sort(key=lambda f: (f.created, f.id))
+        cands.sort(key=lambda f: (f.source_ts, f.created, f.id))
         cands.reverse()
         return cands
 
     def pick_followup(self, owner):
-        """Pure: choose at most ONE follow-up to surface. Most recent open
-        follow-up wins; the one surfaced last time is skipped while another
-        candidate exists, and is NOT re-surfaced when it is the only one
-        (no nagging). Returns None when there is nothing useful to raise."""
-        cands = self.open_followups(owner)
-        if not cands:
-            return None
-        last = self.mode.get_last_fid(owner)
-        if last is not None and cands[0].id == last:
-            return cands[1] if len(cands) > 1 else None
-        return cands[0]
+        """Pure: choose at most ONE follow-up to surface. The most recent
+        candidate (per the documented recency semantics) that has NOT been
+        surfaced this mode session wins. Returns None when every candidate
+        was already surfaced - a surfaced follow-up is not re-raised until
+        the mode is toggled off/on or the fact is corrected (new id)."""
+        surfaced = set(self.mode.get_surfaced(owner))
+        for f in self.open_followups(owner):
+            if f.id not in surfaced:
+                return f
+        return None
 
     # ---------- prompt surface ----------
 
     def prompt_addendum(self, owner):
         """System-prompt behavior contract for reflective mode. Empty when
         the mode is off. EFFECT: if a follow-up is surfaced here, its id is
-        recorded as last-surfaced for this owner (this is the one call the
+        recorded in the owner's surfaced history (this is the one call the
         integration makes per model dispatch, so it is the natural effect
         point). The contract is a REQUEST to the model; the deterministic
         guarantee lives in enforce_one_question()."""
@@ -137,35 +152,46 @@ class ReflectiveMode:
         if fu is not None:
             lines.append("- There is one open follow-up worth raising if it")
             lines.append("  fits naturally: %s" % fu.text[:MAX_FOLLOWUP_TEXT])
-            self.mode.set_last_fid(owner, fu.id)
+            self.mode.add_surfaced(owner, fu.id)
         return "\n".join(lines)
 
     # ---------- deterministic reply guard ----------
 
     @staticmethod
     def question_count(text):
-        """Naive guard metric: every '?' counts as a question. Documented
-        limit: a '?' inside a URL query string or an emoticon also counts;
-        chat replies rarely contain those, and over-counting only ever
-        TRIMS, never invents content."""
+        """Guard metric: every '?' counts as a question. Documented limit:
+        a '?' inside a URL query string or an emoticon also counts;
+        over-counting only ever TRIMS, never invents content."""
         return (text or "").count("?")
+
+    @staticmethod
+    def _sentences(text):
+        """Split into sentences on terminal punctuation runs, keeping the
+        punctuation with its sentence, WITH or WITHOUT following
+        whitespace: 'Why?How?' -> ['Why?', 'How?']; 'Really??' -> ['Really??']
+        (one sentence, repeated marks)."""
+        parts = re.findall(r"[^.!?]+[.!?]+|[^.!?]+$", text)
+        return [p.strip() for p in parts if p.strip()]
 
     @staticmethod
     def enforce_one_question(text):
         """Deterministic post-filter on a drafted reply: reduce it to at
-        most ONE question. Sentences up to and including the first question
-        are kept in order; after that, question sentences are dropped and
-        non-question sentences are kept. A reply with 0 or 1 questions is
-        returned byte-identical."""
+        most ONE question mark. Sentences are recognized with or without
+        separating whitespace; sentences up to and including the first
+        question sentence are kept in order; later question sentences are
+        dropped; later non-question sentences are kept. Inside the kept
+        first question sentence, a run of repeated '?' collapses to one
+        ('Really??' -> 'Really?'). A reply whose only '?' sits inside the
+        first question sentence with no repeats is returned
+        byte-identical."""
         if ReflectiveMode.question_count(text) <= 1:
             return text
-        sentences = re.split(r"(?<=[.!?])\s+", text)
         out = []
         seen_question = False
-        for s in sentences:
+        for s in ReflectiveMode._sentences(text):
             if "?" in s:
                 if not seen_question:
-                    out.append(s)
+                    out.append(re.sub(r"\?{2,}", "?", s))
                     seen_question = True
                 # else: drop the extra question sentence
             else:

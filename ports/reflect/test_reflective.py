@@ -5,15 +5,17 @@ Acceptance criteria under test (owner spec for P0 #2):
 - ONE useful follow-up question, not a barrage
 Plus: explicit command grammar (ambiguous phrasing falls through),
 cross-owner isolation, sensitive follow-ups never injected, superseded
-follow-ups never injected, no-nagging dedupe, deterministic post-filter.
-Every test counts EFFECTS (store rows, question marks), not prose replies.
+follow-ups never injected, GLOBAL no-nagging, deterministic recency by
+source time, and the deterministic one-question guard incl. contiguous
+punctuation. Every test counts EFFECTS (store rows, question marks),
+not prose replies.
 """
 import sys, os, unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "memory"))
 from reflective import ReflectiveMode, MemModeStore
-from continuity import Continuity, MemFactStore
+from continuity import Continuity, MemFactStore, Fact
 
 A, B = "v_owner_a", "v_owner_b"
 
@@ -52,7 +54,7 @@ class TestModeCommands(unittest.TestCase):
         r.handle_message(A, "reflect off")
         self.assertFalse(r.is_on(A))
         self.assertEqual(r.prompt_addendum(A), "")
-        self.assertIsNone(ms.get_last_fid(A))
+        self.assertEqual(ms.get_surfaced(A), [])
 
     def test_aliases_case_insensitive(self):
         for cmd in ("Reflective Mode ON", "THOUGHT PARTNER ON"):
@@ -69,7 +71,6 @@ class TestModeCommands(unittest.TestCase):
 
     def test_commands_create_no_facts(self):
         r, ms, fs = fresh()
-        cont = Continuity(fs)
         before = len(fs.list(A))
         r.handle_message(A, "reflect on")
         r.handle_message(A, "reflect status")
@@ -137,26 +138,6 @@ class TestFollowupGrounding(unittest.TestCase):
         self.assertNotIn("old plan", ad)
         self.assertIn("ask about the new plan", ad)
 
-    def test_most_recent_wins_and_dedupe_no_nagging(self):
-        r, ms, fs = fresh()
-        cont = Continuity(fs)
-        f1 = add_followup(cont, A, "first thing", ts=1000)
-        f2 = add_followup(cont, A, "second thing", ts=2000)
-        r.handle_message(A, "reflect on")
-        ad1 = r.prompt_addendum(A)
-        self.assertIn("second thing", ad1)      # most recent first
-        ad2 = r.prompt_addendum(A)
-        self.assertIn("first thing", ad2)       # dedupe: other candidate
-        self.assertNotIn("second thing", ad2)
-
-    def test_single_candidate_not_resurfaced(self):
-        r, ms, fs = fresh()
-        cont = Continuity(fs)
-        add_followup(cont, A, "only thing", ts=1000)
-        r.handle_message(A, "reflect on")
-        self.assertIn("only thing", r.prompt_addendum(A))
-        self.assertNotIn("only thing", r.prompt_addendum(A))  # no nagging
-
     def test_non_followup_categories_not_injected(self):
         r, ms, fs = fresh()
         cont = Continuity(fs)
@@ -175,6 +156,108 @@ class TestFollowupGrounding(unittest.TestCase):
         ad = r.prompt_addendum(A)
         self.assertIn("LISTEN", ad)             # contract still present
         self.assertNotIn("open follow-up worth", ad)
+
+
+class TestRecencySemantics(unittest.TestCase):
+    """Recency = greatest source_ts (when the user said it), then storage
+    time (created), then id for pure determinism. Ids carry no semantics."""
+
+    def test_recency_is_source_time_not_storage_order(self):
+        r, ms, fs = fresh()
+        cont = Continuity(fs)
+        # Stored FIRST but said EARLIER (small source_ts):
+        fs.put(Fact(A, "followup", "stored first, said earlier", False,
+                    "c", 1000, "", fid="f_e", created=900))
+        # Stored SECOND but said LATER (large source_ts):
+        fs.put(Fact(A, "followup", "stored second, said later", False,
+                    "c", 9000, "", fid="f_l", created=100))
+        r.handle_message(A, "reflect on")
+        self.assertIn("stored second, said later", r.prompt_addendum(A))
+
+    def test_pick_is_deterministic_across_repeated_calls(self):
+        r, ms, fs = fresh()
+        fs.put(Fact(A, "followup", "alpha", False, "c", 5000, "",
+                    fid="f_a1", created=100))
+        fs.put(Fact(A, "followup", "beta", False, "c", 5000, "",
+                    fid="f_b2", created=100))    # exact tie on both times
+        picks = {r.pick_followup(A).id for _ in range(10)}
+        self.assertEqual(len(picks), 1)          # stable under a pure call
+
+    def test_equal_source_ts_newer_storage_wins(self):
+        r, ms, fs = fresh()
+        # Inject with EXPLICIT storage times: source_ts ties, so the created
+        # leg decides. (continuity.remember stamps created=now at 1s
+        # resolution; controlling created removes clock dependence.)
+        fs.put(Fact(A, "followup", "stored first", False, "c", 5000, "",
+                    fid="f_old", created=100))
+        fs.put(Fact(A, "followup", "stored later", False, "c", 5000, "",
+                    fid="f_new", created=200))
+        picks = r.open_followups(A)
+        self.assertEqual(picks[0].text, "stored later")  # created tie-break
+
+    def test_exact_tie_breaks_by_id_for_determinism_only(self):
+        r, ms, fs = fresh()
+        # Same source_ts AND same created: the id leg stabilizes the order.
+        # Semantics live in the timestamp legs; id only makes exact ties
+        # deterministic. Fixed ids make the expectation explicit:
+        # reverse sort => higher id first.
+        fs.put(Fact(A, "followup", "tie aaa", False, "c", 5000, "",
+                    fid="f_aaa", created=100))
+        fs.put(Fact(A, "followup", "tie zzz", False, "c", 5000, "",
+                    fid="f_zzz", created=100))
+        picks = r.open_followups(A)
+        self.assertEqual([f.id for f in picks], ["f_zzz", "f_aaa"])
+        # and the pick is stable across repeated pure calls
+        self.assertEqual({r.pick_followup(A).id for _ in range(10)},
+                         {"f_zzz"})
+
+
+class TestNoNagging(unittest.TestCase):
+    def test_each_candidate_surfaces_exactly_once_then_none(self):
+        r, ms, fs = fresh()
+        cont = Continuity(fs)
+        add_followup(cont, A, "first thing", ts=1000)
+        add_followup(cont, A, "second thing", ts=2000)
+        r.handle_message(A, "reflect on")
+        ad1 = r.prompt_addendum(A)
+        self.assertIn("second thing", ad1)      # most recent source first
+        ad2 = r.prompt_addendum(A)
+        self.assertIn("first thing", ad2)       # the remaining candidate
+        self.assertNotIn("second thing", ad2)
+        ad3 = r.prompt_addendum(A)              # BOTH surfaced: no cycling
+        self.assertNotIn("first thing", ad3)
+        self.assertNotIn("second thing", ad3)
+
+    def test_single_candidate_not_resurfaced(self):
+        r, ms, fs = fresh()
+        cont = Continuity(fs)
+        add_followup(cont, A, "only thing", ts=1000)
+        r.handle_message(A, "reflect on")
+        self.assertIn("only thing", r.prompt_addendum(A))
+        for _ in range(4):
+            self.assertNotIn("only thing", r.prompt_addendum(A))
+
+    def test_mode_toggle_resets_history(self):
+        r, ms, fs = fresh()
+        cont = Continuity(fs)
+        add_followup(cont, A, "only thing", ts=1000)
+        r.handle_message(A, "reflect on")
+        r.prompt_addendum(A)
+        r.handle_message(A, "reflect off")
+        r.handle_message(A, "reflect on")
+        self.assertIn("only thing", r.prompt_addendum(A))  # fresh session
+
+    def test_corrected_followup_is_surfacable_again(self):
+        r, ms, fs = fresh()
+        cont = Continuity(fs)
+        add_followup(cont, A, "ask about the old plan", ts=1000)
+        r.handle_message(A, "reflect on")
+        r.prompt_addendum(A)                    # surfaces old plan
+        cont.correct(A, "old plan", "ask about the new plan",
+                     source_sid="chat-1", source_ts=2000)
+        ad = r.prompt_addendum(A)
+        self.assertIn("ask about the new plan", ad)  # new id: fresh
+        self.assertNotIn("old plan", ad)
 
 
 class TestOneQuestionGuard(unittest.TestCase):
@@ -204,6 +287,28 @@ class TestOneQuestionGuard(unittest.TestCase):
         out = ReflectiveMode.enforce_one_question(t)
         for word in out.split():
             self.assertIn(word, t.split())
+
+    # --- regression: review finding 1 (contiguous / repeated punctuation) ---
+
+    def test_contiguous_questions_no_whitespace(self):
+        out = ReflectiveMode.enforce_one_question("Why?How?")
+        self.assertEqual(out, "Why?")
+        self.assertEqual(out.count("?"), 1)
+
+    def test_repeated_marks_collapse(self):
+        out = ReflectiveMode.enforce_one_question("Really??")
+        self.assertEqual(out, "Really?")
+        self.assertEqual(out.count("?"), 1)
+
+    def test_contiguous_mix_keeps_statements(self):
+        out = ReflectiveMode.enforce_one_question("Why?How?That is fair.")
+        self.assertEqual(out, "Why? That is fair.")
+
+    def test_triple_marks_plus_contiguous(self):
+        out = ReflectiveMode.enforce_one_question("Seriously???How so?Ok.")
+        self.assertEqual(out.count("?"), 1)
+        self.assertIn("Seriously?", out)
+        self.assertIn("Ok.", out)
 
 
 if __name__ == "__main__":

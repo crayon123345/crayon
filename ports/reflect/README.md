@@ -9,7 +9,7 @@ generic.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-This port is complete as a tested module (20/20 tests) but is NOT wired
+This port is complete as a tested module (30/30 tests) but is NOT wired
 into the running app. Named limits, exactly:
 
 1. NOT MOUNTED: nothing calls ReflectiveMode from integrated/ yet.
@@ -41,17 +41,28 @@ into the running app. Named limits, exactly:
 5. SENSITIVE FOLLOW-UPS NEVER ENTER THE PROMPT: open_followups() excludes
    sensitive facts always, independent of the owner's sensitive-storage
    opt-in, matching the continuity guarantee.
-6. NO-NAGGING FOLLOW-UP POLICY: at most one open follow-up is surfaced per
-   prompt; the one surfaced last time is skipped while another candidate
-   exists and is NOT re-surfaced when it is the only one. Turning the mode
-   off resets the surfacing history.
+6. GLOBAL NO-NAGGING FOLLOW-UP POLICY: at most one open follow-up is
+   surfaced per prompt, and each follow-up is surfaced AT MOST ONCE per
+   mode session - after every candidate has been raised, none is raised
+   again. Surfacing history resets only when the mode is toggled off/on;
+   a corrected follow-up has a new id and is surfacable again.
 7. CRISIS HANDLING IS PROMPT-LEVEL ONLY: the contract tells the model to
    drop the format and encourage professional help if the user mentions
    self-harm. This module does NO crisis detection; a real safety layer is
    a separate, owned decision.
-8. QUESTION GUARD IS NAIVE: question_count() counts every "?"; a "?" in a
-   URL query string or emoticon also counts. Over-counting only ever trims
-   extra questions, never invents content (tested).
+8. QUESTION GUARD IS NAIVE BUT COMPLETE ON PUNCTUATION: question_count()
+   counts every "?"; a "?" in a URL query string or emoticon also counts.
+   Sentences are split on terminal punctuation WITH or WITHOUT following
+   whitespace ("Why?How?" is two sentences), and a run of repeated marks
+   inside the kept first question sentence collapses to one ("Really??"
+   -> "Really?"). Over-counting only ever trims, never invents content
+   (tested).
+
+9. RECENCY SEMANTICS ARE EXPLICIT: "most recent" follow-up means greatest
+   source_ts (when the user said it), then greatest created (storage
+   time), then greatest id - the id leg only stabilizes exact-timestamp
+   ties and carries no semantic order. Tests control created explicitly;
+   continuity.remember stamps created at 1s resolution.
 
 ## Commands (chat surface)
 
@@ -60,7 +71,7 @@ into the running app. Named limits, exactly:
   (resets follow-up surfacing history; stored memory is untouched)
 - `reflect status` (and the same aliases) - state + open follow-up count
 
-## Acceptance criteria covered by tests (test_reflective.py, 20 tests)
+## Acceptance criteria covered by tests (test_reflective.py, 30 tests)
 
 - Contract content: addendum contains LISTEN / REFLECT / PLAN and the
   exactly-one-question instruction; empty when the mode is off.
@@ -68,9 +79,18 @@ into the running app. Named limits, exactly:
   across consecutive prompts; a single candidate is not re-surfaced;
   sensitive and superseded follow-ups never appear; non-followup
   categories are never used.
+- Deterministic recency: source-time ordering beats storage order;
+  storage-created breaks source-time ties; id stabilizes exact ties only;
+  picks are stable across repeated calls.
+- Global no-nagging: each follow-up surfaces at most once per mode
+  session; after all candidates surface, none repeats; mode toggle resets
+  history; a corrected follow-up (new id) is surfacable again.
 - No barrage: a 3-question draft is reduced to exactly 1 question;
   non-question sentences survive; the filter never invents content;
-  0- or 1-question replies pass through byte-identical.
+  0- or 1-question replies pass through byte-identical. Contiguous
+  questions without whitespace ("Why?How?") and repeated marks
+  ("Really??") are reduced to one mark (regression tests for the
+  cross-review findings).
 - No cross-owner leakage: mode state and follow-up grounding are
   owner-scoped; a second owner's commands and facts have zero effect.
 - Grammar discipline: commands create ZERO memory facts; ambiguous
@@ -78,4 +98,4 @@ into the running app. Named limits, exactly:
 
 ## Version
 
-crayon-reflect-v1
+crayon-reflect-v2
