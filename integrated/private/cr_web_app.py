@@ -80,7 +80,7 @@ def dispatch(uid, name, text):
             M.touch_user(uid, name)
             if __import__('cr_natural').handle(uid,uid,text,out):return out.items
             text=__import__('cr_natural').translate(text)
-            if __import__('cr_followups').handle(uid,uid,text,out):return out.items
+            if __import__('cr_followups').handle(uid,chat_destination,text,out):return out.items
             if __import__('cr_plugins').handle(uid,uid,text,out):return out.items
             if __import__('cr_persona').handle(uid,uid,text,out):return out.items
             if __import__('cr_voice').handle(uid,uid,text,out):return out.items
@@ -119,7 +119,11 @@ def dispatch(uid, name, text):
             if simple in ('yes','confirm','go ahead','do it','send it'):
                 return [{'kind':'text','text':'Web confirmations are not enabled yet. Nothing was sent or deleted.'}]
             # Never consume a pending action created in another channel.
-            reply, meta = A.respond(uid, chat_destination, text, name, channel_name='web')
+            goal=text.startswith('/goal') and (text=='/goal' or text[5:6].isspace())
+            prompt=text[5:].strip() if goal else text
+            if goal and not prompt:
+                return [{'kind':'text','text':'Use /goal followed by a concrete research or calculation goal.'}]
+            reply, meta = A.respond(uid, chat_destination, prompt, name, channel_name='web', goal_mode=goal)
             out.send(uid, reply)
             out.items.extend({'kind':'mcp_review',**r} for r in meta.get('mcp_reviews',[]))
             for item in meta.get('artifacts', []):
