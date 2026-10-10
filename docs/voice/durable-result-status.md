@@ -1,0 +1,11 @@
+# Durable terminal result preparation, not activation
+
+Unmounted, canonical flag remains off. No live schema migration, HTTP route, provider, model, audio, tool execution, action grant or deployment. Depends on the separately merged durable-ticket slice.
+
+Progress/final validate scoped adapter credentials, server-clock liveness, canonical web session (including email-auth checks), owned conversation, strict envelope and monotonic sequence. Lease and session/conversation locks protect the transaction. Partials are not persisted. At most50 nonpartial progress envelopes plus terminal result are kept in a300s read-only recovery buffer. Secret-looking text is denied. Adapter progress claims are unverified data, never canonical action receipts; message history work_events stays empty.
+
+Final writes one owner/request receipt and up to one transcript+answer history pair in the SAME PostgreSQL transaction. Exact payload hash duplicates still require current liveness before comparison. Conflicts409. Lost-response retry cannot create another history pair; revoked/expired retry stays denied and outcome unknown. Recovery binds current session, owner, exact origin, original request and conversation, never extends TTL, runs no provider/effect. Cleanup and owner erasure functions are prepared but NOT mounted/scheduled or integrated with full account erasure yet.
+
+Proof on dedicated empty local UTF8 PostgreSQL14: eight simultaneous identical finals produced exactly one receipt and two history rows; recovery contained no partials and retained original expiry; conflicting/revoked duplicate denied; exact-now expiry denied; failure on second history insert rolled back receipt/first history/sequence together; response-loss-style exact retry produced one additional pair only; scoped result erasure empty. This is local database proof, not live transport/device acceptance.
+
+Still missing before runtime: HTTP/ASGI and error-code mapping, provider cancellation/isolation, grant/disclosure UI, incremental gateway caps and quotas, revocation push, account erasure/cleanup wiring, private-data processing boundary, actual browser/device/codec/provider tests and deployment/cutover acceptance. Adapter text is stored only as terminal conversation text, not executed or interpreted as an effect receipt. No readiness claim.
