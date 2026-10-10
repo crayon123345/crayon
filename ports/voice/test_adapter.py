@@ -723,3 +723,122 @@ def test_f8_unclean_adapter_refuses_all_further_work():
                                         "worker_survived_cancel",
                                         "lease_closed")), e.value.code
     worker_release.set()
+
+
+# -- REV7 polish: NaN/non-finite rejection, strict ints, exact origins ------
+
+def _mutating_adapter(c, mutate):
+    """Adapter over a wrapper that mutates the canonical's redeem response."""
+    def wrapper(method, path, headers, body):
+        status, data = c(method, path, headers, body)
+        if path == "/voice/internal/redeem" and status == 200:
+            data = dict(data)
+            mutate(data)
+        return status, data
+    return VoiceAdapter(wrapper, "scoped-test-cred",
+                        allowed_origins={ORIGIN, "https://other.example"})
+
+
+def test_nan_revalidate_seconds_rejected_not_clamped():
+    # A NaN cadence would make every `now >= next_check` comparison false,
+    # silently disabling active liveness. Must be rejected, not clamped.
+    c, _ = make()
+    a = _mutating_adapter(c, lambda d: d.update(revalidate_seconds=float("nan")))
+    with pytest.raises(AdapterError) as ei:
+        a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert ei.value.code == "bad_binding:revalidate_seconds"
+
+
+def test_infinite_revalidate_seconds_rejected():
+    c, _ = make()
+    a = _mutating_adapter(c, lambda d: d.update(revalidate_seconds=float("inf")))
+    with pytest.raises(AdapterError) as ei:
+        a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert ei.value.code == "bad_binding:revalidate_seconds"
+
+
+def test_nan_max_seconds_cap_rejected():
+    # A NaN max_seconds would make every cap comparison false (cap disabled).
+    c, _ = make()
+    a = _mutating_adapter(c, lambda d: d["audio_limits"].update(max_seconds=float("nan")))
+    with pytest.raises(AdapterError) as ei:
+        a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert ei.value.code == "bad_binding:audio_limits.max_seconds"
+
+
+def test_infinite_max_bytes_cap_rejected():
+    c, _ = make()
+    a = _mutating_adapter(c, lambda d: d["audio_limits"].update(max_bytes=float("inf")))
+    with pytest.raises(AdapterError) as ei:
+        a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert ei.value.code == "bad_binding:audio_limits.max_bytes"
+
+
+def test_bool_cap_rejected_not_silently_tightened():
+    # bool is an int subclass: min(True, 600) would silently tighten to 1s.
+    c, _ = make()
+    a = _mutating_adapter(c, lambda d: d["audio_limits"].update(max_seconds=True))
+    with pytest.raises(AdapterError) as ei:
+        a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert ei.value.code == "bad_binding:audio_limits.max_seconds"
+
+
+def test_non_dict_audio_limits_rejected():
+    c, _ = make()
+    a = _mutating_adapter(c, lambda d: d.update(audio_limits="wide"))
+    with pytest.raises(AdapterError) as ei:
+        a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert ei.value.code == "bad_binding:audio_limits"
+
+
+def test_nan_expires_at_rejected():
+    c, _ = make()
+    a = _mutating_adapter(c, lambda d: d.update(expires_at=float("nan")))
+    with pytest.raises(AdapterError) as ei:
+        a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert ei.value.code == "bad_binding:expires_at"
+
+
+def test_byte_increment_strict_integer_parsing():
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    for bad in (3.7, True, "3.7", " 3", "+3", "3 ", "-3",
+                float("nan"), float("inf"), None, "abc", b"3"):
+        with pytest.raises(AdapterError) as ei:
+            a.note_audio_bytes(lease, bad)
+        assert ei.value.code == "bad_increment"
+    assert lease.bytes_used == 0      # rejected increments never applied
+    a.note_audio_bytes(lease, 3)      # int
+    a.note_audio_bytes(lease, 3.0)    # integral float
+    a.note_audio_bytes(lease, "3")    # digit-only string
+    assert lease.bytes_used == 9
+
+
+def test_origin_must_be_canonical_exact_form():
+    c, a = make()
+    for bad in ("HTTPS://app.example", "https://APP.example",
+                "https://app.example.", "https://app.example:99999",
+                "https://app.example:0", "https://app.example:abc",
+                "https://app.example\tevil", "https://app.example.evil\n",
+                "https://app.example ", " https://app.example",
+                "https://user@app.example", "https://app.example/",
+                "https://app.example?q=1", "https://app.example#f",
+                "https://app..example", "https://app.example:-1",
+                "http://app.example", "app.example", "https://"):
+        with pytest.raises(AdapterError) as ei:
+            a.redeem(c.issue(), bad, "transcribe")
+        assert ei.value.code.startswith("bad_origin")
+
+
+def test_origin_with_valid_port_allowlisted():
+    c = FakeCanonical()
+    a = VoiceAdapter(c, "scoped-x",
+                     allowed_origins={"https://app.example:8443"})
+    t = c.issue(origin="https://app.example:8443")
+    lease = a.redeem(t, "https://app.example:8443", "transcribe")
+    assert lease.lease_id
+    # same origin, non-canonical port spelling -> rejected, never normalized
+    with pytest.raises(AdapterError) as ei:
+        a.redeem(c.issue(origin="https://app.example:8443"),
+                 "https://app.example:8443 ", "transcribe")
+    assert ei.value.code == "bad_origin"

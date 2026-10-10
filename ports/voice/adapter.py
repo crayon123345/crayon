@@ -16,13 +16,21 @@ obligations of the accepted contract:
   Negative byte increments are rejected; server-provided caps are CLAMPED
   to the contract bounds (600s / 20MB) - a server can only tighten them.
 - Redeem ticket travels in the request BODY only (never in a URL).
-- Local binding validation: observed_origin must parse as a strict https
-  origin (no empty host, credentials, path, query or fragment) AND be on
-  the explicit allowlist; canonical redeem responses must echo the bound
+- Local binding validation: observed_origin must BE a canonical https
+  origin (literal lowercase scheme and host, no credentials, path, query,
+  fragment, whitespace, empty labels, trailing dot, or out-of-range port;
+  anything needing normalization is rejected outright) AND be on the
+  explicit allowlist; canonical redeem responses must echo the bound
   mode/origin and carry the required fields; revalidate responses must
   echo the lease's lease_id, request_id and expires_at; active:false is a
   close.
-- seq is monotonic per request.
+- NaN/Infinity in ANY timing or byte value taken from a canonical
+  response (audio caps, revalidate cadence, expires_at) is REJECTED as
+  non-conformant, never clamped or defaulted - non-finite comparisons are
+  always false and would silently disable caps or the liveness cadence.
+- seq is monotonic per request. Integer inputs (audio byte increments)
+  are strictly parsed: bools, fractional/non-finite floats, and strings
+  with signs, whitespace or float syntax are rejected, never truncated.
 - Terminal guard: after a final, only an IDENTICAL final retry while the
   lease is still live is valid (canonical duplicate path); any other
   progress/final is rejected locally.
@@ -33,9 +41,10 @@ obligations of the accepted contract:
   effects. Resolution is only via the authorized browser read-only
   /voice/result within the original 300s TTL.
 """
+import math
+import re
 import threading
 import time
-from urllib.parse import urlsplit
 
 PROGRESS_TYPES = {"accepted", "progress", "transcript_partial", "transcript_final",
                   "answer_partial", "answer_final", "review_required", "artifact",
@@ -48,6 +57,42 @@ REQUIRED_REDEEM_FIELDS = ("lease_id", "request_id", "conversation_id",
 # Contract bounds: server-provided caps may only tighten these, never widen.
 CONTRACT_MAX_SECONDS = 600
 CONTRACT_MAX_BYTES = 20000000
+
+# Canonical origin form: literal lowercase https, lowercase host labels
+# (no empty labels, no leading/trailing dot, no trailing hyphen), optional
+# numeric port. Anything needing normalization to compare equal is not an
+# exact origin.
+_ORIGIN_RE = re.compile(
+    r"^https://([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*)(?::([0-9]{1,5}))?$")
+
+
+def _require_finite(value, field):
+    """A timing/byte value taken from a canonical response must be a real
+    finite number. NaN/Infinity (and bools/non-numbers) are non-conformant
+    and REJECTED: non-finite comparisons are always false, which would
+    silently disable a cap or the liveness cadence."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AdapterError(f"bad_binding:{field}", 502)
+    v = float(value)
+    if not math.isfinite(v):
+        raise AdapterError(f"bad_binding:{field}", 502)
+    return v
+
+
+def _strict_int(value):
+    """Strict integer parsing: real ints, integral floats, and digit-only
+    strings. Bools, fractional/non-finite floats, and strings with signs,
+    whitespace or float syntax are rejected (None), never truncated."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) and value.is_integer() else None
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        return int(value)
+    return None
 
 
 class TransportTimeout(Exception):
@@ -82,24 +127,34 @@ class Lease:
         self.conversation_id = body["conversation_id"]
         self.mode = body["mode"]
         self.origin = body["origin"]
-        self.expires_at = body["expires_at"]
-        lim = body.get("audio_limits") or {}
+        self.expires_at = _require_finite(body["expires_at"], "expires_at")
+        lim = body.get("audio_limits")
+        if not isinstance(lim, dict):
+            raise AdapterError("bad_binding:audio_limits", 502)
         # Clamp server-provided caps to the contract bounds: the server may
-        # tighten but never widen beyond 600s / 20MB.
+        # tighten but never widen beyond 600s / 20MB. Non-finite values are
+        # rejected, not clamped (see _require_finite).
         self.audio_limits = {
-            "max_seconds": min(lim.get("max_seconds", CONTRACT_MAX_SECONDS),
-                               CONTRACT_MAX_SECONDS),
-            "max_bytes": min(lim.get("max_bytes", CONTRACT_MAX_BYTES),
-                             CONTRACT_MAX_BYTES),
+            "max_seconds": (min(_require_finite(lim["max_seconds"],
+                                                "audio_limits.max_seconds"),
+                                CONTRACT_MAX_SECONDS)
+                            if "max_seconds" in lim else CONTRACT_MAX_SECONDS),
+            "max_bytes": (min(_require_finite(lim["max_bytes"],
+                                              "audio_limits.max_bytes"),
+                              CONTRACT_MAX_BYTES)
+                          if "max_bytes" in lim else CONTRACT_MAX_BYTES),
         }
         # Clamp incoming timing to the contract cadence: the server may
         # tighten but NEVER widen the 15s revalidation cadence (a 3600s
         # server value would silently disable active liveness AND stretch
-        # the cancellation join timeout). Non-positive/garbage -> contract.
+        # the cancellation join timeout). Non-positive/garbage -> contract;
+        # NaN/Infinity -> rejected (comparisons would be silently false).
         try:
             rs = float(body.get("revalidate_seconds", REVALIDATE_SECONDS))
         except (TypeError, ValueError):
             rs = REVALIDATE_SECONDS
+        if not math.isfinite(rs):
+            raise AdapterError("bad_binding:revalidate_seconds", 502)
         self.revalidate_seconds = (REVALIDATE_SECONDS if rs <= 0
                                    else min(rs, REVALIDATE_SECONDS))
         self.redeemed_at = clock()
@@ -143,20 +198,21 @@ class VoiceAdapter:
 
     # -- redeem ----------------------------------------------------------
     def _check_origin(self, observed_origin):
-        """Strict origin parse: https scheme, non-empty host, no
-        credentials, no path/query/fragment, and on the exact allowlist."""
+        """Exact-origin strictness: the origin must BE its canonical form
+        (see _ORIGIN_RE) - no case folding, whitespace, control characters,
+        empty labels, trailing dot, credentials, path, query, fragment, or
+        out-of-range port - and the exact string must be on the explicit
+        allowlist. Anything that would need normalization to compare equal
+        is rejected outright instead of being normalized into a match."""
         if not isinstance(observed_origin, str):
             raise AdapterError("bad_origin", 400)
-        try:
-            p = urlsplit(observed_origin)
-        except ValueError:
-            raise AdapterError("bad_origin", 400) from None
-        if (p.scheme != "https" or not p.hostname
-                or p.username is not None or p.password is not None
-                or p.path not in ("", "/") or p.query or p.fragment):
+        m = _ORIGIN_RE.match(observed_origin)
+        if not m:
             raise AdapterError("bad_origin", 400)
-        normalized = f"https://{p.hostname}" + (f":{p.port}" if p.port else "")
-        if normalized not in self._allowed:
+        port = m.group(2)
+        if port is not None and not 1 <= int(port) <= 65535:
+            raise AdapterError("bad_origin", 400)
+        if observed_origin not in self._allowed:
             raise AdapterError("bad_origin:not_allowlisted", 400)
 
     def redeem(self, ticket, observed_origin, mode):
@@ -192,11 +248,8 @@ class VoiceAdapter:
         self._require_clean()
         with self._lock:
             self._require_active(lease)
-            try:
-                n = int(n)
-            except (TypeError, ValueError):
-                raise AdapterError("bad_increment", 400) from None
-            if n < 0:
+            n = _strict_int(n)
+            if n is None or n < 0:
                 raise AdapterError("bad_increment", 400)
             lease.bytes_used += n
             self._check_caps(lease)

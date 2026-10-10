@@ -73,7 +73,7 @@ revocation push, erasure, real browser/device/codec/provider roundtrips.
 
 ## Tests
 
-`pytest ports/voice` - 46 synthetic tests, including a genuine threaded
+`pytest ports/voice` - 56 synthetic tests, including a genuine threaded
 redeem race (barrier-synchronized, exactly one winner), a real lost-commit
 (canonical commits, response transport dies -> CommitUnknown + close + no
 replay), exact 120s expiry boundary, incremental 600s/20MB cap enforcement,
