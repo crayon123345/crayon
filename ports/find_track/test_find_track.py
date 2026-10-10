@@ -2,9 +2,9 @@ import sys, os, unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from find_track import (FindTrack, MemTrackStore, TrackError,
-                        TrackLimitReached, ItemLimitReached, NoMatch,
-                        canonical_url, MAX_TRACKS, MAX_TOPIC, MAX_ITEMS,
-                        MAX_RUN_ITEMS, MAX_URL, MAX_TITLE)
+                        TrackLimitReached, DiffLimitReached, NoMatch,
+                        canonical_url, MAX_TRACKS, MAX_TOPIC,
+                        MAX_DIFF_ITEMS, MAX_RUN_ITEMS, MAX_URL, MAX_TITLE)
 
 T0 = 1791633600
 HOUR = 3600
@@ -58,57 +58,50 @@ class AddRemoveTests(unittest.TestCase):
         self.assertRaises(NoMatch, f.run, "u1", tid, [], T0)
 
 
-class RunTests(unittest.TestCase):
-    def test_first_run_raises_card_with_all_items(self):
+class DiffTests(unittest.TestCase):
+    def test_first_run_returns_all_items(self):
         f = make()
         tid = f.add("u1", "t", T0)
-        card = f.run("u1", tid, [item(1), item(2)], T0 + HOUR)
-        self.assertEqual(len(card["items"]), 2)
-        self.assertEqual(card["state"], "open")
+        d = f.run("u1", tid, [item(1), item(2)], T0 + HOUR)
+        self.assertEqual(len(d["new"]), 2)
+        self.assertEqual(d["tid"], tid)
+        self.assertEqual(d["topic"], "t")
 
-    def test_second_run_no_new_no_card(self):
+    def test_second_run_same_set_no_diff(self):
         f = make()
         tid = f.add("u1", "t", T0)
         f.run("u1", tid, [item(1)], T0 + HOUR)
         self.assertIsNone(f.run("u1", tid, [item(1)], T0 + 2 * HOUR))
 
-    def test_new_items_extend_open_card(self):
+    def test_only_new_items_reported(self):
         f = make()
         tid = f.add("u1", "t", T0)
         f.run("u1", tid, [item(1)], T0 + HOUR)
-        card = f.run("u1", tid, [item(1), item(2)], T0 + 2 * HOUR)
-        self.assertEqual(len(card["items"]), 2)
+        d = f.run("u1", tid, [item(1), item(2)], T0 + 2 * HOUR)
+        self.assertEqual(len(d["new"]), 1)
+        self.assertEqual(d["new"][0]["canonical"], "https://news.example/story-2")
 
-    def test_dismiss_then_only_fresh_items_reraise(self):
+    def test_items_carry_first_seen(self):
         f = make()
         tid = f.add("u1", "t", T0)
-        f.run("u1", tid, [item(1)], T0 + HOUR)
-        f.dismiss("u1", tid, T0 + 2 * HOUR)
-        # same items again: dismissed set is known, no re-raise
-        self.assertIsNone(f.run("u1", tid, [item(1)], T0 + 3 * HOUR))
-        # genuinely new item re-raises a fresh card
-        card = f.run("u1", tid, [item(1), item(2)], T0 + 4 * HOUR)
-        self.assertEqual(len(card["items"]), 1)
-        self.assertEqual(card["items"][0]["canonical"], "https://news.example/story-2")
-
-    def test_dismiss_without_card_raises(self):
-        f = make()
-        tid = f.add("u1", "t", T0)
-        self.assertRaises(NoMatch, f.dismiss, "u1", tid, T0)
+        d1 = f.run("u1", tid, [item(1)], T0 + HOUR)
+        d2 = f.run("u1", tid, [item(1), item(2)], T0 + 2 * HOUR)
+        self.assertEqual(d1["new"][0]["first_seen"], T0 + HOUR)
+        self.assertEqual(d2["new"][0]["first_seen"], T0 + 2 * HOUR)
 
     def test_run_cap_refuses_zero_effects(self):
         f = make()
         tid = f.add("u1", "t", T0)
         self.assertRaises(TrackError, f.run, "u1", tid,
                           [item(i) for i in range(MAX_RUN_ITEMS + 1)], T0)
-        self.assertIsNone(f.list("u1")[0]["last_run_at"])  # zero effects
+        self.assertIsNone(f.list("u1")[0]["last_run_at"])
 
     def test_atomic_run_bad_item_refuses_all(self):
         f = make()
         tid = f.add("u1", "t", T0)
         bad = [item(1), {"url": "notaurl"}, item(2)]
         self.assertRaises(TrackError, f.run, "u1", tid, bad, T0)
-        self.assertEqual(f.list("u1")[0]["known"], 0)  # item(1) NOT committed
+        self.assertEqual(f.list("u1")[0]["known"], 0)
 
     def test_title_overflow_rejects(self):
         f = make()
@@ -122,33 +115,58 @@ class RunTests(unittest.TestCase):
         self.assertRaises(TrackError, f.run, "u1", tid,
                           [{"url": "https://a.com/" + "x" * MAX_URL}], T0)
 
-    def test_evidence_cap_refuses_run(self):
+    def test_malformed_port_rejects_cleanly(self):
         f = make()
         tid = f.add("u1", "t", T0)
-        f.run("u1", tid, [item(i) for i in range(MAX_ITEMS)], T0 + HOUR)
-        self.assertRaises(ItemLimitReached, f.run, "u1", tid,
-                          [item(MAX_ITEMS)], T0 + 2 * HOUR)
-        # refused run: the new item did not enter the known set
-        self.assertEqual(f.list("u1")[0]["known"], MAX_ITEMS)
+        self.assertRaises(TrackError, f.run, "u1", tid,
+                          [{"url": "https://a.example:bad/x"}], T0)
+
+    def test_diff_cap_refuses_whole_run(self):
+        f = make()
+        tid = f.add("u1", "t", T0)
+        self.assertRaises(DiffLimitReached, f.run, "u1", tid,
+                          [item(i) for i in range(MAX_DIFF_ITEMS + 1)], T0)
+        self.assertEqual(f.list("u1")[0]["known"], 0)  # nothing committed
 
     def test_dedup_within_run_canonical(self):
         f = make()
         tid = f.add("u1", "t", T0)
-        card = f.run("u1", tid, [{"url": "https://www.a.com/x?utm_source=n#f"},
-                                 {"url": "https://a.com/x"}], T0)
-        self.assertEqual(len(card["items"]), 1)
+        d = f.run("u1", tid, [{"url": "https://www.a.com/x?utm_source=n#f"},
+                              {"url": "https://a.com/x"}], T0)
+        self.assertEqual(len(d["new"]), 1)
+
+    def test_scheme_port_are_identity(self):
+        f = make()
+        tid = f.add("u1", "t", T0)
+        d = f.run("u1", tid, [{"url": "http://a.example:8080/x"},
+                              {"url": "https://a.example:9090/x"}], T0)
+        self.assertEqual(len(d["new"]), 2)  # distinct resources
+
+    def test_ipv6_item(self):
+        f = make()
+        tid = f.add("u1", "t", T0)
+        d = f.run("u1", tid, [{"url": "https://[::1]:8080/x"}], T0)
+        self.assertEqual(d["new"][0]["canonical"], "https://[::1]:8080/x")
 
     def test_determinism(self):
         a, b = make(), make()
+        out = []
         for f in (a, b):
             tid = f.add("u1", "t", T0)
             f.run("u1", tid, [item(1), item(2)], T0 + HOUR)
-            f.run("u1", tid, [item(2), item(3)], T0 + 2 * HOUR)
-        self.assertEqual(a.card("u1", "trk_t001"), b.card("u1", "trk_t001"))
+            out.append(f.run("u1", tid, [item(2), item(3)], T0 + 2 * HOUR))
+        self.assertEqual(out[0], out[1])
         self.assertEqual(a.list("u1"), b.list("u1"))
 
+    def test_returned_diff_is_a_snapshot(self):
+        f = make()
+        tid = f.add("u1", "t", T0)
+        d = f.run("u1", tid, [item(1)], T0)
+        d["new"].clear()
+        self.assertEqual(f.list("u1")[0]["known"], 1)
 
-class RoundOneRegressionTests(unittest.TestCase):
+
+class IdTests(unittest.TestCase):
     def test_remove_add_never_reuses_ids(self):
         f = make()
         t1 = f.add("u1", "one", T0)
@@ -163,35 +181,6 @@ class RoundOneRegressionTests(unittest.TestCase):
         f.add("u1", "first", T0)
         self.assertRaises(TrackError, f.add, "u1", "second", T0)
         self.assertEqual([x["topic"] for x in f.list("u1")], ["first"])
-
-    def test_caller_mutation_cannot_corrupt_card(self):
-        f = make()
-        tid = f.add("u1", "t", T0)
-        card = f.run("u1", tid, [item(1)], T0)
-        card["items"].clear()
-        card["state"] = "dismissed"
-        stored = f.card("u1", tid)
-        self.assertEqual(stored["state"], "open")
-        self.assertEqual(len(stored["items"]), 1)
-        stored["items"].clear()
-        self.assertEqual(len(f.card("u1", tid)["items"]), 1)
-
-    def test_items_carry_first_seen(self):
-        f = make()
-        tid = f.add("u1", "t", T0)
-        f.run("u1", tid, [item(1)], T0 + HOUR)
-        card = f.run("u1", tid, [item(1), item(2)], T0 + 2 * HOUR)
-        self.assertEqual(card["items"][0]["first_seen"], T0 + HOUR)
-        self.assertEqual(card["items"][1]["first_seen"], T0 + 2 * HOUR)
-
-    def test_scheme_port_are_identity(self):
-        f = make()
-        tid = f.add("u1", "t", T0)
-        f.run("u1", tid, [{"url": "http://a.example:8080/x"}], T0)
-        # same path on a different scheme+port is a NEW item, not a repeat
-        card = f.run("u1", tid, [{"url": "https://a.example:9090/x"}], T0 + HOUR)
-        self.assertIsNotNone(card)
-        self.assertEqual(len(card["items"]), 2)
 
 
 class OwnerStrictTests(unittest.TestCase):
@@ -208,6 +197,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(canonical_url("HTTPS://WWW.A.com/B/?utm_x=1&keep=2#f"),
                          "https://a.com/B?keep=2")
         self.assertRaises(TrackError, canonical_url, "ftp://x")
+        self.assertRaises(TrackError, canonical_url, "https://a.example:bad/x")
 
 
 if __name__ == "__main__":

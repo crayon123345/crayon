@@ -1,41 +1,45 @@
-"""ports/find_track - tracked topics: change detection, proactive cards.
+"""ports/find_track - tracked topics: known-set diffing, plain diff facts.
 
-Find-feature upgrade, port 3 of 3. "Track <topic> - tell me when it
-changes." The owner registers a topic; the integration re-runs the
-search on its own schedule and feeds each RESULT SET here; the module
-diffs it against the track's known items and raises a reviewable card
-when something new appears. Cards are suggestions with evidence - they
-never act. Stands alone.
+Find-feature upgrade, port 3 of 3. "Track <topic> - tell me when
+something new appears." The owner registers a topic; the integration
+re-runs the search on its own schedule (ports/schedule territory) and
+feeds each RESULT SET here; the module diffs it against the track's
+known items and returns PLAIN DIFF FACTS. There is NO card state
+machine here: surfacing, open/dismiss decisions, re-raise policy and
+delivery belong to ports/patterns, which consumes these facts. One
+authoritative decision state, owned by patterns.
 
 Design invariants:
 
-1. READ-ONLY BY CONSTRUCTION: no code path from a card to any action.
-   Cards surface new findings; what the integration does with a card
-   is its own gated flow.
-2. EVIDENCE IS VISIBLE: every card carries the track id, the new
-   items (urls + titles), and when they were first seen. No card
-   without new items; no item without a url.
-3. DETERMINISTIC DIFFING: an item is identified by its canonical url;
-   new = canonical not in the track's known set. Same track state +
-   same result set -> same diff (determinism-tested).
-4. ATOMIC RUNS: the whole result set is diffed first; over-bounds
-   input refuses the whole run with zero effects - never a partial
-   update of the known set.
-5. NO NAGGING: one open card per track; new findings extend the open
-   card's evidence. A dismissed card re-raises only on items first
-   seen AFTER the dismissal - the dismissed set alone never re-raises.
-6. OWNER-STRICT: tracks, runs and cards keyed to the owning account;
-   a second owner's activity leaves the first byte-identical.
-7. CAPS REFUSE, NEVER EVICT: MAX_TRACKS per owner, MAX_ITEMS evidence
-   per card; overflow raises with zero effects.
+1. DIFF FACTS ONLY: run() returns {"tid", "new": [...]} or None. No
+   cards, no dismissal, no reopening - those are patterns' lifecycle.
+   The no-nagging property is structural: a seen URL is in the known
+   set forever, so a stale replay produces an EMPTY diff forever.
+2. EVIDENCE IS VISIBLE: every diff item carries its canonical identity,
+   the original url, title and a per-item first_seen timestamp.
+3. DETERMINISTIC DIFFING: an item is its canonical url (scheme + port
+   preserved); new = not in the track's known set. Same state + same
+   results -> same diff (determinism-tested). URL-DISCOVERY SCOPE,
+   stated honestly: this detects NEWLY SEEN URL IDENTITIES ONLY - a
+   changed title or body at an already-known URL produces no diff.
+4. ATOMIC RUNS: the whole result set is validated and diffed first; a
+   bad item, an over-bounds run, or a diff that would exceed the
+   output cap refuses the WHOLE run with zero effects - earlier valid
+   items in the same batch are NOT committed.
+5. OWNER-STRICT: tracks, runs and known sets keyed to the owning
+   account; a second owner's activity leaves the first byte-identical.
+6. IDS NEVER REUSED: monotonic per-owner sequence; remove + add cannot
+   overwrite a live track; injected collisions refuse before
+   assignment.
+7. CAPS REFUSE, NEVER EVICT: MAX_TRACKS per owner, MAX_RUN_ITEMS per
+   run, MAX_DIFF_ITEMS per returned diff; overflow raises zero-effects.
 8. OVERFLOW REJECTS, NEVER TRUNCATES: over-length topic/url/title
    raises; truncation could alias distinct items.
-9. CLOCKS + IDS INJECTED; NOT MOUNTED, NO DELIVERY: the integration
-   owns scheduling, searching and rendering.
+9. CLOCKS + IDS INJECTED; NOT MOUNTED: no timers, no cron, no network,
+   no delivery - run() is invoked from outside.
 """
 
 import os
-import re
 import sys
 
 # Shared URL identity: the corrected canonicalizer lives in
@@ -46,10 +50,11 @@ from urlcanon import canonical_url as _shared_canonical_url, UrlCanonError
 
 MAX_TRACKS = 25
 MAX_TOPIC = 200
-MAX_ITEMS = 10       # evidence items per card
+MAX_DIFF_ITEMS = 10  # new items returned per run
 MAX_RUN_ITEMS = 50   # result-set size per run
 MAX_URL = 500
 MAX_TITLE = 200
+
 
 class TrackError(Exception):
     pass
@@ -59,7 +64,7 @@ class TrackLimitReached(TrackError):
     pass
 
 
-class ItemLimitReached(TrackError):
+class DiffLimitReached(TrackError):
     pass
 
 
@@ -76,7 +81,7 @@ def canonical_url(url):
 
 class Track(object):
     __slots__ = ("tid", "owner", "topic", "created_at", "last_run_at",
-                 "known", "card", "dismissed_at")
+                 "known")
 
     def __init__(self, tid, owner, topic, now):
         self.tid = tid
@@ -84,9 +89,7 @@ class Track(object):
         self.topic = topic
         self.created_at = now
         self.last_run_at = None
-        self.known = set()        # canonical urls seen in any accepted run
-        self.card = None          # {"state": open|dismissed, "items": [...], "updated_at": ts}
-        self.dismissed_at = None
+        self.known = set()  # canonical urls seen in any accepted run
 
 
 class MemTrackStore(object):
@@ -135,9 +138,11 @@ class FindTrack(object):
 
     def run(self, owner, tid, results, now):
         """Diff one result set against the track's known set. results:
-        [{"url": str, "title": str?}]. Atomic: over-bounds input or any
-        invalid item refuses the WHOLE run with zero effects. Returns
-        the card when new items were found, else None."""
+        [{"url": str, "title": str?}]. Atomic: over-bounds input, any
+        invalid item, or a diff over MAX_DIFF_ITEMS refuses the WHOLE
+        run with zero effects. Returns {"tid", "new": [...]} when new
+        items were found - plain diff facts for ports/patterns to
+        surface - else None."""
         t = self._track(owner, tid)
         if not isinstance(results, (list, tuple)):
             raise TrackError("results must be a list")
@@ -159,11 +164,8 @@ class FindTrack(object):
             items.append({"canonical": canon, "url": r["url"].strip(),
                           "title": title.strip()})
         new = [it for it in items if it["canonical"] not in t.known]
-        # evidence cap: refuse the run rather than record partial findings
-        open_items = len(t.card["items"]) if t.card and t.card["state"] == "open" else 0
-        if new and open_items + len(new) > MAX_ITEMS:
-            raise ItemLimitReached("card evidence cap %d would be exceeded"
-                                   % MAX_ITEMS)
+        if len(new) > MAX_DIFF_ITEMS:
+            raise DiffLimitReached("diff over %d items" % MAX_DIFF_ITEMS)
         # commit: whole run becomes known exactly once
         t.known |= seen
         t.last_run_at = now
@@ -171,35 +173,9 @@ class FindTrack(object):
             return None
         for it in new:
             it["first_seen"] = now
-        if t.card is None or t.card["state"] == "dismissed":
-            t.card = {"state": "open", "items": list(new),
-                      "updated_at": now, "raised_at": now}
-        else:
-            t.card["items"].extend(new)
-            t.card["updated_at"] = now
-        return self._card_snapshot(t.card)
-
-    def dismiss(self, owner, tid, now):
-        t = self._track(owner, tid)
-        if t.card is None or t.card["state"] != "open":
-            raise NoMatch("no open card")
-        t.card["state"] = "dismissed"
-        t.dismissed_at = now
-
-    @staticmethod
-    def _card_snapshot(card):
-        if card is None:
-            return None
-        snap = dict(card)
-        snap["items"] = [dict(it) for it in card["items"]]
-        return snap
-
-    def card(self, owner, tid):
-        t = self._track(owner, tid)
-        return self._card_snapshot(t.card)
+        return {"tid": tid, "topic": t.topic, "new": new}
 
     def list(self, owner):
         return [{"tid": t.tid, "topic": t.topic, "created_at": t.created_at,
-                 "last_run_at": t.last_run_at, "known": len(t.known),
-                 "card": (t.card["state"] if t.card else None)}
+                 "last_run_at": t.last_run_at, "known": len(t.known)}
                 for t in self._tracks(owner).values()]
