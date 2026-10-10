@@ -1,12 +1,14 @@
 # Canonical voice adapter API v1 - reference contract
 
-Revision3: deny-after-terminal liveness policy and endpoint response codes. Interface for review and synthetic adapter work. Not deployed. Does not activate Live. The accepted runtime-contract.md remains unchanged; this specifies its API shapes.
+Revision4: required lease echo and numeric UTC expiry aligned across canonical/reference/adapter. Preserves Revision3 liveness and endpoint response codes. Interface for review and synthetic adapter work. Not deployed. Does not activate Live. The accepted runtime-contract.md remains unchanged; this specifies its API shapes.
 
 ## Boundaries
 
 Canonical owner is derived from authenticated web session, never an adapter/body user ID. Adapter uses a separate server-only rotated credential, scoped to redeem/revalidate/progress/final only. No ticket issue, account reads or private tools. Do not put tickets/credentials in URLs or logs. TLS required on deployed routes.
 
 Origin attestation means checking the browser's exact HTTPS Origin header against the configured deployment origin AND the canonical ticket's bound origin. It is not native-device attestation or a cryptographic proof of the browser. Adapter must read actual websocket Origin, never a client message/UA. Canonical trusts the scoped adapter to report that observed header on redeem. Missing/null origin rejected, no UA/native exception. A malicious holder of the adapter credential is outside this header guarantee; rotate/revoke the credential and do not expose it to clients. Android Chrome/TWA actual headers/roundtrip remain required device tests.
+
+All wire expires_at values for issue/redeem/revalidate/recovery are finite JSON numbers: UTC Unix seconds since1970 (fractional seconds allowed), derived from canonical database/server clock. Never ISO timestamp strings, client-clock-derived values, NaN or Infinity. Equality binding compares the original lease expiry unchanged.
 
 ## Browser issue
 
@@ -31,8 +33,10 @@ Redeem ticket from first websocket frame only. Query tickets rejected. Atomic pe
 POST /voice/internal/revalidate
 Authorization: scoped adapter credential
 Body: {version:1,lease_id}
-Response 200: {version:1,active:true,request_id,expires_at,next_check_seconds:15}
+Response 200: {version:1,active:true,lease_id,request_id,expires_at,next_check_seconds:15}
 Response 410: {error_code:revoked|expired}
+
+Revalidate must echo the actual requested lease_id, bound request_id and original numeric expires_at. Missing/mismatched echo denies before provider work.
 
 Adapter checks immediately before provider connect and every15 seconds while active; closes on 410 or unavailable validation. No grace fallback. Canonical rechecks live session on ALL progress/final calls, denying immediately after revocation, not merely after15 seconds. Duration from canonical redeemed_at, bytes enforced incrementally by gateway and adapter, first cap ends turn. No automatic continuation.
 
