@@ -222,5 +222,47 @@ class TestLimitsAndCaps(unittest.TestCase):
         self.assertIn("followup", c.context_block(A))
 
 
+class TestReviewRegressions(unittest.TestCase):
+    def test_category_then_sensitive_marker_not_swallowed(self):
+        # regression: "remember #goal sensitive: x" used to store the
+        # sensitive marker as PLAINTEXT in a non-sensitive fact
+        c = fresh()
+        r = c.handle_message(A, "remember #goal sensitive: my therapy schedule",
+                             source_sid="s", source_ts=1)
+        self.assertIn("opt in", r)               # refused without opt-in
+        self.assertEqual(c.store.count(A), 0)    # zero writes
+        c.store.set_optin(A, True)
+        r = c.handle_message(A, "remember #goal sensitive: my therapy schedule",
+                             source_sid="s", source_ts=2)
+        f = c.store.list(A)[0]
+        self.assertTrue(f.sensitive)
+        self.assertEqual(f.category, "goal")
+        self.assertEqual(f.text, "my therapy schedule")  # marker not in text
+        self.assertNotIn("therapy", c.context_block(A))
+
+    def test_sensitive_then_category_marker_order(self):
+        c = fresh()
+        c.store.set_optin(A, True)
+        c.handle_message(A, "remember sensitive: #person my therapist is Dr K",
+                         source_sid="s", source_ts=1)
+        f = c.store.list(A)[0]
+        self.assertTrue(f.sensitive)
+        self.assertEqual(f.category, "person")
+        self.assertEqual(f.text, "my therapist is Dr K")
+
+    def test_correct_at_cap_returns_message_not_exception(self):
+        # regression: FactLimitReached escaped the correct command handler
+        c = fresh()
+        for i in range(MAX_FACTS_PER_OWNER):
+            c.remember(A, "cap filler %d" % i, source_sid="s", source_ts=i)
+        r = c.handle_message(A, "correct cap filler 3 to replacement fact",
+                             source_sid="s", source_ts=999999)
+        self.assertIn("memory is full", r)
+        # zero effects: no new fact, nothing superseded
+        self.assertEqual(c.store.count(A), MAX_FACTS_PER_OWNER)
+        self.assertEqual([f for f in c.store.list(A, include_superseded=True)
+                          if f.superseded_by], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

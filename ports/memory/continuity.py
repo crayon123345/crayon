@@ -242,16 +242,23 @@ class Continuity:
         if m:
             body = m.group(1).strip()
             sensitive = False
-            sm = re.match(r"^sensitive\s*:\s*(.+)$", body, re.I | re.S)
-            if sm:
-                sensitive = True
-                body = sm.group(1).strip()
             category = "other"
-            cm = re.match(r"^#(preference|person|goal|experience|followup)\s+(.+)$",
-                          body, re.I | re.S)
-            if cm:
-                category = cm.group(1).lower()
-                body = cm.group(2).strip()
+            # Strip leading markers in ANY order, repeatedly: "#goal sensitive: x"
+            # and "sensitive: #goal x" are equivalent. A swallowed marker must
+            # never end up as plaintext in a non-sensitive fact.
+            while True:
+                sm = re.match(r"^sensitive\s*:\s*(.+)$", body, re.I | re.S)
+                if sm:
+                    sensitive = True
+                    body = sm.group(1).strip()
+                    continue
+                cm = re.match(r"^#(preference|person|goal|experience|followup)\s+(.+)$",
+                              body, re.I | re.S)
+                if cm:
+                    category = cm.group(1).lower()
+                    body = cm.group(2).strip()
+                    continue
+                break
             try:
                 f, created = self.remember(owner, body, category=category,
                                            sensitive=sensitive,
@@ -276,6 +283,8 @@ class Continuity:
             except SensitiveNotAllowed:
                 return ("That correction touches a sensitive fact while "
                         "sensitive memory is off; nothing was changed.")
+            except FactLimitReached as e:
+                return str(e)
             if n:
                 return ("Corrected: %d previous fact(s) superseded by %s. "
                         "The corrected version is what I will use from now on, "

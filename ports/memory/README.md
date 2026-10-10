@@ -9,7 +9,7 @@ chat" boundary - facts here survive fresh chats by construction.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-This port is complete as a tested module (18/18 tests) but is NOT wired
+This port is complete as a tested module (21/21 tests) but is NOT wired
 into the running app. No route, no UI, no production storage, no automatic
 extraction. Named limits, exactly:
 
@@ -50,7 +50,7 @@ extraction. Named limits, exactly:
 - `export my memory` - full JSON export including provenance + history
 - `allow sensitive memory` / `sensitive memory off` - opt in / purge+opt out
 
-## Acceptance criteria covered by tests (test_continuity.py, 18 tests)
+## Acceptance criteria covered by tests (test_continuity.py, 21 tests)
 
 - Corrected facts survive fresh chats (context_block after supersede shows
   only the correction; old text is gone from context).
