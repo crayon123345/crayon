@@ -13,9 +13,11 @@ EFFECTS (store rows, source links), not prose replies.
 import sys, os, json, unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+from datetime import date, timedelta
 from journal import (Journal, JournalEntry, MemJournalStore, JournalError,
-                     JournalLimitReached, default_summarizer,
-                     MAX_ENTRIES_PER_OWNER)
+                     JournalLimitReached, JournalSourceLimit,
+                     default_summarizer, MAX_ENTRIES_PER_OWNER,
+                     MAX_SOURCES_PER_ENTRY)
 
 A, B = "v_owner_a", "v_owner_b"
 D1, D2 = "2026-10-09", "2026-10-10"
@@ -237,14 +239,71 @@ class TestCaps(unittest.TestCase):
         j, s = fresh()
         journal_on(j)
         s.set_optin(A, True)
-        # fill to the cap with distinct days
+        # fill to the cap with distinct REAL days (review finding: the old
+        # fixture generated impossible months 13-15)
+        base = date(2025, 1, 1)
         for i in range(MAX_ENTRIES_PER_OWNER):
-            day = "2025-%02d-%02d" % (1 + i // 28, 1 + i % 28)
+            day = (base + timedelta(days=i)).isoformat()
             s.put(JournalEntry(A, day, "x"))
         self.assertEqual(s.count(A), MAX_ENTRIES_PER_OWNER)
         with self.assertRaises(JournalLimitReached):
             j.record(A, D1, "overflow", source_sid="c", source_ts=1)
         self.assertEqual(s.count(A), MAX_ENTRIES_PER_OWNER)  # nothing evicted
+
+    # --- regression: review findings round 1 ---
+
+    def test_source_cap_refuses_with_zero_effects(self):
+        j, s = fresh()
+        journal_on(j)
+        for i in range(MAX_SOURCES_PER_ENTRY):
+            j.record(A, D1, "m%d" % i, source_sid="c", source_ts=i)
+        entry = j.get_entry(A, D1)
+        text_before, n_before = entry.text, len(entry.sources)
+        with self.assertRaises(JournalSourceLimit):
+            j.record(A, D1, "link %d" % MAX_SOURCES_PER_ENTRY,
+                     source_sid="c", source_ts=9999)
+        entry = j.get_entry(A, D1)
+        self.assertEqual(len(entry.sources), n_before)   # no truncation
+        self.assertEqual(entry.text, text_before)        # no silent change
+        self.assertNotIn("9999", str(entry.to_dict()))
+
+    def test_real_calendar_validation(self):
+        j, s = fresh()
+        journal_on(j)
+        for bad in ("2026-02-30", "2026-99-99", "2025-02-29",
+                    "2026-13-01", "2026-00-10", "2026-04-31"):
+            with self.assertRaises(JournalError, msg=bad):
+                j.record(A, bad, "x", source_sid="c", source_ts=1)
+        self.assertEqual(s.count(A), 0)                  # zero effects
+        # leap-day boundary: 2024 is a leap year, 2025 is not
+        j.record(A, "2024-02-29", "leap ok", source_sid="c", source_ts=1)
+        self.assertEqual(s.count(A), 1)
+
+    def test_failing_summarizer_leaves_entry_untouched(self):
+        j, s = fresh()
+        journal_on(j)
+        j.record(A, D1, "first", source_sid="c", source_ts=1)
+        entry = j.get_entry(A, D1)
+        text_before, n_before = entry.text, len(entry.sources)
+
+        def boom(items):
+            raise RuntimeError("model down")
+
+        j.summarizer = boom
+        with self.assertRaises(RuntimeError):
+            j.record(A, D1, "second", source_sid="c", source_ts=2)
+        entry = j.get_entry(A, D1)
+        self.assertEqual(len(entry.sources), n_before)   # no partial write
+        self.assertEqual(entry.text, text_before)
+
+    def test_markdown_export_carries_excerpts(self):
+        j, s = fresh()
+        journal_on(j)
+        j.record(A, D1, "talked about the move", source_sid="c1",
+                 source_ts=1000)
+        md = j.export_markdown(A)
+        self.assertIn("chat c1, message 1000", md)
+        self.assertIn("talked about the move", md)  # excerpt, not just refs
 
     def test_invalid_date_refused(self):
         j, s = fresh()

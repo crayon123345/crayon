@@ -7,7 +7,7 @@ with JSON and Markdown portability. Layered next to /ports/memory and
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-This port is complete as a tested module (22/22 tests) but is NOT wired
+This port is complete as a tested module (26/26 tests) but is NOT wired
 into the running app. Named limits, exactly:
 
 1. NOT MOUNTED: nothing calls Journal from integrated/ yet. Integration
@@ -37,13 +37,25 @@ into the running app. Named limits, exactly:
 6. STORAGE IS INJECTED, NOT DURABLE: MemJournalStore is in-memory; the
    SQL adapter (same encryption-at-rest and vid keying convention as
    cw_mem) is integration work, deliberately not shipped half-wired.
-7. CAPS REFUSE, NEVER EVICT: MAX_ENTRIES_PER_OWNER = 400 (distinct days);
-   recording past the cap raises instead of silently dropping history.
+7. CAPS REFUSE, NEVER EVICT: MAX_ENTRIES_PER_OWNER = 400 (distinct days)
+   and MAX_SOURCES_PER_ENTRY = 50 (links per day) both RAISE on overflow
+   with zero effects - recording never silently drops provenance.
    Retention policy is a parked product decision (same convention as #1).
+8a. DATES ARE REAL: YYYY-MM-DD is validated against the actual calendar
+   (2026-02-30, 2026-99-99, 2025-02-29 refused; 2024-02-29 accepted).
+8b. NO PARTIAL WRITES: recording computes on copies and commits only
+   after every step - including the injected summarizer - succeeds; a
+   failing summarizer leaves the stored entry untouched (tested).
 8. PDF EXPORT IS NOT HERE: the spec's "reuse PDF export" refers to the
    app's existing docs exporter in integrated/ - wiring the journal
    Markdown/JSON into it is mount-time work for the owning side. This
-   port ships JSON + Markdown only.
+   port ships JSON + Markdown only (both carry full provenance:
+   chat id, message ts, AND excerpt).
+9. SOURCE LINKS ARE REFERENCES, NOT URLS: entries carry
+   (chat id, message timestamp, excerpt) - the app's deep-link scheme
+   does not exist yet, so no clickable message URLs are generated.
+   Message dedupe (same inbound recorded twice) is NOT handled here;
+   the integration owns idempotency keys at delivery time.
 
 ## Commands (chat surface)
 
@@ -56,7 +68,7 @@ into the running app. Named limits, exactly:
   (source links unchanged)
 - `export my journal as json` / `export my journal as markdown`
 
-## Acceptance criteria covered by tests (test_journal.py, 22 tests)
+## Acceptance criteria covered by tests (test_journal.py, 26 tests)
 
 - Opt-in gate: record without opt-in stores ZERO rows; off pauses
   recording with zero new links; wipe deletes everything and turns off.
@@ -73,7 +85,11 @@ into the running app. Named limits, exactly:
   opt-ins and wipes have zero effect on the first owner.
 - Grammar discipline: ambiguous phrasing falls through; commands create
   zero entries; invalid dates refused.
-- Cap: refuses at 400 entries with ZERO eviction.
+- Caps: refuses at 400 entries with ZERO eviction; refuses the 51st
+  source link with ZERO effects (no silent truncation).
+- Real calendar validation incl. leap-day boundaries; a failing injected
+  summarizer leaves the stored entry untouched (no partial writes).
+- Markdown export carries excerpts alongside chat/message refs.
 
 ## Version
 

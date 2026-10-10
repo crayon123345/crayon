@@ -28,6 +28,7 @@ Design rules (same discipline as the other ports):
 import re
 import time
 import secrets
+from datetime import date as _date
 
 MAX_ENTRIES_PER_OWNER = 400   # parked retention: refuse, never evict (same as #1)
 MAX_ENTRY_TEXT = 4000
@@ -50,6 +51,10 @@ class JournalLimitReached(JournalError):
     pass
 
 
+class JournalSourceLimit(JournalError):
+    pass
+
+
 class JournalEntry:
     __slots__ = ("id", "owner", "date", "text", "sources", "edited",
                  "created", "updated")
@@ -60,6 +65,10 @@ class JournalEntry:
         self.owner = owner
         if not DATE_RE.match(date or ""):
             raise JournalError("date must be YYYY-MM-DD")
+        try:  # real calendar validation: 2026-02-30 / 2026-99-99 refused
+            _date(int(date[:4]), int(date[5:7]), int(date[8:10]))
+        except ValueError:
+            raise JournalError("not a real calendar date: %s" % date)
         self.date = date
         self.text = (text or "")[:MAX_ENTRY_TEXT]
         self.sources = list(sources or [])[:MAX_SOURCES_PER_ENTRY]
@@ -160,16 +169,26 @@ class Journal:
                     "journal is full (%d entries); delete some first"
                     % MAX_ENTRIES_PER_OWNER)
             entry = JournalEntry(owner, date)
-        if len(entry.sources) < MAX_SOURCES_PER_ENTRY:
-            entry.sources.append({"chat": source_sid, "ts": ts,
-                                  "excerpt": excerpt})
+        if len(entry.sources) >= MAX_SOURCES_PER_ENTRY:
+            # refuse with ZERO effects - never silently drop provenance
+            raise JournalSourceLimit(
+                "entry for %s already has %d source links; nothing was "
+                "recorded" % (date, MAX_SOURCES_PER_ENTRY))
+        # Compute on COPIES; commit to the stored entry only after every
+        # step (including the injected summarizer) has succeeded.
+        new_sources = entry.sources + [{"chat": source_sid, "ts": ts,
+                                        "excerpt": excerpt}]
         if not entry.edited:
             # un-edited entries re-render from sources; an owner-edited
             # entry is NEVER overwritten by later recording (links still
             # accrue, so provenance stays complete)
-            entry.text = self.summarizer(
-                [(s["ts"], s["excerpt"]) for s in entry.sources])[
+            new_text = self.summarizer(
+                [(s["ts"], s["excerpt"]) for s in new_sources])[
                 :MAX_ENTRY_TEXT]
+        else:
+            new_text = entry.text
+        entry.sources = new_sources
+        entry.text = new_text
         entry.updated = int(time.time())
         self.store.put(entry)
         return entry
@@ -224,9 +243,10 @@ class Journal:
                 lines.append("")
                 lines.append("Sources:")
                 for s in e.sources:
-                    lines.append("- chat %s, message %s"
+                    lines.append("- chat %s, message %s: \"%s\""
                                  % (s.get("chat") or "?",
-                                    s.get("ts") or "?"))
+                                    s.get("ts") or "?",
+                                    s.get("excerpt", "")))
             lines.append("")
         return "\n".join(lines)
 
