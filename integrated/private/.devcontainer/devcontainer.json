@@ -1,0 +1,5 @@
+{
+  "name": "Crayon bounded computer",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "postStartCommand": "sh /workspaces/crayon/computer_start.sh"
+}

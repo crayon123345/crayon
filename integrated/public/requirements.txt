@@ -1,0 +1,12 @@
+fastapi>=0.115
+uvicorn>=0.30
+langchain-core>=0.3
+langchain-google-genai>=2.0
+langchain-openai>=0.3
+ddgs
+httpx
+cryptography
+psycopg[binary]>=3.1
+trafilatura
+discord.py>=2.3
+python-multipart

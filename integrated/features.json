@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "source_of_truth": "crayon123345/crayon",
+  "state": "development_review_required",
+  "cutover": false,
+  "account_merge": false,
+  "surfaces": {
+    "studio": "/studio",
+    "workspace": "/workspace/",
+    "canonical": "/"
+  },
+  "public": [
+    "chat",
+    "web_search",
+    "page_read",
+    "python_pyodide",
+    "file_analysis",
+    "charts",
+    "currency",
+    "stocks",
+    "pwa"
+  ],
+  "private": [
+    "telegram_google_email_login",
+    "conversations",
+    "memory",
+    "tasks",
+    "reminders",
+    "scheduled_jobs",
+    "task_reminder_digest",
+    "notifications",
+    "durable_work_queue",
+    "google_account_reads",
+    "email_html_draft_review_send",
+    "calendar_review_create",
+    "docs_read_create",
+    "sheets_read_review_write_create",
+    "slides_create",
+    "public_browser_screenshot",
+    "uploads",
+    "requested_voice",
+    "mcp_review",
+    "rooms",
+    "privacy_controls"
+  ],
+  "pending_peer_source": [
+    "pdf_docx_md_pptx_exports",
+    "research_fanout",
+    "wav_tts_stt",
+    "android_mic_retest",
+    "360dialog_sandbox"
+  ],
+  "not_accepted": [
+    "xlsx_export",
+    "full_device_voice_conversation",
+    "whatsapp_phone_delivery",
+    "drive_discovery",
+    "merged_provider_acceptance",
+    "production_cutover"
+  ],
+  "provider_effects": "exact account owner content recipients review before execution",
+  "local_ports": [
+    "pdf_docx_md_pptx_exports",
+    "research_focus",
+    "sourced_numeric_cards"
+  ]
+}
