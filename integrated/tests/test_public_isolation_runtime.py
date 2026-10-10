@@ -29,3 +29,10 @@ def test_personal_public_router_unavailable():
  with TestClient(A.app) as c:
   assert c.post('/api/mail/tool',json={'action':'send','args':{}}).status_code==404
   assert c.post('/telegram/webhook',json={}).status_code==404
+
+def test_latest_raw_adapters_remain_disabled():
+ with TestClient(A.app) as c:
+  assert c.post('/api/tts',json={'text':'Synthetic'}).status_code==404
+  assert c.post('/api/stt',content=b'Synthetic').status_code==404
+  assert c.post('/whatsapp/d360',json={}).status_code==404
+  assert c.post('/setup/d360-webhook',json={}).status_code==404

@@ -178,6 +178,21 @@
     return out;
   }
 
+  const thinkWords = ['Thinking', 'Pondering', 'Connecting ideas', 'Untangling', 'Piecing it together'];
+  function startThink(bub) {
+    stopThink(bub);
+    let i = 0;
+    bub._think = setInterval(() => {
+      const el = bub.querySelector('.think');
+      if (!el) { stopThink(bub); return; }
+      i++;
+      const secs = i * 3;
+      if (secs >= 30) el.textContent = 'Taking longer than usual - the free host may be waking up';
+      else if (secs >= 12) el.textContent = 'Still working on it';
+      else el.textContent = thinkWords[i % thinkWords.length];
+    }, 3000);
+  }
+  function stopThink(bub) { if (bub && bub._think) { clearInterval(bub._think); bub._think = 0; } }
   async function stream(text, bub) {
     let acc = '', raf = 0, modelTag = '';
     try {
@@ -195,12 +210,12 @@
           const d = line.slice(5).trim(); if (d === '[DONE]') continue;
           try {
             const j = JSON.parse(d);
-            if (j.m) { modelTag = j.m; } if (j.t) { acc += j.t; if (!raf) raf = requestAnimationFrame(() => { raf = 0; bub.innerHTML = md(acc); stick(); }); }
+            if (j.m) { modelTag = j.m; } if (j.t) { stopThink(bub); acc += j.t; if (!raf) raf = requestAnimationFrame(() => { raf = 0; bub.innerHTML = md(acc); stick(); }); }
             if (j.err) { bub.parentElement.classList.add('err'); bub.textContent = j.err; return null; }
           } catch (_) {}
         }
       }
-    } catch (e) { if (stopped) { return null; } bub.parentElement.classList.add('err'); bub.textContent = 'Connection problem. Please try again.'; return null; }
+    } catch (e) { stopThink(bub); if (stopped) { return null; } bub.parentElement.classList.add('err'); bub.textContent = 'Connection problem. Please try again.'; return null; }
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     bub.innerHTML = md(acc);
     if (modelTag && acc) { const t = document.createElement('div'); t.className = 'mtag'; t.textContent = 'via ' + modelTag; bub.appendChild(t); }
@@ -286,7 +301,9 @@
     const TCAP = agentMode ? 8 : 5;
     for (let step = 0; step < TCAP + 1; step++) {
       const bub = add('ai', '<span class="think">Thinking</span>');
+      startThink(bub);
       const acc = await stream(msg, bub);
+      stopThink(bub);
       if (acc !== null) finalAcc = acc;
       if (acc === null || stopped) break;
       const pm = agentMode && acc.match(/```plan\n([\s\S]*?)```/);
@@ -413,6 +430,7 @@
         } catch (_) { err = 'Search failed.'; }
         finishSearch(sc, items, err);
         msg = '[Search results for: ' + q + ']\n' + (items.length ? items.map((x, i) => (i + 1) + '. ' + x.title + (x.date ? ' (' + x.date + ')' : '') + '\n   ' + x.url + '\n   ' + x.snippet).join('\n') : '(no results' + (err ? ': ' + err : '') + ')');
+        if ((document.querySelector('#focus') || {}).value === 'deep') msg += '\n[Deep research mode: synthesize ALL sources into a structured report with ## headings, cite sources inline as [n], end with a Sources list.]';
         continue;
       }
       const ig = acc.match(/```image-gen\n([\s\S]*?)```/);
@@ -553,6 +571,96 @@
   };
   $('#forget').addEventListener('click', forgetHandler);
   const f2 = $('#forget2'); if (f2) f2.addEventListener('click', forgetHandler);
+  // ---- chat export (PDF / Word / Markdown / Slides) - all client-side ----
+  function chatMessages() {
+    return [...log.querySelectorAll('.msg')].map((r) => ({
+      role: r.classList.contains('user') ? 'You' : 'Crayon',
+      text: (r.querySelector('.bubble') || r).innerText.trim(),
+    })).filter((m) => m.text);
+  }
+  function saveBlob(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  }
+  const stamp = () => new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-');
+  function exportMarkdown() {
+    const ms = chatMessages(); if (!ms.length) { toast('Nothing to export yet.'); return; }
+    const body = ms.map((m) => '**' + m.role + ':** ' + m.text).join('\n\n');
+    saveBlob(new Blob(['# Crayon chat\n\n' + body + '\n'], {type: 'text/markdown'}), 'crayon-chat-' + stamp() + '.md');
+  }
+  function exportPDF() {
+    const ms = chatMessages(); if (!ms.length) { toast('Nothing to export yet.'); return; }
+    const { jsPDF } = window.jspdf; const doc = new jsPDF({unit: 'pt'});
+    const W = doc.internal.pageSize.getWidth() - 80; let y = 50;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.text('Crayon chat', 40, y); y += 28;
+    doc.setFontSize(10);
+    for (const m of ms) {
+      doc.setFont('helvetica', 'bold');
+      const head = doc.splitTextToSize(m.role + ':', W);
+      if (y + 14 > 800) { doc.addPage(); y = 50; }
+      doc.text(head, 40, y); y += head.length * 13;
+      doc.setFont('helvetica', 'normal');
+      for (const para of m.text.split('\n')) {
+        const lines = doc.splitTextToSize(para || ' ', W);
+        if (y + lines.length * 13 > 800) { doc.addPage(); y = 50; }
+        doc.text(lines, 40, y); y += lines.length * 13;
+      }
+      y += 12;
+    }
+    doc.save('crayon-chat-' + stamp() + '.pdf');
+  }
+  async function exportDocx() {
+    const ms = chatMessages(); if (!ms.length) { toast('Nothing to export yet.'); return; }
+    const kids = [new docx.Paragraph({text: 'Crayon chat', heading: docx.HeadingLevel.HEADING_1})];
+    for (const m of ms) {
+      kids.push(new docx.Paragraph({children: [new docx.TextRun({text: m.role + ':', bold: true})], spacing: {before: 240}}));
+      for (const para of m.text.split('\n')) kids.push(new docx.Paragraph(para));
+    }
+    const blob = await docx.Packer.toBlob(new docx.Document({sections: [{children: kids}]}));
+    saveBlob(blob, 'crayon-chat-' + stamp() + '.docx');
+  }
+  async function exportSlides() {
+    const ms = chatMessages().filter((m) => m.role === 'Crayon');
+    if (!ms.length) { toast('Ask Crayon something first - slides are built from its last answer.'); return; }
+    const lines = ms[ms.length - 1].text.split('\n').map((l) => l.trim()).filter(Boolean);
+    const title = lines[0].replace(/^[#*\-\d. )]+/, '').slice(0, 90) || 'Crayon slides';
+    const points = lines.slice(1).map((l) => l.replace(/^[#*\-\u2022\d. )]+/, '')).filter(Boolean);
+    const p = new PptxGenJS();
+    p.defineLayout({name: 'W', width: 10, height: 5.63}); p.layout = 'W';
+    const t = p.addSlide();
+    t.addText(title, {x: 0.6, y: 2.1, w: 8.8, fontSize: 32, bold: true, color: '121013', align: 'center'});
+    t.addText('Made with Crayon', {x: 0.6, y: 4.9, w: 8.8, fontSize: 12, color: '888888', align: 'center'});
+    for (let i = 0; i < points.length; i += 5) {
+      const s = p.addSlide();
+      const chunk = points.slice(i, i + 5);
+      s.addText(chunk[0].slice(0, 60), {x: 0.6, y: 0.4, w: 8.8, fontSize: 22, bold: true, color: '121013'});
+      s.addText(chunk.map((c) => ({text: c, options: {bullet: true, fontSize: 16, paraSpaceAfter: 10}})), {x: 0.8, y: 1.3, w: 8.4, h: 3.9, color: '333333'});
+    }
+    await p.writeFile({fileName: 'crayon-slides-' + stamp() + '.pptx'});
+  }
+  (function () {
+    const btn = $('#exportbtn'); if (!btn) return;
+    const menu = document.createElement('div');
+    menu.id = 'exportmenu'; menu.className = 'hide';
+    menu.innerHTML = '<button data-f="pdf">PDF document</button><button data-f="docx">Word (.docx)</button><button data-f="md">Markdown (.md)</button><button data-f="pptx">Slides (.pptx)</button>';
+    document.body.appendChild(menu);
+    const FNS = {pdf: exportPDF, docx: exportDocx, md: exportMarkdown, pptx: exportSlides};
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const r = btn.getBoundingClientRect();
+      menu.style.top = (r.bottom + 6) + 'px'; menu.style.right = (innerWidth - r.right) + 'px';
+      menu.classList.toggle('hide');
+    });
+    menu.addEventListener('click', (e) => {
+      const f = e.target && e.target.dataset && e.target.dataset.f; if (!f) return;
+      menu.classList.add('hide');
+      Promise.resolve(FNS[f]()).catch((err) => { console.error(err); toast('Export failed - ' + (err && err.message || 'try again.')); });
+    });
+    document.addEventListener('click', () => menu.classList.add('hide'));
+  })();
+
   $('#sharebtn').addEventListener('click', async () => {
     try {
       const r = await fetch('/api/share', {method: 'POST', headers: XH, body: '{}'});
@@ -565,24 +673,69 @@
     } catch (_) { toast('Could not create a share link.'); }
   });
 
-  // ---- voice: speech input + spoken replies (browser-native, degrades gracefully) ----
-  let wantSpeak = false;
-  function speak(text) {
-    if (!window.speechSynthesis || !text) return;
+  // ---- voice: Gemini-backed TTS/STT + live conversation, browser fallback ----
+  let wantSpeak = false, ttsAudio = null;
+  async function speak(text) {
+    if (!text) return;
+    const clean = text.replace(/```[\s\S]*?(```|$)/g, ' ').replace(/[*_`#\[\]()>]/g, '').replace(/https?:\/\/\S+/g, 'link').slice(0, 1200);
+    try { ttsAudio && ttsAudio.pause(); } catch (_) {}
+    try { window.speechSynthesis && speechSynthesis.cancel(); } catch (_) {}
     try {
-      speechSynthesis.cancel();
-      const clean = text.replace(/```[\s\S]*?(```|$)/g, ' ').replace(/[*_`#\[\]()>]/g, '').replace(/https?:\/\/\S+/g, 'link').slice(0, 1200);
-      speechSynthesis.speak(new SpeechSynthesisUtterance(clean));
+      const r = await fetch('/api/tts', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: clean})});
+      if (r.ok) {
+        const a = new Audio(URL.createObjectURL(await r.blob()));
+        ttsAudio = a;
+        a.onended = () => { if (ttsAudio === a) ttsAudio = null; };
+        await a.play();
+        return;
+      }
+    } catch (_) {}
+    try {
+      if (window.speechSynthesis) speechSynthesis.speak(new SpeechSynthesisUtterance(clean));
     } catch (_) {}
   }
+  function stopSpeaking() {
+    try { ttsAudio && ttsAudio.pause(); ttsAudio = null; } catch (_) {}
+    try { window.speechSynthesis && speechSynthesis.cancel(); } catch (_) {}
+  }
+
+  // mic: record -> /api/stt (Gemini transcription), fallback to browser SpeechRecognition
+  const mic = $('#mic');
+  if(location.pathname!=='/studio')mic.classList.remove('hide');
+  let mr = null, mrChunks = [];
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (SR) {
-    const mic = $('#mic');
-    mic.classList.remove('hide');
+  async function startGeminiMic() {
+    const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true}});
+    const mtypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+    let mt = '';
+    for (const t of mtypes) { try { if (MediaRecorder.isTypeSupported(t)) { mt = t; break; } } catch (_) {} }
+    mr = mt ? new MediaRecorder(stream, {mimeType: mt}) : new MediaRecorder(stream);
+    mrChunks = [];
+    mr.ondataavailable = (e) => { if (e.data.size) mrChunks.push(e.data); };
+    mr.onstop = async () => {
+      mic.classList.remove('listening');
+      stream.getTracks().forEach((t) => t.stop());
+      toast('Transcribing...');
+      const blob = new Blob(mrChunks, {type: mr.mimeType || 'audio/webm'});
+      try {
+        const r = await fetch('/api/stt', {method: 'POST', headers: {'Content-Type': blob.type || 'audio/webm'}, body: blob});
+        const j = await r.json();
+        const t = (j.text || '').trim();
+        if (t) { input.value = t; wantSpeak = true; ask(t); }
+        else if (SR) { toast('Heard nothing - trying browser dictation. Speak now.'); startSrMic(); }
+        else toast('Heard nothing - try again.');
+      } catch (_) { toast('Transcription failed - try again.'); }
+    };
+    mr.start(250);
+    mic.classList.add('listening');
+    toast('Listening - tap the mic again when done.');
+  }
+  function startSrMic() {
+    if (!SR) { toast('Voice input is not available in this browser.'); return; }
     const rec = new SR();
     rec.lang = navigator.language || 'en-US';
     rec.interimResults = true;
-    let base = '';
+    let base = input.value;
     rec.onresult = (e) => {
       let t = '';
       for (const r of e.results) t += r[0].transcript;
@@ -595,48 +748,162 @@
       if (t) { wantSpeak = true; ask(t); }
     };
     rec.onerror = () => mic.classList.remove('listening');
-    mic.addEventListener('click', () => {
-      if (mic.classList.contains('listening')) { rec.stop(); return; }
-      try { base = input.value; mic.classList.add('listening'); rec.start(); } catch (_) {}
-    });
+    try { mic.classList.add('listening'); rec.start(); } catch (_) {}
   }
+  function micError(e) {
+    if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError' || e.name === 'PermissionDeniedError'))
+      toast('Microphone is blocked. Allow mic access for this site in your browser settings, then tap again.');
+    else if (e && e.name === 'NotFoundError') toast('No microphone found on this device.');
+    else if (e && e.name === 'NotReadableError') toast('Microphone is busy in another app - close it and retry.');
+    else return false;
+    return true;
+  }
+  mic.addEventListener('click', () => {
+    if (mic.classList.contains('listening')) {
+      try { mr && mr.state !== 'inactive' ? mr.stop() : null; } catch (_) {}
+      mic.classList.remove('listening');
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { toast('Voice input needs a secure (https) browser with mic support.'); return; }
+    if (window.MediaRecorder) startGeminiMic().catch((e) => { if (!micError(e)) startSrMic(); });
+    else startSrMic();
+  });
 
-  // ---- live voice mode: hands-free conversation loop ----
-  let live = false, liveRec = null;
+  // ---- live voice mode: Gemini Live when available, browser loop fallback ----
+  let live = false, liveRec = null, liveWs = null, liveCtx = null, liveNode = null, liveStream = null, nextPlay = 0, liveSrcs = [];
+  function makeCtx(rate) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try { return rate ? new AC({sampleRate: rate}) : new AC(); } catch (_) { try { return new AC(); } catch (_) { return null; } }
+  }
   const liveBtn = $('#live');
-  if (SR) liveBtn.classList.remove('hide');
+  if(location.pathname!=='/studio')liveBtn.classList.remove('hide');
   function stopLive() {
     live = false; liveBtn.classList.remove('listening');
     try { liveRec && liveRec.stop(); } catch (_) {}
-    try { window.speechSynthesis && speechSynthesis.cancel(); } catch (_) {}
+    try { liveWs && liveWs.close(); liveWs = null; } catch (_) {}
+    try { liveNode && liveNode.disconnect(); liveNode = null; } catch (_) {}
+    try { liveStream && liveStream.getTracks().forEach((t) => t.stop()); liveStream = null; } catch (_) {}
+    liveSrcs.forEach((x) => { try { x.stop(); } catch (_) {} });
+    liveSrcs = [];
+    try { liveCtx && liveCtx.close(); } catch (_) {}
+    liveCtx = null;
+    stopSpeaking();
   }
-  function liveLoop() {
-    if (!live) return;
-    liveRec = new SR();
-    liveRec.lang = navigator.language || 'en-US';
-    liveRec.interimResults = false;
-    let got = '';
-    liveRec.onresult = (e) => {
-      try { speechSynthesis.cancel(); } catch (_) {}
-      got = e.results[e.results.length - 1][0].transcript;
+  function downsample(f32, from, to) {
+    if (!from || from === to) return f32;
+    const ratio = from / to, out = new Float32Array(Math.floor(f32.length / ratio));
+    for (let i = 0; i < out.length; i++) {
+      const pos = i * ratio, j = Math.floor(pos), f = pos - j;
+      out[i] = (j + 1 < f32.length) ? f32[j] * (1 - f) + f32[j + 1] * f : f32[j];
+    }
+    return out;
+  }
+  function b64pcm(f32) {
+    const b = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) b[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
+    let bin = '';
+    const u8 = new Uint8Array(b.buffer);
+    for (let i = 0; i < u8.length; i += 4096) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 4096));
+    return btoa(bin);
+  }
+  function playPcm(b64) {
+    const bin = atob(b64);
+    const b = new Int16Array(bin.length / 2);
+    for (let i = 0; i < b.length; i++) b[i] = bin.charCodeAt(i * 2) | (bin.charCodeAt(i * 2 + 1) << 8);
+    const f = new Float32Array(b.length);
+    for (let i = 0; i < b.length; i++) f[i] = b[i] / 32768;
+    const buf = liveCtx.createBuffer(1, f.length, 24000);
+    buf.getChannelData(0).set(f);
+    const src = liveCtx.createBufferSource();
+    src.buffer = buf; src.connect(liveCtx.destination);
+    liveSrcs.push(src);
+    src.onended = () => { liveSrcs = liveSrcs.filter((x) => x !== src); };
+    nextPlay = Math.max(nextPlay, liveCtx.currentTime);
+    src.start(nextPlay);
+    nextPlay += buf.duration;
+  }
+  async function startGeminiLive() {
+    if (!liveCtx) liveCtx = makeCtx();
+    if (!liveCtx) throw new Error('no audio context');
+    try { await liveCtx.resume(); } catch (_) {}
+    if (liveCtx.state !== 'running') {
+      stopLive();
+      toast('Audio is blocked - tap the live button again.');
+      return;
+    }
+    nextPlay = 0;
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    liveWs = new WebSocket(proto + '://' + location.host + '/ws/live');
+    liveWs.onerror = () => { if (live) { stopLive(); startSrLive(); } };
+    liveWs.onclose = () => { if (live) { stopLive(); startSrLive(); } };
+    liveWs.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      if (msg.error) { toast(msg.error); return; }
+      if (msg.interrupted) { liveSrcs.forEach((x) => { try { x.stop(); } catch (_) {} }); liveSrcs = []; nextPlay = 0; return; }
+      (msg.audio || []).forEach(playPcm);
     };
-    liveRec.onend = () => {
+    await new Promise((res, rej) => {
+      const to = setTimeout(() => rej(new Error('timeout')), 12000);
+      liveWs.addEventListener('message', function h(ev) {
+        try { if (JSON.parse(ev.data).ready) { clearTimeout(to); liveWs.removeEventListener('message', h); res(); } } catch (_) {}
+      });
+    });
+    liveStream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, channelCount: 1}});
+    const src = liveCtx.createMediaStreamSource(liveStream);
+    liveNode = liveCtx.createScriptProcessor(4096, 1, 1);
+    const inRate = liveCtx.sampleRate;
+    let maxAbs = 0, capStart = 0, watched = false;
+    liveNode.onaudioprocess = (e) => {
+      const d = e.inputBuffer.getChannelData(0);
+      for (let i = 0; i < d.length; i += 8) { const a = d[i] < 0 ? -d[i] : d[i]; if (a > maxAbs) maxAbs = a; }
+      if (!capStart) capStart = Date.now();
+      if (!watched && Date.now() - capStart > 8000) {
+        watched = true;
+        if (maxAbs < 0.00001) {
+          toast('Mic audio is not reaching Crayon - switching to basic voice mode.');
+          stopLive();
+          live = true; liveBtn.classList.add('listening');
+          startSrLive();
+          return;
+        }
+      }
+      if (liveWs && liveWs.readyState === 1) liveWs.send(JSON.stringify({audio: b64pcm(downsample(d, inRate, 16000))}));
+    };
+    src.connect(liveNode); liveNode.connect(liveCtx.destination);
+    toast('Gemini Live on - just talk. Tap the same button to stop.');
+  }
+  function startSrLive() {
+    if (!SR) { toast('Live voice is not available in this browser.'); live = false; return; }
+    toast('Live mode on (basic) - just talk.');
+    (function loop() {
       if (!live) return;
-      const t = got.trim();
-      if (t && !busy) { wantSpeak = true; ask(t).finally(() => { if (live) setTimeout(liveLoop, 600); }); }
-      else setTimeout(liveLoop, 400);
-    };
-    liveRec.onerror = () => { if (live) setTimeout(liveLoop, 900); };
-    try { liveRec.start(); } catch (_) { setTimeout(liveLoop, 900); }
+      liveRec = new SR();
+      liveRec.lang = navigator.language || 'en-US';
+      liveRec.interimResults = false;
+      let got = '';
+      liveRec.onresult = (e) => { stopSpeaking(); got = e.results[e.results.length - 1][0].transcript; };
+      liveRec.onend = () => {
+        if (!live) return;
+        const t = got.trim();
+        if (t && !busy) { wantSpeak = true; ask(t).finally(() => { if (live) setTimeout(loop, 600); }); }
+        else setTimeout(loop, 400);
+      };
+      liveRec.onerror = () => { if (live) setTimeout(loop, 900); };
+      try { liveRec.start(); } catch (_) { setTimeout(loop, 900); }
+    })();
   }
-  if (SR) liveBtn.addEventListener('click', () => {
+  liveBtn.addEventListener('click', () => {
     if (live) { stopLive(); return; }
     live = true; liveBtn.classList.add('listening');
-    toast('Live mode on - just talk. Tap the same button to stop.');
-    liveLoop();
+    startGeminiLive().catch((e) => {
+      if (micError(e)) { stopLive(); return; }
+      if (live) { stopLive(); live = true; liveBtn.classList.add('listening'); startSrLive(); }
+    });
   });
 
-  bootChats(); loadMe(); send.disabled = true; input.focus();
+  bootChats(); loadMe(); send.disabled = true; if(innerWidth<=540)input.placeholder='Ask Crayon...'; input.focus();
 })();
 
-if ('serviceWorker' in navigator) { window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {})); }
+if ('serviceWorker' in navigator) { window.addEventListener('load', () => (location.pathname==='/studio'?Promise.resolve():navigator.serviceWorker.register('/sw.js')).catch(() => {})); }
