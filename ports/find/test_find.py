@@ -112,7 +112,7 @@ class WindowTests(unittest.TestCase):
         w0 = g_day0 - wday * DAY
         self.assertEqual(parse_window("this week", T0), (w0, w0 + 7 * DAY))
         self.assertEqual(parse_window("last week", T0), (w0 - 7 * DAY, w0))
-        self.assertEqual(parse_window("past week", T0), (g_day0 - 7 * DAY, g_day0 + DAY))
+        self.assertEqual(parse_window("past week", T0), (T0 - 7 * DAY, T0))
 
     def test_this_month_vs_last_month_distinct(self):
         # T0 = Oct 10 2026
@@ -123,10 +123,10 @@ class WindowTests(unittest.TestCase):
                          (calendar.timegm((2026,9,1,0,0,0,0,1,0)),
                           calendar.timegm((2026,10,1,0,0,0,0,1,0))))
 
-    def test_latest_is_rolling_7d(self):
-        day0 = int(T0 // DAY) * DAY
-        self.assertEqual(parse_window("latest ai news", T0),
-                         (day0 - 7 * DAY, day0 + DAY))
+    def test_latest_is_now_anchored_rolling_7d(self):
+        # exactly 7 days, anchored at now - no future upper bound
+        self.assertEqual(parse_window("latest ai news", T0), (T0 - 7 * DAY, T0))
+        self.assertEqual(parse_window("past month", T0), (T0 - 30 * DAY, T0))
 
     def test_explicit_year(self):
         w = parse_window("budget announcements in 2025", T0)
@@ -162,6 +162,20 @@ class SupportGateTests(unittest.TestCase):
         self.assertFalse(reference_support(
             "quantum breakthrough announced",
             "page content about cooking recipes and more detail here"))
+
+    def test_synonym_contradiction_refused(self):
+        # fail-closed: paraphrase is not quote evidence
+        self.assertFalse(reference_support(
+            "The drug cures cancer", "The drug causes cancer in trials."))
+
+    def test_role_reversal_refused(self):
+        self.assertFalse(reference_support(
+            "Alice acquired Beta", "Beta acquired Alice last week."))
+
+    def test_numeric_misattribution_refused(self):
+        self.assertFalse(reference_support(
+            "Acme revenue was 999 million dollars",
+            "Acme revenue was 10 million dollars; its workforce was 999 people."))
 
     def test_plain_support(self):
         self.assertTrue(reference_support(
@@ -265,6 +279,16 @@ class VerifyTests(unittest.TestCase):
                          "https://a.com/B?keep=2")
         self.assertRaises(UrlCanonError, canonical_url, "notaurl")
         self.assertRaises(UrlCanonError, canonical_url, "x" * 501)
+
+    def test_malformed_port_recorded_bad_url(self):
+        f = make(); p = f.plan("u1", "q", T0)
+        r = f.verify("u1", p.pid, [{"text": "x y z", "url": "https://a.example:bad/x"}],
+                     fetch_ok("x y z"), T0)
+        self.assertEqual(r["dropped"][0]["reason"], "bad_url")  # no ValueError escape
+
+    def test_ipv6_brackets_preserved(self):
+        self.assertEqual(canonical_url("https://[::1]:8080/x"), "https://[::1]:8080/x")
+        self.assertEqual(canonical_url("https://[2001:db8::1]/a"), "https://[2001:db8::1]/a")
 
     def test_scheme_and_port_are_identity(self):
         a = canonical_url("http://a.example:8080/x")

@@ -26,15 +26,23 @@ class UrlCanonError(Exception):
 def canonical_url(url, max_url=MAX_URL, error=UrlCanonError):
     if not isinstance(url, str) or not url or len(url) > max_url:
         raise error("url missing or over %d chars" % max_url)
-    p = urlparse(url.strip())
-    if p.scheme not in ("http", "https") or not p.hostname:
+    try:
+        p = urlparse(url.strip())
+        host = p.hostname  # ValueError on malformed brackets
+        port = p.port      # ValueError on malformed port
+    except ValueError:
+        raise error("malformed url")
+    if p.scheme not in ("http", "https") or not host:
         raise error("url must be absolute http(s)")
     scheme = p.scheme.lower()
-    host = p.hostname.lower()
-    if host.startswith("www."):
+    host = host.lower()
+    ipv6 = ":" in host
+    if not ipv6 and host.startswith("www."):
         host = host[4:]
-    if p.port is not None and p.port != _DEFAULT_PORTS[scheme]:
-        host = "%s:%d" % (host, p.port)
+    if ipv6:
+        host = "[%s]" % host  # brackets are required for a valid URL
+    if port is not None and port != _DEFAULT_PORTS[scheme]:
+        host = "%s:%d" % (host, port)
     q = urlencode([(k, v) for k, v in parse_qsl(p.query)
                    if not _TRACKING_PARAMS.match(k)])
     return urlunparse((scheme, host, p.path.rstrip("/"), "", q, ""))

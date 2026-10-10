@@ -24,7 +24,7 @@ ports/find/urlcanon.py (also imported by ports/find_track).
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (44/44 tests) but NOT wired into the
+Complete as a tested module (49/49 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. VERIFIED CITATIONS ONLY: a citation survives only when its URL is
@@ -33,11 +33,17 @@ running app. Named limits, exactly:
    support_error) - never presented, never retried, never substituted.
    Probes: 1000/1000 fabricated disjoint-token citations dropped; 500/
    500 contradiction + numeric near-miss citations dropped.
-2. SUPPORT IS MORE THAN SHARED TOKENS: the reference gate scores the
-   best sentence-window, requires every numeric token in the claim in
-   that window, and requires exact negation parity - "drug cures
-   cancer" vs "drug does not cure cancer" and "999 million" vs
-   "10 million" both refuse (tested both directions).
+2. THE DEFAULT GATE IS FAIL-CLOSED QUOTE EVIDENCE: a claim is
+   supported ONLY when its full normalized text appears verbatim
+   (case/punctuation-insensitive) in the fetched content. Paraphrase,
+   shared tokens, numeric coincidence and role reordering ALL refuse:
+   "drug cures cancer" vs "drug causes cancer", "revenue 999 million"
+   vs "revenue 10 million ... workforce 999 people", "Alice acquired
+   Beta" vs "Beta acquired Alice" (regression-tested; probe: 0/600
+   verified across 200 rounds of all three). Paraphrase-level support
+   is the production gate's job - wire checked_answer via support_fn;
+   anything the default cannot positively quote-verify is dropped,
+   never verified. Genuine quotes still pass (probe: 2/2).
 3. ATOMIC VERIFICATION: verified/dropped/sources/session are computed
    and validated BEFORE any commit; a source-cap violation refuses the
    whole batch leaving prior plan state and the session byte-identical
@@ -49,13 +55,16 @@ running app. Named limits, exactly:
 5. RECENCY IS EXPLICIT + OWNER-LOCAL: today/yesterday are owner-local
    days via injected tz offset (UTC default); this/last week are ISO
    Monday weeks; this/last month are calendar months; past week/month
-   are rolling 7/30 days; latest/recent/news is rolling 7 days. Each
-   distinct, boundary-tested.
+   and latest/recent/news are NOW-ANCHORED rolling intervals of exactly
+   7/30 days - (now - n*DAY, now], never future-bound (probe: 90
+   duration checks exact).
 6. URL IDENTITY PRESERVES SCHEME + PORT: http://a.example:8080/x and
    https://a.example:9090/x are DIFFERENT resources (tested); default
-   ports fold; www/fragments/tracking params/trailing slashes strip.
-   Redirect/canonical equivalence is the integration's to resolve
-   before feeding urls.
+   ports fold; www/fragments/tracking params/trailing slashes strip;
+   IPv6 brackets are preserved (https://[::1]:8080/x stays valid);
+   malformed ports raise the declared error, never a leaked ValueError
+   (probe: 200/200 recorded bad_url through verify). Redirect/canonical
+   equivalence is the integration's to resolve before feeding urls.
 7. OWNER-STRICT SESSIONS: first..tenth/last follow-ups resolve only
    against the owner's own last verified sources; session reads return
    deep snapshots (caller mutation cannot corrupt state, tested).
