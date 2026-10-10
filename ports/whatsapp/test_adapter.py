@@ -13,9 +13,10 @@ SECRET = "synthetic-app-secret"
 
 
 class FakeMeta:
-    def __init__(self, fail=None, delay=0):
+    def __init__(self, fail=None, delay=0, fail5=None):
         self.calls = []
         self.fail = fail or {}
+        self.fail5 = fail5 or {}
         self.delay = delay
         self._lk = threading.Lock()
     def __call__(self, method, path, headers, body):
@@ -29,22 +30,35 @@ class FakeMeta:
         if to in self.fail:
             return 400, {"error": {"code": self.fail[to],
                                    "message": "synthetic failure"}}
+        if to in self.fail5:
+            return 500, {"error": {"code": 131000,
+                                   "message": "synthetic 5xx"}}
         return 200, {"messages": [{"id": "wamid.test"}]}
 
 
+OWNER = "owner:test"
+RESOURCE = f"whatsapp:waba:{WABA}:phone:{PNID}"
+
+
 def grant_fn(req):
-    return {"grant_id": "grant-1", "idempotency_key": req.idempotency_key,
-            "to": req.to}
+    """A fully-bound synthetic grant: allowed, echoing key/recipient/
+    owner/resource/action/content, with a live expiry."""
+    return {"grant_id": "grant-1", "allowed": True,
+            "idempotency_key": req.idempotency_key, "to": req.to,
+            "owner": OWNER, "resource": RESOURCE, "action": req.action,
+            "content_sha256": req.content_sha256,
+            "expires_at": 9_999_999_999.0}
 
 
 def make(now=[1000.0], fail=None, recips=(ME,), secret=SECRET, store=None,
          grant=grant_fn, waba=WABA, **mkw):
-    m = FakeMeta(fail=fail, delay=mkw.pop("delay", 0))
+    m = FakeMeta(fail=fail, delay=mkw.pop("delay", 0),
+             fail5=mkw.pop("fail5", None))
     bindings = [RecipientBinding(r, PNID, True) for r in recips]
     a = WhatsAppStagingAdapter(m, PNID, "test-token", bindings,
                                clock=lambda: now[0], app_secret=secret,
                                outbox_store=store, canonical_grant=grant,
-                               waba_id=waba, **mkw)
+                               waba_id=waba, owner=OWNER, **mkw)
     return m, a
 
 
@@ -87,7 +101,8 @@ def test_recipient_cap_enforced():
         WhatsAppStagingAdapter(
             FakeMeta(), PNID, "t",
             [RecipientBinding(f"+1555000000{i}", PNID, True)
-             for i in range(6)], waba_id=WABA, canonical_grant=grant_fn)
+             for i in range(6)], waba_id=WABA, canonical_grant=grant_fn,
+            owner=OWNER)
 
 
 def test_freeform_blocked_outside_window():
@@ -142,14 +157,16 @@ def test_binding_to_other_phone_number_rejected():
     with pytest.raises(ValueError):
         WhatsAppStagingAdapter(FakeMeta(), PNID, "t",
                                [RecipientBinding(ME, "other-pnid", True)],
-                               waba_id=WABA, canonical_grant=grant_fn)
+                               waba_id=WABA, canonical_grant=grant_fn,
+                               owner=OWNER)
 
 
 def test_unconfirmed_binding_rejected():
     with pytest.raises(ValueError):
         WhatsAppStagingAdapter(FakeMeta(), PNID, "t",
                                [RecipientBinding(ME, PNID, False)],
-                               waba_id=WABA, canonical_grant=grant_fn)
+                               waba_id=WABA, canonical_grant=grant_fn,
+                               owner=OWNER)
 
 
 def test_error_map_covers_block_chain():
@@ -169,7 +186,9 @@ def test_no_grant_function_no_transport():
 
 def test_grant_must_echo_exact_request():
     def bad_grant(req):
-        return {"grant_id": "g", "idempotency_key": "WRONG", "to": req.to}
+        g = grant_fn(req)
+        g["idempotency_key"] = "WRONG"
+        return g
     m, a = make(grant=bad_grant)
     with pytest.raises(WhatsAppError) as e:
         a.send_template(ME, "hello_world")
@@ -207,7 +226,7 @@ def test_lost_response_is_unknown_never_blind_retried():
     a = WhatsAppStagingAdapter(m, PNID, "t",
                                [RecipientBinding(ME, PNID, True)],
                                app_secret=SECRET, canonical_grant=grant_fn,
-                               waba_id=WABA)
+                               waba_id=WABA, owner=OWNER)
     with pytest.raises(WhatsAppError) as e:
         a.send_template(ME, "hello_world", idempotency_key="k-lost")
     assert e.value.code == "send_unknown"
@@ -323,7 +342,8 @@ def test_inbound_bad_signature_dropped():
 def test_inbound_requires_app_secret():
     a = WhatsAppStagingAdapter(FakeMeta(), PNID, "t",
                                [RecipientBinding(ME, PNID, True)],
-                               waba_id=WABA, canonical_grant=grant_fn)
+                               waba_id=WABA, canonical_grant=grant_fn,
+                               owner=OWNER)
     body, sig = webhook([msg()])
     with pytest.raises(WhatsAppError) as e:
         a.handle_inbound_webhook(body, sig)
@@ -347,14 +367,295 @@ def test_far_future_timestamp_rejected_no_window():
     now = [1000.0]
     m, a = make(now=now)
     body, sig = webhook([msg(mid="wam-future", ts=1000 + 3600)])
-    assert a.handle_inbound_webhook(body, sig) == []
+    with pytest.raises(WhatsAppError) as e:
+        a.handle_inbound_webhook(body, sig)
+    assert e.value.code == "invalid_message"
     assert not a.in_window(ME)
 
 
-def test_beyond_retry_horizon_skipped():
+def test_beyond_retry_horizon_rejected():
     now = [10_000_000.0]
     m, a = make(now=now)
     ancient = now[0] - 8 * 24 * 3600  # past Meta's 7-day retry horizon
     body, sig = webhook([msg(mid="wam-ancient", ts=ancient)])
-    assert a.handle_inbound_webhook(body, sig) == []
+    with pytest.raises(WhatsAppError) as e:
+        a.handle_inbound_webhook(body, sig)
+    assert e.value.code == "invalid_message"
     assert not a.in_window(ME)
+
+
+# ==========================================================================
+# REVIEW 5478487276 fix set - adversarial repros counting EFFECTS
+# (transport calls), mirroring their probes.
+# ==========================================================================
+
+# -- 1: allowed:false grant is refused with ZERO transport ------------------
+
+def test_allowed_false_grant_refused_zero_transport():
+    def denying(req):
+        g = grant_fn(req)
+        g["allowed"] = False
+        return g
+    m, a = make(grant=denying)
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world")
+    assert e.value.code == "grant_denied"
+    assert len(m.calls) == 0                     # zero effects
+    assert a.outbox_record is not None
+
+
+def test_missing_allowed_flag_refused_zero_transport():
+    def sloppy(req):
+        g = grant_fn(req)
+        del g["allowed"]
+        return g
+    m, a = make(grant=sloppy)
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world")
+    assert e.value.code == "grant_denied"
+    assert len(m.calls) == 0
+
+
+# -- 2: grant must echo-bind owner/resource/action/content/expiry -----------
+
+@pytest.mark.parametrize("field,bad", [
+    ("owner", "owner:someone-else"),
+    ("resource", "whatsapp:waba:other-waba:phone:test-phone-id"),
+    ("action", "send:other"),
+    ("content_sha256", "0" * 64),
+    ("expires_at", "not-a-number"),
+    ("expires_at", float("nan")),
+    ("expires_at", float("inf")),
+])
+def test_grant_binding_violations_refused_zero_transport(field, bad):
+    def broken(req):
+        g = grant_fn(req)
+        g[field] = bad
+        return g
+    m, a = make(grant=broken)
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world")
+    assert e.value.code == "bad_grant"
+    assert len(m.calls) == 0                     # zero effects
+
+
+def test_expired_grant_refused_zero_transport():
+    def expired(req):
+        g = grant_fn(req)
+        g["expires_at"] = 500.0                  # clock is 1000.0
+        return g
+    m, a = make(grant=expired)
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world")
+    assert e.value.code == "grant_expired"
+    assert len(m.calls) == 0
+
+
+def test_fully_bound_grant_sends_exactly_once():
+    m, a = make()
+    out = a.send_template(ME, "hello_world")
+    assert out.ok and len(m.calls) == 1
+
+
+# -- 3: atomic publish + crash recovery never resurrects a resend -----------
+
+def test_store_publish_is_atomic_temp_then_rename(tmp_path):
+    path = str(tmp_path / "outbox.json")
+    store = JsonOutboxStore(path)
+    store.put("send:k", {"state": "sent", "request": {}})
+    # no temp files left behind, and the store is always valid JSON
+    import os, glob
+    assert glob.glob(path + ".tmp.*") == []
+    assert json.loads(open(path).read())["send:k"]["state"] == "sent"
+
+
+def test_empty_store_file_after_crash_fails_closed(tmp_path):
+    # crash artifact: truncate-in-place would leave an EMPTY file; that
+    # must NOT be treated as a fresh store (their two-effect repro).
+    path = str(tmp_path / "outbox.json")
+    open(path, "w").close()
+    with pytest.raises(OutboxCorrupt):
+        JsonOutboxStore(path)
+    assert open(path).read() == ""            # left untouched, never reset
+
+
+def test_crash_recovery_pending_claim_never_resent(tmp_path):
+    # Instance A claims and crashes BEFORE recording an outcome.
+    path = str(tmp_path / "outbox.json")
+    store = JsonOutboxStore(path)
+    full_body = {"messaging_product": "whatsapp",
+                 "recipient_type": "individual", "to": ME, "type": "template",
+                 "template": {"name": "hello_world",
+                              "language": {"code": "en_US"}}}
+    store.claim("send:k-crash",
+                {"state": "claimed",
+                 "request": {"to": ME, "type": "template", "body": full_body},
+                 "grant_id": "g", "claimant": "dead-instance",
+                 "attempts": 1, "claimed_at": 1}, "dead-instance")
+    # Instance B (new adapter, same store) retries the same key+content:
+    m = FakeMeta()
+    req_body = {"to": ME, "type": "template"}
+    a = WhatsAppStagingAdapter(m, PNID, "t",
+                               [RecipientBinding(ME, PNID, True)],
+                               app_secret=SECRET, canonical_grant=grant_fn,
+                               waba_id=WABA, owner=OWNER,
+                               outbox_store=JsonOutboxStore(path))
+    # same key + same content -> "held", claimant is the dead instance
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world", idempotency_key="k-crash")
+    assert e.value.code == "send_unknown"
+    assert len(m.calls) == 0        # ZERO new effects: never resurrected
+
+
+# -- 4: 5xx is unknown (no blind retry); only 4xx is definitive -------------
+
+def test_5xx_is_unknown_never_blind_retried():
+    m, a = make(fail5={ME: True})
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world", idempotency_key="k-5xx")
+    assert e.value.code == "send_unknown"
+    assert a.outbox_record("k-5xx")["state"] == "unknown"
+    with pytest.raises(WhatsAppError) as e2:
+        a.send_template(ME, "hello_world", idempotency_key="k-5xx")
+    assert e2.value.code == "send_unknown"
+    assert len(m.calls) == 1        # exactly one effect, ever
+
+
+def test_4xx_is_definitive_and_reclaimable():
+    m, a = make(fail={ME: 131047})
+    with pytest.raises(WhatsAppError):
+        a.send_template(ME, "hello_world", idempotency_key="k-4xx")
+    assert a.outbox_record("k-4xx")["state"] == "failed"
+    m.fail.clear()                  # Meta recovers; explicit retry allowed
+    out = a.send_template(ME, "hello_world", idempotency_key="k-4xx")
+    assert out.ok and len(m.calls) == 2   # two EXPLICIT attempts
+
+
+# -- 5: replay dedupe + window state survive restart -------------------------
+
+def test_replay_dedupe_survives_restart(tmp_path):
+    path = str(tmp_path / "outbox.json")
+    now = [1000.0]
+    m1, a1 = make(now=now, store=JsonOutboxStore(path))
+    body, sig = webhook([msg(mid="wam-durable", ts=1000)])
+    assert len(a1.handle_inbound_webhook(body, sig)) == 1
+    # new instance on the SAME store: the retry is still a duplicate
+    m2, a2 = make(now=now, store=JsonOutboxStore(path))
+    assert a2.handle_inbound_webhook(body, sig) == []   # zero re-delivery
+    assert a2.in_window(ME)                              # window persisted
+
+
+# -- 6: statuses and media are explicit --------------------------------------
+
+def test_status_receipts_recorded_never_messages_never_windows():
+    now = [1000.0]
+    m, a = make(now=now)
+    payload = {"entry": [{"id": WABA, "changes": [{"value": {
+        "metadata": {"phone_number_id": PNID},
+        "statuses": [{"id": "wamid.test", "status": "delivered",
+                      "timestamp": "1000",
+                      "recipient_id": ME}]}}]}]}
+    body = json.dumps(payload).encode()
+    sig = "sha256=" + hmac.new(SECRET.encode(), body,
+                               hashlib.sha256).hexdigest()
+    assert a.handle_inbound_webhook(body, sig) == []   # not messages
+    assert len(a.statuses) == 1                        # explicit record
+    assert a.statuses[0]["status"] == "delivered"
+    assert not a.in_window(ME)                         # receipts open nothing
+
+
+def test_media_message_normalized_with_type_no_content():
+    now = [1000.0]
+    m, a = make(now=now)
+    body, sig = webhook([msg(mid="wam-img", ts=1000, text=None,
+                             type_="image")])
+    out = a.handle_inbound_webhook(body, sig)
+    assert len(out) == 1
+    assert out[0].type == "image" and out[0].text is None
+    assert a.in_window(ME)     # a real customer message opens the window
+
+
+# -- 7: batch all-or-nothing -------------------------------------------------
+
+def test_batch_with_wrong_resource_mutates_nothing():
+    now = [1000.0]
+    m, a = make(now=now)
+    payload = {"entry": [
+        {"id": WABA, "changes": [{"value": {
+            "metadata": {"phone_number_id": PNID},
+            "messages": [msg(mid="wam-good", ts=1000)]}}]},
+        {"id": "OTHER-WABA", "changes": [{"value": {
+            "metadata": {"phone_number_id": PNID},
+            "messages": [msg(mid="wam-evil", ts=1000)]}}]}]}
+    body = json.dumps(payload).encode()
+    sig = "sha256=" + hmac.new(SECRET.encode(), body,
+                               hashlib.sha256).hexdigest()
+    with pytest.raises(WhatsAppError) as e:
+        a.handle_inbound_webhook(body, sig)
+    assert e.value.code == "wrong_resource"
+    # ZERO partial mutation: the GOOD message was not recorded either
+    assert not a.in_window(ME)
+    good_only = webhook([msg(mid="wam-good", ts=1000)])
+    assert len(a.handle_inbound_webhook(*good_only)) == 1  # not a duplicate
+
+
+def test_batch_with_invalid_message_mutates_nothing():
+    now = [1000.0]
+    m, a = make(now=now)
+    body, sig = webhook([msg(mid="wam-good2", ts=1000),
+                         msg(mid="wam-bad", ts=1000 + 99999)])
+    with pytest.raises(WhatsAppError) as e:
+        a.handle_inbound_webhook(body, sig)
+    assert e.value.code == "invalid_message"
+    assert not a.in_window(ME)
+    good_only = webhook([msg(mid="wam-good2", ts=1000)])
+    assert len(a.handle_inbound_webhook(*good_only)) == 1
+
+
+# -- 8: content-bound idempotency --------------------------------------------
+
+def test_same_key_different_content_is_conflict_never_stale_success():
+    m, a = make()
+    out = a.send_template(ME, "hello_world", idempotency_key="k-content")
+    assert out.ok and len(m.calls) == 1                # one effect
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "different_template",
+                        idempotency_key="k-content")
+    assert e.value.code == "idempotency_conflict"
+    assert len(m.calls) == 1          # the OLD success was NOT replayed
+    rec = a.outbox_record("k-content")
+    assert rec["request"]["body"]["template"]["name"] == "hello_world"
+
+
+def test_same_key_same_content_returns_stored_response_no_new_effect():
+    m, a = make()
+    out1 = a.send_template(ME, "hello_world", idempotency_key="k-same")
+    out2 = a.send_template(ME, "hello_world", idempotency_key="k-same")
+    assert out2.ok and out2.duplicate and out2.wamid == out1.wamid
+    assert len(m.calls) == 1          # exactly one effect
+
+
+# -- 10: window state is monotonic -------------------------------------------
+
+def test_older_inbound_never_regresses_window():
+    now = [10_000.0]
+    m, a = make(now=now)
+    new_body, new_sig = webhook([msg(mid="wam-new", ts=10_000)])
+    assert len(a.handle_inbound_webhook(new_body, new_sig)) == 1
+    # an OLDER inbound (valid signature, different id, within horizon)
+    old_body, old_sig = webhook([msg(mid="wam-older", ts=9_000)])
+    assert len(a.handle_inbound_webhook(old_body, old_sig)) == 1
+    now[0] = 10_000 + 23 * 3600       # 23h after the NEWER message
+    assert a.in_window(ME)            # window anchored at 10000, not 9000
+    now[0] = 10_000 + 25 * 3600       # 25h after the newer message
+    assert not a.in_window(ME)
+
+
+def test_note_inbound_never_regresses_window():
+    now = [10_000.0]
+    m, a = make(now=now)
+    a.note_inbound(ME)
+    now[0] = 5_000.0                  # clock skew backwards
+    a.note_inbound(ME)                # must not regress the window
+    now[0] = 10_000 + 23 * 3600
+    assert a.in_window(ME)

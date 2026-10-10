@@ -48,29 +48,50 @@ automation of any personal number, no paid routes.
 - 131000 is a GENERIC unknown Meta error. It is NOT evidence of an
   incomplete business profile or of any other specific cause; the adapter
   reports it as unknown and points at the official error reference.
-- CANONICAL PERMISSION HANDOFF: every send first asks the injected
-  canonical grant function for permission against the verified resource;
-  the grant must echo the exact request (idempotency key + recipient).
-  No grant function, or a non-echoing grant, and transport is never
-  reached. The adapter performs this handoff itself.
-- Durable outbox with ATOMIC CLAIM (flock-guarded read-modify-write,
-  fsync, reload on every op; fails closed as OutboxCorrupt on a corrupt
-  file - never silently resets). States: claimed -> sent | failed |
-  unknown. A LOST transport response is UNKNOWN: the message may or may
-  not have been sent, so the adapter NEVER blind-retries it - resolution
-  is via receipts. A same-key concurrent send shares the claim holder's
-  terminal outcome: exactly one effect, proven by threaded tests. A
-  definitively failed send (Meta 4xx) may be retried explicitly.
+- CANONICAL PERMISSION HANDOFF, FULLY BOUND: every send first asks the
+  injected canonical grant function for permission. The grant must
+  (a) carry allowed:true - anything else (false OR absent) refuses with
+  ZERO transport; (b) echo-bind ALL SIX of: idempotency key, recipient,
+  OWNER (constructor-required principal), RESOURCE (exact
+  whatsapp:waba:<id>:phone:<id> string), ACTION (send:<type>), CONTENT
+  (sha256 of the exact send body); (c) carry a finite, unexpired
+  expires_at (NaN/Infinity/non-numeric rejected). No grant function, no
+  send. The adapter performs this handoff itself.
+- CONTENT-BOUND IDEMPOTENCY: the same idempotency key with DIFFERENT
+  content is idempotency_conflict - NEVER a stale success replay. Same
+  key + same content returns the stored response with duplicate:true and
+  no new transport effect.
+- Durable outbox with ATOMIC CLAIM and ATOMIC PUBLISH: exclusive flock on
+  a sidecar lock file around read-modify-write, write-temp-then-rename
+  with fsync(file)+fsync(dir), reload on every op. FAILS CLOSED
+  (OutboxCorrupt) on unparseable content AND on an existing-but-EMPTY
+  file - an empty store is a crash artifact, never a fresh start, so a
+  crash can never silently reset state into a blind resend. States:
+  claimed -> sent | failed | unknown. A LOST transport response OR a Meta
+  5xx is UNKNOWN (the request may have landed): never blind-retried,
+  resolution via receipts; only 4xx is definitively failed and explicitly
+  re-claimable. A "claimed" record left by ANOTHER adapter instance
+  (crash recovery) is treated as unknown - a new instance never
+  resurrects it into a resend (zero new effects, tested). Same-key
+  concurrent sends within one instance share the claim holder's terminal
+  outcome: exactly one effect, proven by threaded tests.
 - Inbound handling (synthetic): X-Hub-Signature-256 HMAC validation, then
-  RESOURCE binding (entry WABA id AND metadata phone_number_id must match
-  the configured owner test WABA/phone id - a signed payload for a
-  different resource is dropped and opens nothing), then replay handling:
-  dedupe by message id over Meta's documented SEVEN-DAY webhook retry
-  horizon
-  (https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/overview/);
-  far-future timestamps (>5min skew) are rejected; a window opens only
-  from a valid in-horizon timestamp, and the 24h window math itself
-  refuses old timestamps.
+  ALL-OR-NOTHING validation of the WHOLE entry set - resource binding
+  (entry WABA id AND metadata phone_number_id) plus per-message shape and
+  time (parseable timestamp, <=5min future skew, within Meta's documented
+  SEVEN-DAY webhook retry horizon,
+  https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/overview/).
+  ANY failure rejects the entire batch with ZERO state change - a batch
+  never partially mutates. Application is then idempotent: dedupe by
+  message id over the retry horizon, PERSISTED in the durable store
+  (dedupe and window state survive restart, tested). Status receipts are
+  recorded explicitly (adapter.statuses) and never open windows; media
+  messages normalize with their type and NO fetched content (the adapter
+  does not download media).
+- The 24h service window is MONOTONIC and PERSISTED: an older-timestamped
+  inbound only ever extends a window forward - it can never regress or
+  close a newer open window (tested at T vs T-1h, and against clock
+  skew).
 
 ## Not here
 
@@ -80,16 +101,29 @@ Activation gates live with the canonical engine.
 
 ## Tests
 
-`pytest ports/whatsapp` - 30 synthetic tests: owner-verified recipient
-binding (wrong-WABA and unconfirmed bindings refused) + cap, window
-logic, template vs free-form, 141006 card-free guidance, 131000-as-generic
--unknown, unknown-error fallback, inbound signature validation
-(bad-signature drop, missing secret refusal), replay rejection (duplicate
-message id, stale timestamp), durable outbox (idempotency-key dedupe,
-persisted receipt, cross-instance durability via a fresh adapter on the
-same store file, failed-send recording), canonical grant handoff (no-grant and
-non-echoing-grant refusals reach zero transport), lost-response ->
-unknown with no blind retry (exactly one effect ever), same-key threaded
-concurrency -> exactly one Meta call, corrupt-store fail-closed,
-wrong-WABA / wrong-phone-id webhook rejection, 2-day delayed-retry
-dedupe with no window, far-future and beyond-horizon rejection.
+`pytest ports/whatsapp` - 55 synthetic tests, the review-fix repros
+counting EFFECTS (transport calls), not just state: owner-verified
+recipient binding + cap, window logic, template vs free-form, 141006
+card-free guidance, 131000-as-generic-unknown, signature validation,
+grant handoff (no-grant refusal; allowed:false AND missing-allowed
+refused with zero transport; parametrized echo-binding violations -
+owner/resource/action/content-sha256/expires_at incl. NaN/Infinity - all
+refused with zero transport; expired grant refused), content-bound
+idempotency (same key + different content = idempotency_conflict, old
+success never replayed, transport count stays 1; same content =
+duplicate:true, one effect), atomic publish (temp+rename, no leftover
+tmp files), empty-store-after-crash fail-closed (file left untouched),
+crash-recovery pending claim never resurrected (dead-instance claim ->
+send_unknown, ZERO new transport effects), 5xx -> unknown with no blind
+retry (one effect ever), 4xx definitive + explicit reclaim (two explicit
+attempts), lost-response -> unknown (exactly one effect), same-key
+threaded concurrency -> exactly one Meta call, durable replay dedupe AND
+window persistence across a fresh adapter on the same store file,
+status receipts recorded explicitly (never messages, never windows),
+media normalized with type and no content, batch all-or-nothing
+(wrong-resource or invalid message anywhere -> whole batch rejected, the
+GOOD message not recorded, replayed cleanly afterwards), monotonic window
+(older inbound never regresses; note_inbound never regresses under clock
+skew), corrupt-store fail-closed, wrong-WABA / wrong-phone-id rejection,
+2-day delayed-retry dedupe with no window, far-future and
+beyond-horizon whole-batch rejection.
