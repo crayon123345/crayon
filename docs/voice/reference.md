@@ -1,6 +1,6 @@
 # Canonical voice adapter API v1 - reference contract
 
-Revision2: consistent component event enums across reference/OpenAPI/handler. Interface for review and synthetic adapter work. Not deployed. Does not activate Live. The accepted runtime-contract.md remains unchanged; this specifies its API shapes.
+Revision3: deny-after-terminal liveness policy and endpoint response codes. Interface for review and synthetic adapter work. Not deployed. Does not activate Live. The accepted runtime-contract.md remains unchanged; this specifies its API shapes.
 
 ## Boundaries
 
@@ -47,7 +47,7 @@ Response {accepted:true,seq}. seq monotonic per request. Types accepted/progress
 
 POST /voice/internal/final
 Scoped credential. Body {version:1,lease_id,request_id,seq,type:done,transcript_text?,answer_text?,state:done|blocked,error_code?}
-Response201 {accepted:true,request_id,seq}; exact repeated payload200 {accepted:true,duplicate:true}; conflicting repeated payload409 {error_code:final_conflict}. Key owner+request_id; one terminal final envelope containing transcript_text/answer_text as applicable, payload hash atomic uniqueness. Intermediate transcript_final is a progress envelope, not a second terminal final. request_id and conversation_id recovered from lease, reject mismatch. Canonical history written only after validated final transcript/answer processing; adapter cannot invent an effect receipt. Voice effects always require existing exact canonical review, not spoken yes. No direct adapter action execution.
+Response201 {accepted:true,request_id,seq}; exact repeated payload200 {accepted:true,duplicate:true}; conflicting repeated payload409 {error_code:final_conflict}. Lost response ruling (b), deny after lease expiry/revocation: even an exact final retry must pass current scoped-adapter authentication and lease/session liveness before duplicate comparison. A prior commit never grants a liveness bypass. 410 on retry does NOT prove the original commit failed. Adapter must stop, report commit status unknown and never rerun provider work/effects. Browser uses the current valid canonical session, exact Origin and original request ID to read /voice/result within the original 300s TTL. Successful recovery confirms the recorded final without replay. If canonical session is revoked, recovery is denied; if TTL expired or recovery unavailable, commit status remains unknown, not failed. No duplicate ACK or result disclosure after revocation/expiry. Key owner+request_id; one terminal final envelope containing transcript_text/answer_text as applicable, payload hash atomic uniqueness. Intermediate transcript_final is a progress envelope, not a second terminal final. request_id and conversation_id recovered from lease, reject mismatch. Canonical history written only after validated final transcript/answer processing; adapter cannot invent an effect receipt. Voice effects always require existing exact canonical review, not spoken yes. No direct adapter action execution.
 
 ## Read-only recovery
 

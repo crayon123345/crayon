@@ -32,6 +32,8 @@ def final(request, auth, clock, leases, finals, history):
     adapter=auth.scoped_adapter(request.bearer,'final')
     body=request.strict_body('version','lease_id','request_id','seq','type','state',
                              optional=('transcript_text','answer_text','error_code'))
+    # Ruling (b): liveness denial precedes duplicate detection, including exact retries.
+    # 410 never proves a prior final was not committed; authorized browser recovery only.
     bound=leases.active_owned_adapter(body['lease_id'],adapter,clock.now())
     auth.require_live_session(bound.owner,bound.session)
     assert body['request_id']==bound.request_id and body['type']=='done'

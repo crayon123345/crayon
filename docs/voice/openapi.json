@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Canonical voice adapter reference",
-    "version": "1.0.1",
-    "description": "Review-only. No live endpoint/consent/activation. Exact HTTPS Origin + ticket binding, no native or UA exception."
+    "version": "1.0.2",
+    "description": "Review-only. No live endpoint/consent/activation. Exact HTTPS Origin + ticket binding, no native or UA exception. Lost-final-response ruling: deny after expiry/revocation, ambiguous commit resolved only by authorized read-only recovery."
   },
   "paths": {
     "/voice/session": {
@@ -54,11 +54,8 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Accepted"
-          },
           "201": {
-            "description": "Created where applicable"
+            "description": "Accepted"
           },
           "400": {
             "description": "Malformed"
@@ -130,9 +127,6 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Accepted"
-          },
           "201": {
             "description": "Created where applicable"
           },
@@ -159,6 +153,9 @@
           },
           "503": {
             "description": "Unavailable fail closed"
+          },
+          "200": {
+            "description": "Accepted"
           }
         }
       }
@@ -198,9 +195,6 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Accepted"
-          },
           "201": {
             "description": "Created where applicable"
           },
@@ -227,6 +221,9 @@
           },
           "503": {
             "description": "Unavailable fail closed"
+          },
+          "200": {
+            "description": "Accepted"
           }
         }
       }
@@ -266,9 +263,6 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Accepted"
-          },
           "201": {
             "description": "Created where applicable"
           },
@@ -295,6 +289,9 @@
           },
           "503": {
             "description": "Unavailable fail closed"
+          },
+          "200": {
+            "description": "Accepted"
           }
         }
       }
@@ -369,9 +366,6 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Accepted"
-          },
           "201": {
             "description": "Created where applicable"
           },
@@ -398,13 +392,16 @@
           },
           "503": {
             "description": "Unavailable fail closed"
+          },
+          "200": {
+            "description": "Accepted"
           }
         }
       }
     },
     "/voice/internal/final": {
       "post": {
-        "description": "Reference only, not deployed. See reference.md for atomic validation and activation gates.",
+        "description": "Reference only, not deployed. See reference.md for atomic validation and activation gates. Expired/revoked lease always denied before duplicate detection. 410 does not prove earlier commit failed; never replay provider work or effects. Browser authorized recovery only within original TTL.",
         "security": [
           {
             "adapter": []
@@ -448,7 +445,11 @@
                     ]
                   },
                   "state": {
-                    "type": "string"
+                    "type": "string",
+                    "enum": [
+                      "done",
+                      "blocked"
+                    ]
                   },
                   "transcript_text": {
                     "type": "string"
@@ -465,11 +466,8 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Accepted"
-          },
           "201": {
-            "description": "Created where applicable"
+            "description": "New terminal final committed"
           },
           "400": {
             "description": "Malformed"
@@ -494,6 +492,9 @@
           },
           "503": {
             "description": "Unavailable fail closed"
+          },
+          "200": {
+            "description": "Exact duplicate acknowledged only while original lease/session remains live and scoped adapter is valid"
           }
         }
       }
@@ -516,11 +517,20 @@
           }
         ],
         "responses": {
+          "410": {
+            "description": "Owned result recovery TTL expired"
+          },
           "200": {
             "description": "Owner/session/conversation-bound read-only final recovery,300s TTL"
           },
-          "410": {
-            "description": "Expired"
+          "401": {
+            "description": "Canonical authentication absent, expired or revoked"
+          },
+          "403": {
+            "description": "Exact origin rejected"
+          },
+          "404": {
+            "description": "Unknown or not owned by current owner/session/conversation; no existence leak"
           }
         }
       }

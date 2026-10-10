@@ -50,3 +50,18 @@ def test_explicit_revoke_and_wrong_adapter(state):
  with pytest.raises(VoiceError):s.revalidate(l['lease_id'],'other')
  s.revoke(1,'session',l['request_id'])
  with pytest.raises(VoiceError,match='revoked'):s.revalidate(l['lease_id'],'adapter')
+
+@pytest.mark.parametrize('reason',['expired','revoked','session_revoked'])
+def test_lost_final_retry_never_bypasses_liveness(state,reason):
+ s,n,active=state;l=redeem(s,issue(s));lease=l['lease_id']
+ e={'version':1,'request_id':l['request_id'],'seq':0,'type':'done','state':'done','answer_text':'committed'}
+ s.final(lease,'adapter',e) # pretend response lost
+ if reason=='expired':n[0]+=600
+ elif reason=='revoked':s.revoke(1,'session',l['request_id'])
+ else:active[0]=False
+ with pytest.raises(VoiceError):s.final(lease,'adapter',e)
+ assert (1,l['request_id']) in s.finals # rejection is NOT evidence of failed commit
+ if reason=='revoked':
+  assert s.recover(1,'session',l['request_id'],'conversation',s.origin)['events'][-1]['answer_text']=='committed'
+ else:
+  with pytest.raises(VoiceError):s.recover(1,'session',l['request_id'],'conversation',s.origin)
