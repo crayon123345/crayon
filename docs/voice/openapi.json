@@ -127,9 +127,6 @@
           }
         },
         "responses": {
-          "201": {
-            "description": "Created where applicable"
-          },
           "400": {
             "description": "Malformed"
           },
@@ -195,9 +192,6 @@
           }
         },
         "responses": {
-          "201": {
-            "description": "Created where applicable"
-          },
           "400": {
             "description": "Malformed"
           },
@@ -263,9 +257,6 @@
           }
         },
         "responses": {
-          "201": {
-            "description": "Created where applicable"
-          },
           "400": {
             "description": "Malformed"
           },
@@ -366,9 +357,6 @@
           }
         },
         "responses": {
-          "201": {
-            "description": "Created where applicable"
-          },
           "400": {
             "description": "Malformed"
           },
