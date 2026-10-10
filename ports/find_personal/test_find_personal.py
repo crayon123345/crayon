@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from find_personal import (FindPersonal, MemPersonalStore,
                            FindPersonalError, RecordLimitReached,
+                           NoRecord,
                            MAX_RECORDS, MAX_KIND, MAX_TEXT, MAX_QUERY,
                            MAX_RESULTS)
 
@@ -151,6 +152,50 @@ class RoundOneRegressionTests(unittest.TestCase):
         rid = f.add("u1", "note", "mine", T0)
         self.assertFalse(f.remove("u2", rid))
         self.assertEqual(f.count("u1"), 1)
+
+
+class RoundTwoRegressionTests(unittest.TestCase):
+    def test_remove_then_readd_never_collides(self):
+        # their exact case: rec1 + rec2, remove rec1, re-add edited
+        f = make()
+        r1 = f.add("u1", "note", "visa appointment friday", T0)
+        r2 = f.add("u1", "note", "second record", T0)
+        f.remove("u1", r1)
+        r3 = f.add("u1", "note", "visa appointment monday", T0)
+        self.assertNotIn(r3, (r1, r2))
+        self.assertEqual(f.count("u1"), 2)
+        self.assertEqual(f.find("u1", "visa appointment", T0)[0]["rid"], r3)
+
+    def test_repeated_edits_keep_fresh_ids(self):
+        f = make()
+        rid = f.add("u1", "note", "version one", T0)
+        for i in range(50):
+            f.remove("u1", rid)
+            rid = f.add("u1", "note", "version %d" % (i + 2), T0)
+        self.assertEqual(f.count("u1"), 1)
+        self.assertTrue(f.find("u1", "version", T0))
+
+    def test_atomic_replace(self):
+        f = make()
+        rid = f.add("u1", "note", "alpha bravo charlie", T0)
+        self.assertTrue(f.replace("u1", rid, "note", "delta echo foxtrot", T0 + 100))
+        self.assertEqual(f.find("u1", "delta echo", T0)[0]["rid"], rid)
+        self.assertEqual(f.find("u1", "alpha bravo", T0), [])
+
+    def test_replace_failure_preserves_old(self):
+        f = make()
+        rid = f.add("u1", "note", "alpha bravo charlie", T0)
+        for bad in [("k" * (MAX_KIND + 1), "fine", T0 + 1),
+                    ("note", "x" * (MAX_TEXT + 1), T0 + 1),
+                    ("note", "fine", None),
+                    ("note", "fine", float("nan")),
+                    ("note", "  ", T0 + 1)]:
+            self.assertRaises(FindPersonalError, f.replace, "u1", rid, *bad)
+            self.assertEqual(f.find("u1", "alpha bravo", T0)[0]["rid"], rid)
+
+    def test_replace_missing_record_raises(self):
+        f = make()
+        self.assertRaises(NoRecord, f.replace, "u1", "nope", "note", "text", T0)
 
 
 class OwnerStrictTests(unittest.TestCase):
