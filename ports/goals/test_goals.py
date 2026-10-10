@@ -258,3 +258,58 @@ class TestGrammarAndCaps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Review5479230472RegressionTests(unittest.TestCase):
+    """Regression tests for PR #22 review 5479230472 blockers."""
+
+    def setUp(self):
+        self.s = Goals(MemGoalStore())
+        self.A = "v_a"
+
+    def test_empty_step_ref_refused_zero_effects(self):
+        g = self.s.add_goal(self.A, "solo goal")
+        self.s.add_step(self.A, "solo", "the only step")
+        for bad in ("", "   ", "\t"):
+            with self.assertRaises(NoMatch):
+                self.s.set_step_state(self.A, "solo", bad, "done")
+        # zero effects: the step is untouched
+        self.assertEqual(self.s._match_goal(self.A, "solo").steps[0].state,
+                         "pending")
+
+    def test_empty_step_ref_refused_with_zero_and_many_steps(self):
+        g0 = self.s.add_goal(self.A, "empty goal")
+        with self.assertRaises(NoMatch):
+            self.s.set_step_state(self.A, "empty", "", "done")
+        g2 = self.s.add_goal(self.A, "multi goal")
+        self.s.add_step(self.A, "multi", "alpha")
+        self.s.add_step(self.A, "multi", "beta")
+        with self.assertRaises(NoMatch):
+            self.s.set_step_state(self.A, "multi", "", "done")
+        self.assertTrue(all(s.state == "pending"
+                            for s in self.s._match_goal(self.A, "multi").steps))
+
+    def test_abandon_and_done_make_room_under_cap(self):
+        for i in range(MAX_GOALS_PER_OWNER):
+            self.s.add_goal(self.A, "goal %d" % i)
+        with self.assertRaises(GoalLimitReached):
+            self.s.add_goal(self.A, "overflow")
+        # abandon makes room, exactly as the refusal prescribes
+        self.s.set_goal_status(self.A, "goal 0", "abandoned")
+        self.s.add_goal(self.A, "replacement")
+        # ...and the abandoned record is still there (abandon keeps records)
+        abandoned = self.s.store.list(self.A, statuses=("abandoned",))
+        self.assertEqual([g.title for g in abandoned], ["goal 0"])
+        # completing a goal also makes room; paused still counts
+        self.s.set_goal_status(self.A, "goal 98", "done")
+        self.s.add_goal(self.A, "replacement 2")
+        self.s.set_goal_status(self.A, "goal 97", "paused")
+        with self.assertRaises(GoalLimitReached):
+            self.s.add_goal(self.A, "overflow 2")
+
+    def test_normal_matching_still_works_after_guard(self):
+        g = self.s.add_goal(self.A, "guard goal")
+        self.s.add_step(self.A, "guard", "write tests")
+        self.s.set_step_state(self.A, "guard", "write", "done")
+        self.assertEqual(self.s._match_goal(self.A, "guard").steps[0].state,
+                         "done")

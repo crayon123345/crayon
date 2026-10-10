@@ -169,10 +169,11 @@ class Goals:
                                                                "paused"):
                 raise GoalError("an open goal with that title already "
                                 "exists (id %s)" % g.id)
-        if self.store.count(owner) >= MAX_GOALS_PER_OWNER:
+        live = len(self.store.list(owner, statuses=("active", "paused")))
+        if live >= MAX_GOALS_PER_OWNER:
             raise GoalLimitReached(
-                "goal list is full (%d); delete or abandon some first"
-                % MAX_GOALS_PER_OWNER)
+                "goal list is full (%d active/paused goals); abandon, "
+                "complete or delete some first" % MAX_GOALS_PER_OWNER)
         g = Goal(owner, title, source_sid=source_sid, source_ts=source_ts,
                  source_excerpt=source_excerpt)
         self.store.put(g)
@@ -196,6 +197,8 @@ class Goals:
 
     def _match_step(self, g, ref):
         ref = (ref or "").strip()
+        if not ref:
+            raise NoMatch("step reference required - refusing to guess")
         m = re.match(r"^#?(\d+)$", ref)
         if m:
             n = int(m.group(1))

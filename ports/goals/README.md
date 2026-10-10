@@ -75,3 +75,14 @@ into the running app. Named limits, exactly:
 ## Version
 
 crayon-goals-v1
+
+## Usability notes (from cross-review, non-blocking)
+
+- Returned goal/step IDs are NOT accepted as references at the chat
+  surface today - matching is by title/text substring. IDs are stored
+  and exported for the mount surface; making them matchable in chat is
+  follow-up work.
+- A closed (done/abandoned) goal and a new goal may share a title;
+  substring matching then needs a more specific reference.
+- Step references must be non-empty: an empty/whitespace step reference
+  refuses with zero effects instead of guessing a step.
