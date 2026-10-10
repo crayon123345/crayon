@@ -148,6 +148,45 @@ class SupportGateTests(unittest.TestCase):
             "The drug does not cure cancer",
             "The drug does not cure cancer in trials."))
 
+    def test_contraction_negation_refused(self):
+        # round-9: a negated auxiliary flips the frame - the claim
+        # must NOT verify with zero room for doubt
+        for neg in ("didn't", "didnt", "wouldn't", "wouldnt",
+                    "couldn't", "couldnt", "shouldn't", "shouldnt",
+                    "hadn't", "hadnt", "hasn't", "hasnt", "haven't",
+                    "havent", "can't", "cant", "mustn't", "needn't",
+                    "ain't", "shan't", "daren't", "oughtn't", "mayn't",
+                    "don\u2019t"):
+            self.assertFalse(reference_support(
+                "The board approve the plan",
+                "The board %s approve the plan." % neg), neg)
+
+    def test_contraction_negation_parity_supported(self):
+        # the SAME contraction in claim and content keeps parity
+        self.assertTrue(reference_support(
+            "The board didn't approve the plan",
+            "The board didn't approve the plan on monday."))
+        self.assertTrue(reference_support(
+            "The board don\u2019t approve the plan",
+            "The board don't approve the plan on monday."))
+
+    def test_contraction_negation_mismatch_refused(self):
+        # claim negated, content affirmative - frames differ
+        self.assertFalse(reference_support(
+            "The board didn't approve the plan",
+            "The board did approve the plan on monday."))
+
+    def test_won_haven_collision_documented(self):
+        # documented fail-closed collision: the bare nouns "won"/
+        # "haven" mark their sentence negated - a drop, never a
+        # wrong verify
+        self.assertFalse(reference_support(
+            "The lab approved the plan",
+            "The lab approved the plan in its safe haven."))
+        self.assertFalse(reference_support(
+            "The team celebrated the victory",
+            "The team celebrated after it won the match."))
+
     def test_numeric_mismatch_refused(self):
         self.assertFalse(reference_support(
             "Acme revenue was 999 million dollars",

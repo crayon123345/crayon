@@ -24,7 +24,7 @@ ports/find/urlcanon.py (also imported by ports/find_track).
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (69/69 tests) but NOT wired into the
+Complete as a tested module (73/73 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. VERIFIED CITATIONS ONLY: a citation survives only when its URL is
@@ -49,7 +49,13 @@ running app. Named limits, exactly:
    0/4), the sentence's negation + hedge frame must exactly equal the
    claim's ("the drug cures cancer" inside "Claims that the drug cures
    cancer are false." refuses - probes: 0/32 framed cases, 0/400
-   fuzzed wraps, doubt/dispute frames included 0/10), the span may not
+   fuzzed wraps, doubt/dispute frames included 0/10; round-9:
+   n't-contractions - didn't/wouldn't/couldn't/shouldn't/hadn't/
+   hasn't/haven't/can't et al. - are negation marks in every spelling:
+   straight, curly, acute-accent and no-apostrophe forms, regression-
+   tested; accepted fail-closed collision: the bare nouns "won"/
+   "haven" mark their sentence negated - a drop, never a wrong
+   verify), the span may not
    end before a unit word ("revenue was 10 million" inside "revenue
    was 10 million dollars lower than expected" refuses - probe: 0/5),
    and NUMERIC TOKENS ARE EXACT (round-4/5: NO unfolding - currency

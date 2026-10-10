@@ -90,7 +90,15 @@ _NEG = frozenset("not no never neither none dont doesn't don't isnt "
                  "isn't aren't arent wasn't wasnt weren't werent won't "
                  "wont cannot can't cant without lack lacks lacking "
                  "fail fails failed hardly barely nor nobody nothing "
-                 "nowhere".split())
+                 "nowhere "
+                 # auxiliary contractions (both spellings): a negated
+                 # auxiliary flips the sentence frame exactly like
+                 # "not", so the parity check must see every one.
+                 "didn't didnt wouldn't wouldnt couldn't couldnt "
+                 "shouldn't shouldnt hadn't hadnt hasn't hasnt haven't "
+                 "havent mustn't mustnt needn't neednt mightn't mightnt "
+                 "oughtn't oughtnt shan't shant daren't darent ain't "
+                 "aint mayn't maynt".split())
 
 # A claim span ending immediately before one of these truncated a
 # quantity expression mid-way ("revenue was 10 million" cut out of
@@ -114,9 +122,14 @@ _HEDGE = frozenset(
     "doubtful dispute disputes disputed disputable contradict "
     "contradicts contradicted contradictory".split())
 
-# apostrophe stems: normalization strips the apostrophe, so "doesn't"
-# reads as "doesn t" - match the stems
-_NEG_STEMS = frozenset("don doesn isn aren wasn weren won ain".split())
+# Stems catch split forms: an apostrophe outside the token class
+# (e.g. an acute-accent "don´t") or a spaced "doesn t" still
+# tokenizes as stem + "t". Accepted fail-closed collisions: the bare
+# words "won"/"haven" ("she won", "safe haven") mark their sentence
+# negated, so affected claims REFUSE - a drop, never a wrong verify.
+_NEG_STEMS = frozenset("don doesn isn aren wasn weren won ain "
+                       "didn wouldn couldn shouldn hadn hasn haven "
+                       "mustn needn mightn oughtn shan daren".split())
 
 
 class FindError(Exception):
@@ -245,11 +258,16 @@ def _validate_subqueries(subs):
 # lowercase alphanumerics.
 _TOKEN = re.compile(r"-?[$\u20ac\u00a3\u00a5\u20b9\u20a9\u20bd\u00a2]?-?"
                     r"\d+(?:[.,/\-]\d+)*[%$\u20ac\u00a3\u00a5\u20b9\u20a9\u20bd\u00a2]?"
-                    r"|[a-z0-9]+")
+                    # n't-contractions stay ONE token ("can't" -> "can't", not
+                    # "can" + "t") so a negated auxiliary stays visible to
+                    # the parity check (round-9 contraction patch).
+                    r"|[a-z0-9]+(?:['\u2019]t)?")
 
 
 def _gate_tokens(text):
-    return _TOKEN.findall((text or "").lower())
+    # the curly apostrophe normalizes to straight so "don\u2019t" and
+    # "don't" are the same token (round-9 contraction patch)
+    return _TOKEN.findall((text or "").lower().replace("\u2019", "'"))
 
 
 def _gate_sent_tokens(content):
@@ -290,7 +308,11 @@ def reference_support(claim_text, content):
       content tokens - "yes" or "the" can never verify;
     - NEGATION/HEDGE PARITY: the sentence's negation + hedge frame
       exactly equals the claim's - "the drug cures cancer" inside
-      "Claims that the drug cures cancer are false." refuses;
+      "Claims that the drug cures cancer are false." refuses.
+      n't-contractions count as negation in every spelling
+      ("didn't"/"didnt"/curly/acute); the bare nouns "won"/"haven"
+      are a documented fail-closed collision (they refuse, never
+      wrongly verify);
     - NUMERIC CONTEXT: the claim span may not end right before a unit
       word - "revenue was 10 million" refuses inside "revenue was 10
       million dollars lower than expected".
