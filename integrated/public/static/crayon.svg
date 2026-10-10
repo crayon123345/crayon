@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Crayon">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff8a5b"/><stop offset="1" stop-color="#ff5d73"/></linearGradient></defs>
+  <circle cx="60" cy="60" r="58" fill="#fff4ec"/>
+  <g transform="rotate(-14 60 62)">
+    <path d="M44 30 L60 8 L76 30 Z" fill="#f2b880"/>
+    <path d="M54 17 L60 8 L66 17 Z" fill="#ff5d73"/>
+    <rect x="40" y="30" width="40" height="66" rx="9" fill="url(#g)"/>
+    <rect x="40" y="38" width="40" height="7" fill="#ffffff" opacity=".35"/>
+    <rect x="40" y="86" width="40" height="7" fill="#ffffff" opacity=".25"/>
+    <circle cx="52" cy="61" r="4.2" fill="#2b1d2a"/><circle cx="68" cy="61" r="4.2" fill="#2b1d2a"/>
+    <circle cx="53.4" cy="59.6" r="1.4" fill="#fff"/><circle cx="69.4" cy="59.6" r="1.4" fill="#fff"/>
+    <circle cx="46" cy="70" r="3.4" fill="#ffd0c4" opacity=".9"/><circle cx="74" cy="70" r="3.4" fill="#ffd0c4" opacity=".9"/>
+    <path d="M52 72 Q60 80 68 72" fill="none" stroke="#2b1d2a" stroke-width="3" stroke-linecap="round"/>
+  </g>
+</svg>

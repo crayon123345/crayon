@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Crayon - ask me anything</title>
+<meta name="description" content="Crayon is a friendly AI assistant. Open the page and ask anything.">
+<meta property="og:title" content="Crayon">
+<meta property="og:description" content="A friendly AI assistant. Ask me anything.">
+<link rel="icon" href="./favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="./style.css?v=20261010-agent11">
+</head>
+<body>
+<header>
+  <div class="brand"><img src="./crayon.svg" alt="" width="28" height="28"><span>Crayon</span></div>
+  <button id="sidebar-toggle" class="ghost" aria-label="Recent chats" aria-expanded="false">Chats</button><button id="theme" class="ghost" aria-label="Toggle dark mode">Dark</button><button id="menu" class="ghost" aria-expanded="false">Menu</button><span id="identity">Signed out</span><button id="auth-open" class="ghost">Sign in</button><button id="logout" class="ghost hide">Log out</button><button id="new" class="ghost" title="Start a new chat">Clear view</button>
+</header>
+<nav id="panel" class="hide" aria-label="Crayon controls">
+<button data-command="/play quiz">Quick quiz</button><button data-command="/play guess">Guess a number</button><button data-command="/help">Help</button><button data-command="my tasks">Tasks</button><button data-command="show my memory">Memory</button><button data-command="my reminders">Reminders</button>
+<button data-command="/work list">Work queue</button><button data-command="/computer status">Computer</button><button id="rooms">Shared rooms</button><button id="forget-fact">Forget saved fact</button><button id="proactive">Check-ins / digests</button><button id="notifications">Notifications</button><button id="exportbtn" title="Download visible chat">Export chat</button><button id="history">Full history</button><button id="activity">Web activity / files</button><button id="google-link">Link Google login</button><button id="email-link">Link email login</button><button id="telegram-merge" hidden disabled>Link Telegram / merge accounts</button><button id="plugins">Plugins / MCP</button><button id="connections">Connections / actions</button>
+<p>History has recorded text. Older Telegram files were not retained. New uploads are read without saving raw bytes.</p>
+</nav>
+<aside id="sidebar" class="hide" aria-label="Recent activity"><h2>Recent chats</h2><button id="sidebar-close" class="ghost">Close</button><button id="new-conversation" class="ghost">New chat</button><button id="shared-conversation" class="ghost">Shared history chat</button><button id="sidebar-history" class="ghost">All recorded history</button><p class="sidebar-note">Named chats have separate turn history. Saved facts remain shared across your account. Telegram sync, if linked, still shares replies.</p><div id="sidebar-list"></div></aside><main id="scroll"><button id="older" class="ghost hide">Load earlier messages</button>
+  <section id="hero">
+    <img src="./crayon.svg" alt="Crayon" class="face" width="96" height="96">
+    <div id="auth-card" class="auth-card">
+      <h1>Welcome to Crayon</h1>
+      <p class="sub">Your conversations, memory and work.</p>
+      <button id="google-login" class="auth-provider"><span class="google-mark" aria-hidden="true">G</span>Continue with Google</button>
+      <button id="login" class="auth-provider"><svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20"><path d="M21 3 3 10l7 3 3 7 8-17Z" fill="none" stroke="#229ED9" stroke-width="1.8" stroke-linejoin="round"/></svg>Continue with Telegram</button>
+      <div class="auth-divider"><span>or</span></div>
+      <label class="auth-email-label" for="auth-email">Email address</label>
+      <input id="auth-email" class="auth-email" type="email" autocomplete="email" placeholder="you@example.com">
+      <button id="email-login" class="auth-primary">Continue with email</button>
+      <p class="auth-help">Email sign-in requires email verification. Passwords stay with Firebase.</p>
+      <p class="auth-help" id="auth-link-help">Already have a Crayon account? Use your existing login, then link an unused Google or email login in Menu. Signing in separately creates a separate account. Accounts remain separate; consolidation is disabled.</p>
+      <p class="auth-legal">By continuing, you agree to the <a href="https://crayon-v1.onrender.com/terms" target="_blank" rel="noopener">Terms</a> and <a href="https://crayon-v1.onrender.com/privacy" target="_blank" rel="noopener">Privacy Policy</a>.</p>
+    </div>
+    <div id="signedin-hero" class="hide"><h1>What are we working on?</h1><p class="sub">From a first idea to the next step.</p></div>
+    <div class="chips hide" id="prompt-chips">
+      <button class="chip">Explain something simply</button>
+      <button class="chip">Help me write a message</button>
+      <button class="chip" data-prompt="my tasks">My tasks</button>
+      <button class="chip" data-prompt="show my memory">My memory</button>
+    </div>
+  </section>
+  <p id="status" role="status"></p><section id="log" aria-live="polite"></section>
+</main>
+<footer><div id="attachment-stage" class="hide" aria-label="Staged attachment"></div>
+  <form id="form" autocomplete="off">
+    <button id="mic" type="button" class="ghost" aria-label="Record voice">Mic</button><button id="attach" type="button" class="ghost" aria-label="Upload image or file">+</button><input id="file" type="file" class="hide"><select id="research-focus" aria-label="Research focus"><option value="">Agent</option><option value="web">Web research</option><option value="deep">Deep research</option><option value="academic">Academic</option><option value="social">Social</option><option value="video">Video</option></select><textarea id="input" rows="1" maxlength="8000" disabled placeholder="Ask Crayon, or give it a task..." aria-label="Ask Crayon, or give it a task..."></textarea>
+    <button id="send" type="submit" aria-label="Send">
+      <svg viewBox="0 0 24 24" width="20" height="20"><path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </form>
+  <p class="note">Crayon can make mistakes. Review important facts and outgoing actions. <a href="https://crayon-v1.onrender.com/privacy" target="_blank" rel="noopener">Privacy</a></p>
+</footer>
+<script src="./vendor/jspdf.js"></script><script src="./vendor/docx.js"></script><script src="./vendor/pptx.js"></script><script src="./exports.js"></script><script src="./data-cards.js"></script>
+<script src="./app.js?v=20261010-agent11"></script>
+</body>
+</html>
