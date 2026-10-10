@@ -4,7 +4,37 @@ Transport-injected Cloud API client for the Meta test WhatsApp Business
 account. STAGING ONLY: no live Meta calls, no unofficial libraries, no
 automation of any personal number, no paid routes.
 
-## Hard rules
+## STATUS: DISABLED-INCOMPLETE SCAFFOLD (explicit statement)
+
+This adapter is a STAGING SCAFFOLD. It is disabled in production and
+incomplete by design. Every parked limit, named exactly:
+
+1. RECEIPT STORAGE IS NOT RECONCILIATION: rcpt:<owner>:<waba>:<pnid>:
+   <wamid> rows (via receipt(wamid)/statuses) are raw storage ONLY.
+   Matching receipts to outbox records, confirming delivery of unknown
+   sends, or turning a receipt into any send decision is EXCLUSIVELY
+   the canonical engine's job at activation. A stored receipt never
+   changes adapter behavior. (Receipt rows DO carry send_key when the
+   wamid matches a local send - that is binding metadata, not
+   reconciliation.)
+2. MEDIA DOWNLOAD ABSENT: media messages normalize with their type and
+   NO fetched content; no media fetch exists.
+3. CANONICAL GRANT INTEGRATION PENDING: sends require an injected
+   canonical_grant function (fully-bound synthetic grant in tests); the
+   real canonical engine handoff is not wired.
+4. RECOVERY OF UNKNOWNS MANUAL: unknown-outcome sends (lost response,
+   5xx, 2xx-without-wamid) and unknown_failure classifications are
+   never auto-resolved or retried; diagnosis from the actual Meta
+   response and any resend is a deliberate human/canonical act.
+5. INBOUND HANDOFF IS A PULL API: normalized inbound payloads persist
+   durably (inb:<ns>:<mid>, handoff-pending) inside the same atomic
+   transaction as the seen-mark; the canonical engine consumes them via
+   inbox_pending()/inbox_ack(). Unacked payloads are never pruned and
+   are replayable after restart; there is no push/callback wiring.
+6. TRANSPORT IS INJECTED: no real Meta HTTP client is configured here;
+   tests drive a fake transport.
+
+Hard rules
 
 - Sends only to recipients with an OWNER-VERIFIED binding to THIS test
   WABA: every recipient is a RecipientBinding(number, phone_number_id,
@@ -68,6 +98,11 @@ automation of any personal number, no paid routes.
   failed key requires retry=True - a deliberate act that increments
   attempts and preserves the full prior-attempt history atomically inside
   the claim.
+- FALSE-COMPLETION GUARD: an HTTP 2xx WITHOUT a valid messages[0].id
+  is NOT a success - state never becomes sent without a bound wamid;
+  the record persists as unknown (outcome unresolved), retry=True is
+  refused (send_unknown), and the effect count stays exactly 1
+  (tested: 200 + {}).
 - PER-CODE FAILURE CLASSIFICATION WITH ENFORCEMENT: 4xx failures are
   classified by META ERROR CODE (not by status class) from the official
   Cloud API error-codes reference
@@ -144,8 +179,15 @@ automation of any personal number, no paid routes.
   extends, durable receipts and horizon pruning commit together or not at
   all (verified: exactly one locked write for a multi-message batch).
   Dedupe by message id over the retry horizon is PERSISTED (survives
-  restart, tested). Status receipts are persisted DURABLY as rcpt:<wamid>
-  rows and never open windows.
+  restart, tested). Status receipts are persisted DURABLY as
+  rcpt:<owner>:<waba>:<pnid>:<wamid> rows and never open windows.
+  Every accepted message ALSO persists its normalized payload DURABLY
+  (inb:<ns>:<mid>, handoff-pending) INSIDE the same atomic transaction
+  as its seen-mark: a crash after the mark but before the canonical
+  handoff never loses the message - unacked payloads survive restart
+  (inbox_pending()), the handoff acks them (inbox_ack()), and a
+  duplicate delivery after ack is deduped with ZERO re-handoff
+  (tested). Unacked inbox rows are never pruned at the horizon.
 - !!! RECEIPT STORAGE IS NOT RECONCILIATION !!! The durable raw receipt
   rows (rcpt:<wamid>, exposed via receipt(wamid)/statuses) are ONLY
   storage. The adapter performs NO reconciliation: matching receipts to
@@ -174,7 +216,7 @@ Activation gates live with the canonical engine.
 
 ## Tests
 
-`pytest ports/whatsapp` - 83 synthetic tests, the review-fix repros
+`pytest ports/whatsapp` - 86 synthetic tests, the review-fix repros
 counting EFFECTS (transport calls), not just state: owner-verified
 recipient binding + cap, window logic, template vs free-form, 141006
 card-free guidance, 131000-as-generic-unknown, signature validation,

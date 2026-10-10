@@ -13,8 +13,10 @@ SECRET = "synthetic-app-secret"
 
 
 class FakeMeta:
-    def __init__(self, fail=None, delay=0, fail5=None, pnid=PNID):
+    def __init__(self, fail=None, delay=0, fail5=None, pnid=PNID,
+                 empty200=None):
         self.pnid = pnid
+        self.empty200 = empty200 or set()
         self.calls = []
         self.fail = fail or {}
         self.fail5 = fail5 or {}
@@ -34,6 +36,8 @@ class FakeMeta:
         if to in self.fail5:
             return 500, {"error": {"code": 131000,
                                    "message": "synthetic 5xx"}}
+        if to in self.empty200:
+            return 200, {}                     # 200 WITHOUT a message id
         return 200, {"messages": [{"id": "wamid.test"}]}
 
 
@@ -993,3 +997,65 @@ def test_receipt_binds_the_exact_send_key(tmp_path):
     assert rec["send_key"] == f"send:{aA._ns}:k-bind"
     # the outbox record itself binds the exact wamid of ITS send
     assert aA.outbox_record("k-bind")["receipt"]["wamid"] == out.wamid
+
+
+# -- false completion + durable inbox (their findings on d4e3f38) -----------
+
+def test_200_without_wamid_is_unknown_retry_refused_one_effect():
+    # Their repro: provider HTTP 200 with empty body {} must NOT complete
+    # as SENT with wamid=None.
+    m, a = make()
+    m.empty200.add(ME)
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world", idempotency_key="k-200empty")
+    assert e.value.code == "send_unknown"
+    rec = a.outbox_record("k-200empty")
+    assert rec["state"] == "unknown"          # NEVER sent without wamid
+    assert "receipt" not in rec               # no wamid bound
+    with pytest.raises(WhatsAppError) as e2:
+        a.send_template(ME, "hello_world", idempotency_key="k-200empty",
+                        retry=True)
+    assert e2.value.code == "send_unknown"    # retry refused
+    assert len(m.calls) == 1                  # exactly one transport call
+
+
+def test_inbound_survives_crash_between_mark_and_handoff(tmp_path):
+    # Their repro: crash after the atomic seen-mark but before canonical
+    # handoff must NOT lose the message.
+    path = str(tmp_path / "shared.json")
+    now = [1000.0]
+    m1, a1 = make(now=now, store=JsonOutboxStore(path))
+    body, sig = webhook([msg(mid="wam-crash", ts=1000)])
+    accepted = a1.handle_inbound_webhook(body, sig)
+    assert len(accepted) == 1                 # seen-mark committed...
+    # ...CRASH before any handoff/ack: fresh instance on the same store
+    m2, a2 = make(now=now, store=JsonOutboxStore(path))
+    pending = a2.inbox_pending()
+    assert len(pending) == 1                  # payload still present
+    assert pending[0]["_mid"] == "wam-crash"
+    assert pending[0]["text"] == "hi"
+    a2.inbox_ack("wam-crash")                 # canonical handoff acks
+    assert a2.inbox_pending() == []
+    # replay after handoff: deduped, zero re-handoff
+    body2, sig2 = webhook([msg(mid="wam-crash", ts=1000)])
+    assert a2.handle_inbound_webhook(body2, sig2) == []
+    assert a2.inbox_pending() == []
+
+
+def test_duplicate_webhook_after_handoff_zero_rehandoff(tmp_path):
+    path = str(tmp_path / "shared.json")
+    now = [1000.0]
+    m1, a1 = make(now=now, store=JsonOutboxStore(path))
+    body, sig = webhook([msg(mid="wam-dup", ts=1000)])
+    assert len(a1.handle_inbound_webhook(body, sig)) == 1
+    a1.inbox_ack("wam-dup")
+    assert a1.handle_inbound_webhook(body, sig) == []   # deduped
+    assert a1.inbox_pending() == []                     # no re-handoff
+    # unacked pending rows are NEVER pruned at the dedupe horizon
+    body3, sig3 = webhook([msg(mid="wam-owed", ts=1001)])
+    assert len(a1.handle_inbound_webhook(body3, sig3)) == 1
+    now[0] = 1000.0 + 25 * 3600                          # past horizon
+    body4, sig4 = webhook([msg(mid="wam-later", ts=int(now[0]))])
+    a1.handle_inbound_webhook(body4, sig4)
+    owed = [r["_mid"] for r in a1.inbox_pending()]
+    assert "wam-owed" in owed                           # still owed

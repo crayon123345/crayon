@@ -365,6 +365,11 @@ class JsonOutboxStore:
                       if k.startswith((seen_p, rcpt_p))
                       and now - (rows[k] or {}).get("ts", 0) >= horizon]:
                 del rows[k]
+            for k in [k for k in rows
+                      if k.startswith(f"inb:{ns}:")
+                      and (rows[k] or {}).get("handoff") == "done"
+                      and now - (rows[k] or {}).get("ts", 0) >= horizon]:
+                del rows[k]  # only ACKED inbox rows prune
             accepted = []
             for m in messages:
                 k = seen_p + m["id"]
@@ -378,6 +383,18 @@ class JsonOutboxStore:
                     prior = rows.get(wk)
                     if prior is None or ts > prior.get("ts", 0):
                         rows[wk] = {"ts": ts}  # monotonic: forward only
+                # LOST-INBOUND GUARD: the normalized payload is persisted
+                # DURABLY in the SAME transaction as the seen-mark, with a
+                # handoff-pending state - a crash after the mark but before
+                # the canonical handoff NEVER loses the message; unacked
+                # inbox records are replayable after restart.
+                rows[f"inb:{ns}:" + m["id"]] = {
+                    "ts": now, "handoff": "pending",
+                    "payload": {"from": m.get("from", ""),
+                                "id": m["id"],
+                                "timestamp": m.get("timestamp"),
+                                "type": m.get("type", "unknown"),
+                                "text": (m.get("text") or {}).get("body")}}
                 accepted.append(m)
             for st in statuses:
                 sid = st.get("id")
@@ -391,6 +408,24 @@ class JsonOutboxStore:
                         "ts": now, "status": st, "send_key": send_key}
             return accepted
         return self._mutate(fn)
+
+    def inbox_pending(self, ns):
+        """Unacked inbound payloads for this namespace, oldest first."""
+        return self._mutate(lambda rows: [
+            dict(v["payload"], _mid=k[len(f"inb:{ns}:"):])
+            for k, v in sorted(rows.items(),
+                               key=lambda kv: (kv[1] or {}).get("ts", 0))
+            if k.startswith(f"inb:{ns}:")
+            and (v or {}).get("handoff") == "pending"])
+
+    def inbox_ack(self, ns, mid):
+        """Atomic handoff ack: pending -> done. Done rows are pruned at
+        the dedupe horizon; pending rows are NEVER pruned (owed handoff)."""
+        def fn(rows):
+            k = f"inb:{ns}:" + mid
+            if k in rows:
+                rows[k] = dict(rows[k], handoff="done")
+        self._mutate(fn)
 
     def receipt(self, wamid):
         return self._mutate(lambda rows: rows.get("rcpt:" + wamid))
@@ -459,6 +494,11 @@ class MemOutboxStore:
                       if k.startswith((seen_p, rcpt_p))
                       and now - (self._rows[k] or {}).get("ts", 0) >= horizon]:
                 del self._rows[k]
+            for k in [k for k in self._rows
+                      if k.startswith(f"inb:{ns}:")
+                      and (self._rows[k] or {}).get("handoff") == "done"
+                      and now - (self._rows[k] or {}).get("ts", 0) >= horizon]:
+                del self._rows[k]  # only ACKED inbox rows prune
             accepted = []
             for m in messages:
                 k = seen_p + m["id"]
@@ -473,6 +513,13 @@ class MemOutboxStore:
                     if prior is None or ts > prior.get("ts", 0):
                         self._rows[wk] = {"ts": ts}
                 accepted.append(m)
+                self._rows[f"inb:{ns}:" + m["id"]] = {
+                    "ts": now, "handoff": "pending",
+                    "payload": {"from": m.get("from", ""),
+                                "id": m["id"],
+                                "timestamp": m.get("timestamp"),
+                                "type": m.get("type", "unknown"),
+                                "text": (m.get("text") or {}).get("body")}}
             for st in statuses:
                 sid = st.get("id")
                 if sid:
@@ -488,6 +535,20 @@ class MemOutboxStore:
     def receipt(self, wamid):
         with self._lk:
             return self._rows.get("rcpt:" + wamid)
+
+    def inbox_pending(self, ns):
+        with self._lk:
+            return [dict(v["payload"], _mid=k[len(f"inb:{ns}:"):])
+                    for k, v in sorted(self._rows.items(),
+                                       key=lambda kv: (kv[1] or {}).get("ts", 0))
+                    if k.startswith(f"inb:{ns}:")
+                    and (v or {}).get("handoff") == "pending"]
+
+    def inbox_ack(self, ns, mid):
+        with self._lk:
+            k = f"inb:{ns}:" + mid
+            if k in self._rows:
+                self._rows[k] = dict(self._rows[k], handoff="done")
 
 
 class WhatsAppStagingAdapter:
@@ -564,6 +625,19 @@ class WhatsAppStagingAdapter:
         invisible here (a wamid from A means nothing to B's outbox)."""
         rec = self._outbox.receipt(f"{self._ns}:{wamid}")
         return rec.get("status") if rec else None
+
+    def inbox_pending(self):
+        """Unacked inbound payloads for THIS owner+resource, oldest
+        first. Durable across restart: a crash after the atomic
+        seen-mark but before the canonical handoff NEVER loses the
+        message - replay these and inbox_ack each on handoff."""
+        return self._outbox.inbox_pending(self._ns)
+
+    def inbox_ack(self, message_id):
+        """Mark one inbound payload handed off to canonical. Duplicate
+        webhook deliveries after ack are deduped by the seen-mark and
+        produce ZERO re-handoff."""
+        self._outbox.inbox_ack(self._ns, message_id)
 
     @property
     def resource(self):
@@ -877,10 +951,12 @@ class WhatsAppStagingAdapter:
             raise WhatsAppError(
                 "send_unknown",
                 f"Meta {status} after the request may have landed - "
-                "treated as UNKNOWN (only 4xx is definitive); resolve via "
-                "receipts before any retry; never blind resend")
+                "treated as UNKNOWN; resolve via receipts before any "
+                "retry; never blind resend")
         if status >= 400:
-            # 4xx: Meta definitively refused. Re-claimable explicitly.
+            # 4xx: a definitive RESPONSE (the message certainly did not
+            # send); the PER-CODE class governs whether any resend is
+            # permitted, and claim() enforces it (zero transport).
             err = (data or {}).get("error", {})
             code = err.get("code", 0)
             fclass = failure_class(code)
@@ -911,6 +987,21 @@ class WhatsAppStagingAdapter:
                         "response."}[fclass]
             raise WhatsAppError(code, f"{meaning} - {guidance} {cls_note}")
         wamid = ((data or {}).get("messages") or [{}])[0].get("id")
+        if not isinstance(wamid, str) or not wamid.strip():
+            # FALSE COMPLETION GUARD: an HTTP 200 without a valid message
+            # id is NOT a success - Meta's contract returns messages[0].id
+            # on a real send. Never persist SENT without a bound wamid;
+            # the outcome is UNKNOWN (the request may have landed).
+            record["state"] = "unknown"
+            record["last_error"] = {"code": "success_without_wamid",
+                                    "message": repr(data)}
+            record["finished_at"] = self._clock()
+            self._outbox.put(key, record)
+            raise WhatsAppError(
+                "send_unknown",
+                "Meta returned 2xx WITHOUT a message id - NOT a confirmed "
+                "send; treated as UNKNOWN (no blind retry; resolve via "
+                "receipts)")
         record["state"] = "sent"
         record["response"] = {"status": status, "wamid": wamid, "raw": data}
         record["receipt"] = {"wamid": wamid, "sent_at": self._clock()}
