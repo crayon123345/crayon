@@ -238,11 +238,12 @@ def _validate_subqueries(subs):
     return out
 
 
-# Numeric tokens are exact: currency symbol, sign, % and separator
-# characters are load-bearing, so "1,500" != "1.500", "5" != "-5" !=
-# "5%", "3.5" != "3-5", "$5" != "€5" != "5". Anything else
-# tokenizes as lowercase alphanumerics.
-_TOKEN = re.compile(r"[$\u20ac\u00a3\u00a5\u20b9\u20a9\u20bd\u00a2]?-?"
+# Numeric tokens are exact: currency symbol, sign (in EITHER position
+# around the symbol), % and separator characters are load-bearing, so
+# "1,500" != "1.500", "5" != "-5" != "5%", "3.5" != "3-5", "$5" !=
+# "-$5" != "$-5" != "€5" != "5". Anything else tokenizes as
+# lowercase alphanumerics.
+_TOKEN = re.compile(r"-?[$\u20ac\u00a3\u00a5\u20b9\u20a9\u20bd\u00a2]?-?"
                     r"\d+(?:[.,/\-]\d+)*[%$\u20ac\u00a3\u00a5\u20b9\u20a9\u20bd\u00a2]?"
                     r"|[a-z0-9]+")
 
@@ -253,13 +254,15 @@ def _gate_tokens(text):
 
 def _gate_sent_tokens(content):
     # sentence boundary = sentence mark + optional CLOSING quote or
-    # bracket + whitespace (or newline): 'Revenue was 15." Today...'
-    # and "...cured) Next..." DO split. The decimal exception is ONLY
+    # bracket + whitespace (or newline): 'Revenue was 15." Today...',
+    # "...15.\u201d Today...", "...15.\u00bb Today..." and
+    # "...15.\u300d Today..." DO split. The decimal exception is ONLY
     # digit.digit with no whitespace ("1.5" stays whole). Documented
     # edge: a sentence mark with NO following whitespace ("15.Today")
-    # is not a boundary - fail-closed, not chased (round-6 note).
+    # is not a boundary - a combined claim CAN span it, so that edge
+    # fails OPEN (round-7 wording correction; not chased).
     raw = (content or "").lower()
-    parts = re.split(r"[.!?;]['\u2019\u201d\")\]]*(?=\s)|[\r\n]+", raw)
+    parts = re.split(r"[.!?;]['\u2019\u201d\u00bb\u300d\")\]]*(?=\s)|[\r\n]+", raw)
     return [_gate_tokens(p) for p in parts]
 
 

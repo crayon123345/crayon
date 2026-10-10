@@ -24,7 +24,7 @@ ports/find/urlcanon.py (also imported by ports/find_track).
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (67/67 tests) but NOT wired into the
+Complete as a tested module (69/69 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. VERIFIED CITATIONS ONLY: a citation survives only when its URL is
@@ -62,10 +62,13 @@ running app. Named limits, exactly:
    "Revenue was 1.5. Costs fell." keeps 1.5 whole; probes: 0/18,
    3/3+0/2). Closing quotes/brackets between the sentence mark and
    whitespace do NOT hide the boundary (round-6: straight/curly double
-   quote, single quote, ], ); probe: 0/45 wrongfully verified, genuine
-   quoted supports 3/3). Documented edge: a sentence mark with no
-   following whitespace ("15.Today") is not a boundary - fail-closed,
-   not chased. DOCUMENTED GAP:
+   quote, single quote, ], ), plus round-7's U+00BB and U+300D; probe:
+   0/45 wrongfully verified, genuine quoted supports 3/3). Documented
+   edge: a sentence mark with no following whitespace ("15.Today") is
+   not a boundary - a combined claim CAN span it, so that edge FAILS
+   OPEN (round-7 wording correction; not chased). Signs are exact in
+   EITHER position around a currency symbol (round-7: "$5" != "-$5"
+   != "$-5"; probe: 0/48 wrong). DOCUMENTED GAP:
    framing beyond the hedge list is not caught - the default is not
    general semantic proof; production wires support_fn.
 3. ATOMIC VERIFICATION: verified/dropped/sources/session are computed
