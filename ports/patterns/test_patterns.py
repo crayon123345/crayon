@@ -197,7 +197,8 @@ class IsolationAndCapTests(unittest.TestCase):
             s.observe("v_a", "overflow", ts=T0 + MAX_OBSERVATIONS)
         self.assertEqual(s.store.count_obs("v_a"), MAX_OBSERVATIONS)
 
-    def test_card_cap_refuses(self):
+    def test_card_cap_is_atomic_zero_effects(self):
+        # round-1 review 5479332317: never write 30 of 31
         rules = [rule(rid="r%02d" % i, kind="kind%02d" % i)
                  for i in range(MAX_CARDS_PER_OWNER + 5)]
         s = make(rules)
@@ -207,8 +208,57 @@ class IsolationAndCapTests(unittest.TestCase):
                 s.observe("v_a", "kind%02d" % i, ts=T0 + i * 10 + j)
         with self.assertRaises(CardLimitReached):
             s.scan("v_a", now=T0 + 1000)
-        self.assertEqual(s.store.count_cards("v_a"),
-                         MAX_CARDS_PER_OWNER)
+        self.assertEqual(s.store.count_cards("v_a"), 0)  # nothing written
+
+    def test_under_cap_batch_writes_atomically(self):
+        rules = [rule(rid="r%02d" % i, kind="kind%02d" % i)
+                 for i in range(MAX_CARDS_PER_OWNER)]
+        s = make(rules)
+        s.enable("v_a")
+        for i in range(MAX_CARDS_PER_OWNER):
+            for j in range(3):
+                s.observe("v_a", "kind%02d" % i, ts=T0 + i * 10 + j)
+        cards = s.scan("v_a", now=T0 + 1000)
+        self.assertEqual(len(cards), MAX_CARDS_PER_OWNER)
+
+    def test_accept_and_dismiss_make_room(self):
+        # cap counts live (open+snoozed); decided cards are history
+        rules = [rule(rid="r%02d" % i, kind="kind%02d" % i)
+                 for i in range(MAX_CARDS_PER_OWNER)]
+        s = make(rules + [rule(rid="rnew", kind="newkind")])
+        s.enable("v_a")
+        for i in range(MAX_CARDS_PER_OWNER):
+            for j in range(3):
+                s.observe("v_a", "kind%02d" % i, ts=T0 + i * 10 + j)
+        s.scan("v_a", now=T0 + 1000)
+        for j in range(3):
+            s.observe("v_a", "newkind", ts=T0 + 2000 + j)
+        with self.assertRaises(CardLimitReached):
+            s.scan("v_a", now=T0 + 2003)
+        s.accept("v_a", "kind00", now=T0 + 2004)
+        s.dismiss("v_a", "kind01", now=T0 + 2005)
+        cards = s.scan("v_a", now=T0 + 2006)
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0].signature, "rnew:newkind")
+
+    def test_snoozed_reraise_needs_fresh_evidence(self):
+        # round-1 review: no re-raise on the same stale evidence.
+        # snooze 1 day << window 7 days, so the OLD observations are
+        # still in-window at snooze expiry - without the fix the card
+        # re-raises on stale evidence.
+        s = make([rule()])
+        s.enable("v_a")
+        for i in range(3):
+            s.observe("v_a", "gym", ts=T0 + i)
+        s.scan("v_a", now=T0 + 3)
+        s.snooze("v_a", "gym", 1, now=T0 + 4)
+        # snooze expired, old evidence still in window, NO fresh obs
+        self.assertEqual(s.scan("v_a", now=T0 + 2 * DAY), [])
+        # one fresh observation -> re-raise (evidence ts > last_seen)
+        s.observe("v_a", "gym", ts=T0 + 2 * DAY + 1)
+        cards = s.scan("v_a", now=T0 + 2 * DAY + 2)
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0].evidence_count, 4)
 
 
 class GrammarTests(unittest.TestCase):

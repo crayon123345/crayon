@@ -9,7 +9,7 @@ reminders or messages by themselves. Stands alone.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (19/19 tests) but NOT wired into the
+Complete as a tested module (22/22 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. READ-ONLY BY CONSTRUCTION: no code path from a card to any action.
@@ -25,13 +25,19 @@ running app. Named limits, exactly:
    deletes observations AND cards AND the opt-in.
 5. OWNER-STRICT: observations, cards, decisions keyed to the owning
    account only; a second owner's wipe leaves the first byte-identical.
-6. CAPS REFUSE, NEVER EVICT: MAX_OBSERVATIONS = 500,
-   MAX_CARDS_PER_OWNER = 30, MAX_CARDS_PER_RULE = 5 open+snoozed;
-   overflow raises with zero effects.
+6. CAPS REFUSE, NEVER EVICT: MAX_OBSERVATIONS = 500; the card cap
+   counts LIVE (open+snoozed) cards only - MAX_CARDS_PER_OWNER = 30,
+   MAX_CARDS_PER_RULE = 5 - so accept and dismiss make room exactly as
+   the refusal prescribes (decided cards are kept history). Scans are
+   ATOMIC: all eligible cards are computed first; if the batch would
+   exceed the live cap the WHOLE batch refuses with zero effects -
+   never 30 of 31.
 7. NO NAGGING: one open card per (rule, signature); an ACCEPTED
    signature never re-raises in v1; a dismissed signature respects its
-   rule cooldown; a snoozed card re-surfaces only after its snooze
-   expires AND fresh evidence exists.
+   rule cooldown; a snoozed (or otherwise previously raised) signature
+   re-surfaces only when the window holds at least one observation
+   NEWER than the prior card's last_seen - stale evidence alone never
+   re-raises (tested at snooze << window).
 8. CLOCKS ARE INJECTED: event ts and processing now are both explicit.
 9. WHAT COUNTS AS AN OBSERVATION IS MOUNT WORK: this module records
    what the integration feeds it (explicit owner-visible events);
@@ -50,7 +56,7 @@ running app. Named limits, exactly:
 Anything else falls through. Ambiguous or empty references refuse with
 zero effects.
 
-## Acceptance criteria covered by tests (test_patterns.py, 19 tests)
+## Acceptance criteria covered by tests (test_patterns.py, 22 tests)
 
 - Off-by-default zero writes; wipe deletes everything.
 - Min-count gating, window exclusion, evidence fields on cards.

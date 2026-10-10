@@ -268,7 +268,7 @@ class Patterns:
         now = self._now(now)
         if not self.store.is_enabled(owner):
             return []
-        new_cards = []
+        eligible = []
         for rule in self.rules:
             kinds = ({o.kind for o in self.store.list_obs(owner)}
                      if rule.kind == "any" else {rule.kind})
@@ -292,20 +292,36 @@ class Patterns:
                 if dismissed and now - max(c.decided for c in dismissed) \
                         < rule.cooldown:
                     continue
+                if existing:
+                    # re-raise only on FRESH evidence: at least one
+                    # observation newer than any prior card's last_seen
+                    newest_seen = max(c.last_seen for c in existing)
+                    if not any(o.ts > newest_seen for o in matches):
+                        continue
                 live = [c for c in existing
                         if c.state in ("open", "snoozed")]
                 if len(live) >= MAX_CARDS_PER_RULE:
                     continue
-                if self.store.count_cards(owner) >= MAX_CARDS_PER_OWNER:
-                    raise CardLimitReached(
-                        "pattern card list is full (%d); accept or "
-                        "dismiss some first" % MAX_CARDS_PER_OWNER)
-                c = Card(self._next_id("c", now), owner, rule, signature,
-                         matches, now)
-                c.title = rule.title.replace("{kind}", kind).replace(
-                    "{count}", str(len(matches)))
-                self.store.put_card(c)
-                new_cards.append(c)
+                eligible.append((rule, signature, matches))
+                # (per-rule live cap already enforced above)
+        live_total = len(self.store.list_cards(owner,
+                                               states=("open",
+                                                       "snoozed")))
+        if live_total + len(eligible) > MAX_CARDS_PER_OWNER:
+            # ATOMIC: the whole batch refuses with zero effects -
+            # never write 30 of 31
+            raise CardLimitReached(
+                "pattern card list would exceed %d open/snoozed; "
+                "accept or dismiss some first - nothing was added"
+                % MAX_CARDS_PER_OWNER)
+        new_cards = []
+        for rule, signature, matches in eligible:
+            c = Card(self._next_id("c", now), owner, rule, signature,
+                     matches, now)
+            c.title = rule.title.replace("{kind}", signature.split(":", 1)[1]).replace(
+                "{count}", str(len(matches)))
+            self.store.put_card(c)
+            new_cards.append(c)
         return new_cards
 
     # ---------- decisions (never actions) ----------
