@@ -500,6 +500,36 @@ class GuardedCallTests(unittest.TestCase):
         with self.assertRaises(ModelsError):
             ProviderConfig(enabled="embed")
 
+    def test_backend_base_exceptions_take_the_failure_path(self):
+        # SystemExit / KeyboardInterrupt raised BY THE BACKEND on its worker
+        # thread are provider failures: fallback answer, breaker counted
+        # under the original exception's name.
+        for exc in (SystemExit(2), KeyboardInterrupt()):
+            p = FunctionProvider(nli_fn=lambda a, b, _e=exc: (_ for _ in ()).throw(_e))
+            out = guarded_call(enabled("nli"), self.breaker, p,
+                               "nli", lambda: p.nli("a", "b"), lambda: "det")
+            self.assertEqual(out, "det")
+            self.assertEqual(self.breaker.snapshot()["last_reason"],
+                             type(exc).__name__)
+
+    def test_backend_models_error_is_converted_by_adapter_not_module(self):
+        # Policy: backends must not raise ModelsError; if one does, it is
+        # boxed like any other backend failure (adapters such as
+        # find_support_nli convert it to CapabilityUnavailable upstream).
+        p = FunctionProvider(nli_fn=lambda a, b: 1)
+        def call_with_buggy_backend():
+            raise ModelsError("backend miswired")  # not module validation
+        # ModelsError raised by the CALL lambda is indistinguishable from
+        # module validation inside it, so it propagates as a caller bug...
+        with self.assertRaises(ModelsError):
+            guarded_call(enabled("nli"), self.breaker, p,
+                         "nli", call_with_buggy_backend, lambda: "det")
+        # ...while FunctionProvider's own arg validation also propagates
+        with self.assertRaises(ModelsError):
+            guarded_call(enabled("nli"), self.breaker, p,
+                         "nli", lambda: p.nli(None, "b"), lambda: "det")
+        self.assertEqual(self.breaker.snapshot()["consecutive_failures"], 0)
+
     def test_embed_roundtrip_through_guard(self):
         p = FunctionProvider(embed_fn=lambda ts: [[float(len(t))] for t in ts])
         out = guarded_call(enabled("embed"), self.breaker, p,

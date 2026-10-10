@@ -25,10 +25,17 @@ Design invariants:
    backend.
 2. FALLBACK IS THE FAILURE ANSWER: guarded_call returns the caller-supplied
    fallback on disabled capability, unavailable capability, open breaker,
-   timeout, or ANY backend exception. It never retries, never substitutes,
-   never surfaces a partial provider result, and never raises for a provider
-   failure. A timed-out backend thread may linger (daemon) but its late
-   result is discarded and cannot affect state.
+   timeout, or ANY backend exception - including SystemExit or
+   KeyboardInterrupt raised BY THE BACKEND on its worker thread (boxed via
+   BackendRaised, recorded under the original exception's name). It never
+   retries, never substitutes, never surfaces a partial provider result,
+   and never raises for a provider failure. An interrupt on the CALLER
+   thread is not a provider failure and still propagates. A timed-out
+   backend thread may linger (daemon) but its late result is discarded and
+   cannot affect state. Backends must not raise ModelsError themselves;
+   adapters convert it to CapabilityUnavailable (see ports/find_support_nli)
+   so module validation errors remain distinguishable from backend
+   failures.
 3. FAIL-CLOSED VALIDATION: unknown provider names, unknown capabilities,
    bad numeric bounds, non-callable backends and wrong argument types raise
    ModelsError (never raw TypeError/ValueError/KeyError) - before any backend
@@ -76,6 +83,17 @@ class CapabilityUnavailable(ModelsError):
 
 class CallTimeout(ModelsError):
     """Internal: the backend did not finish within timeout_ms."""
+
+
+class BackendRaised(ModelsError):
+    """Internal: wraps any BaseException the backend raised on its worker
+    thread, so the failure path can tell it apart from an interrupt on the
+    CALLER thread (which must still propagate)."""
+
+    def __init__(self, original):
+        super().__init__("backend raised %s: %s"
+                         % (type(original).__name__, original))
+        self.original = original
 
 
 def _is_int(v):
@@ -194,8 +212,14 @@ class CircuitBreaker:
 
     closed -> open after failure_threshold consecutive failures; any success
     resets the count. While open, allow() refuses until cooldown_ms elapse,
-    then one half-open trial is permitted; its outcome closes or reopens.
-    allow()/state/snapshot never mutate stored state.
+    then admits half-open trials; each trial's recorded outcome closes the
+    breaker (success) or re-opens it with a FRESH cooldown (failure), so a
+    down backend is not hammered per request. Because allow() does not
+    mutate state, concurrent callers could each start a half-open trial:
+    the breaker is NOT thread-safe - own one per single-threaded caller
+    (guarded_call records each outcome synchronously, so under that use
+    trials are sequential). allow()/state/snapshot never mutate stored
+    state.
     """
 
     CLOSED = "closed"
@@ -387,7 +411,11 @@ def _run_with_timeout(fn, timeout_ms):
     def target():
         try:
             box["value"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller thread
+        except ModelsError as exc:
+            # the module's own validation is a caller bug, never a
+            # backend failure: re-raise unwrapped on the caller thread
+            box["models_error"] = exc
+        except BaseException as exc:  # noqa: BLE001 - boxed for the caller thread
             box["error"] = exc
 
     worker = threading.Thread(target=target, daemon=True)
@@ -395,8 +423,10 @@ def _run_with_timeout(fn, timeout_ms):
     worker.join(timeout_ms / 1000.0)
     if worker.is_alive():
         raise CallTimeout("backend exceeded timeout_ms=%d" % timeout_ms)
+    if "models_error" in box:
+        raise box["models_error"]
     if "error" in box:
-        raise box["error"]
+        raise BackendRaised(box["error"])
     return box["value"]
 
 
@@ -445,6 +475,14 @@ def guarded_call(config, breaker, provider, capability, call, fallback):
         return answer()
     try:
         value = _run_with_timeout(call, config.timeout_ms)
+    except BackendRaised as exc:
+        # Anything the BACKEND raised - including SystemExit or
+        # KeyboardInterrupt on its worker thread - is a provider failure:
+        # count it (under the original exception's name) and answer with
+        # the fallback. An interrupt on the CALLER thread is never boxed,
+        # so it still propagates normally.
+        breaker.record_failure(reason=type(exc.original).__name__)
+        return answer()
     except (CapabilityUnavailable, CallTimeout) as exc:
         # genuine backend failures: count them, answer with the fallback
         breaker.record_failure(reason=type(exc).__name__)
