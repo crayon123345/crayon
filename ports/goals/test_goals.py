@@ -313,3 +313,32 @@ class Review5479230472RegressionTests(unittest.TestCase):
         self.s.set_step_state(self.A, "guard", "write", "done")
         self.assertEqual(self.s._match_goal(self.A, "guard").steps[0].state,
                          "done")
+
+    def test_reactivate_guarded_by_live_cap(self):
+        # round-2 review 5479285366: abandon+create+reactivate bypass
+        for i in range(MAX_GOALS_PER_OWNER):
+            self.s.add_goal(self.A, "cap %03d" % i)
+        self.s.set_goal_status(self.A, "cap 000", "abandoned")
+        self.s.add_goal(self.A, "cap replacement")
+        # 100 live again; reactivating the abandoned goal must refuse
+        with self.assertRaises(GoalLimitReached):
+            self.s.set_goal_status(self.A, "cap 000", "active")
+        with self.assertRaises(GoalLimitReached):
+            self.s.set_goal_status(self.A, "cap 000", "paused")
+        # zero effects: it stays abandoned
+        g = self.s._match_goal(self.A, "cap 000")
+        self.assertEqual(g.status, "abandoned")
+        self.assertEqual(len(self.s.store.list(
+            self.A, statuses=("active", "paused"))), MAX_GOALS_PER_OWNER)
+
+    def test_reactivate_works_when_room_exists(self):
+        g = self.s.add_goal(self.A, "revivable")
+        self.s.set_goal_status(self.A, "revivable", "abandoned")
+        self.s.set_goal_status(self.A, "revivable", "active")
+        self.assertEqual(self.s._match_goal(self.A, "revivable").status,
+                         "active")
+        # done -> active also re-enters live and is cap-guarded (allowed here)
+        self.s.set_goal_status(self.A, "revivable", "done")
+        self.s.set_goal_status(self.A, "revivable", "active")
+        self.assertEqual(self.s._match_goal(self.A, "revivable").status,
+                         "active")

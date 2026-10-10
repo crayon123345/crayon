@@ -230,10 +230,21 @@ class Goals:
         self.store.put(g)
         return g, s
 
-    def set_goal_status(self, owner, goal_match, status):
+    def set_goal_status(self, owner, goal_match, status, now=None):
         if status not in GOAL_STATUSES:
             raise GoalError("unknown goal status %r" % status)
         g = self._match_goal(owner, goal_match)
+        if status in ("active", "paused") and g.status not in ("active",
+                                                                "paused"):
+            # re-entering a live state must pass the live cap, or the
+            # abandon->create->reactivate path bypasses it
+            live = len(self.store.list(owner, statuses=("active",
+                                                        "paused")))
+            if live >= MAX_GOALS_PER_OWNER:
+                raise GoalLimitReached(
+                    "goal list is full (%d active/paused goals); abandon, "
+                    "complete or delete some first - %r stays %s"
+                    % (MAX_GOALS_PER_OWNER, g.title, g.status))
         g.status = status
         g.updated = int(time.time())
         self.store.put(g)
