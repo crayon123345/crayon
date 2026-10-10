@@ -9,35 +9,54 @@ what the sources panel shows, and how follow-ups resolve. Searching and
 fetching themselves are integration-injected callables; this module
 never touches the network.
 
+REUSE BOUNDARY (not a parallel stack): the running app already owns
+research/comparison fanout (cr_web.research), the production
+claim/citation evidence gate (cr_citations.checked_answer), dated news
+search (cr_web.news) and conversation context (cr_memory). This module
+adds only what those do not have: a validated planning API, RECORDED
+citation drops, the canonical sources panel, explicit recency windows,
+and ordinal follow-up references. The citation support check is
+injectable (support_fn); production wiring must be the existing
+checked_answer gate - the shipped deterministic gate is a hardened
+reference implementation for source-only testing. This module performs
+no searching, fetching, news handling or conversation memory of its own.
+
 Design invariants:
 
 1. VERIFIED CITATIONS ONLY: a citation survives only when its URL is
    fetched through the injected fetcher AND the fetched content
-   supports the claim (token-overlap check). Unfetchable or
-   unsupported citations are DROPPED and recorded - never presented.
-2. UNKNOWN REFUSES WITHOUT RETRY: a fetch error drops that citation;
+   supports the claim. Unfetchable or unsupported citations are DROPPED
+   and recorded - never presented.
+2. SUPPORT IS MORE THAN SHARED TOKENS: the reference gate scores the
+   best sentence-window, requires the claim's numbers to appear in it,
+   and requires negation parity (claim negation words exactly match the
+   window's) - "drug cures cancer" against "drug does not cure cancer"
+   and "revenue 999 million" against "revenue 10 million" both refuse.
+3. UNKNOWN REFUSES WITHOUT RETRY: a fetch error drops that citation;
    the module never retries, never substitutes a different URL.
-3. DETERMINISTIC PLANNING: the fallback decomposer is pure; an injected
-   planner is validated (1..4 subqueries, each within bounds) and
-   out-of-bounds output REFUSES the whole plan with zero effects.
-4. RECENCY IS EXPLICIT: "latest"/"today"/"this week" etc. resolve to a
-   concrete (after, before) window against the injected clock; the
-   window rides on the plan so the integration can bound its search.
-5. OWNER-STRICT SESSIONS: follow-up references ("the second one")
-   resolve against the OWNER's own last verified result only. A second
-   owner's session is invisible and untouched.
-6. CAPS REFUSE, NEVER EVICT: plan/claim/source bounds raise with zero
-   effects - nothing is silently dropped to make room.
-7. OVERFLOW REJECTS, NEVER TRUNCATES: over-length query, subquery,
-   claim or URL raises; truncation could alias distinct requests.
-8. READ-ONLY, NOT MOUNTED: no action paths. The integration runs
-   searches/fetches and renders; this module owns state and decisions.
+4. ATOMIC VERIFICATION: all derived state (verified, dropped, sources
+   panel, session) is computed and validated first; a source-cap
+   violation refuses the WHOLE batch leaving prior plan state and the
+   session byte-identical.
+5. DETERMINISTIC PLANNING: the fallback decomposer is pure and REFUSES
+   questions that decompose past the subquery cap (no silent subject
+   drops); an injected planner is validated the same way.
+6. RECENCY IS EXPLICIT + OWNER-LOCAL: today/yesterday are owner-local
+   days (injected tz offset); this/last week are ISO Monday weeks;
+   this/last month are calendar months; past week/month are rolling;
+   latest/recent/news is a rolling 7 days. The window rides on the
+   plan so the integration can bound its search.
+7. OWNER-STRICT SESSIONS: follow-up references ("the second one")
+   resolve against the OWNER's own last verified result only.
+8. CAPS REFUSE, NEVER EVICT; OVERFLOW REJECTS, NEVER TRUNCATES.
+9. READ-ONLY, NOT MOUNTED: no action paths, no network.
 """
 
 import calendar
 import re
 import time
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+
+from urlcanon import canonical_url, UrlCanonError
 
 MAX_QUERY = 500
 MAX_SUBQUERIES = 4
@@ -47,10 +66,8 @@ MAX_CLAIM_TEXT = 1000
 MAX_URL = 500
 MAX_SOURCES = 10
 MAX_PLANS_PER_OWNER = 50
-MIN_SUPPORT_OVERLAP = 0.34  # fraction of claim tokens found in fetched text
+MIN_SUPPORT_OVERLAP = 0.34  # fraction of claim tokens in the best window
 DAY = 86400
-
-_TRACKING_PARAMS = re.compile(r'(?i)^(utm_|fbclid|gclid|mc_|ref$|ref_)')
 
 ORDINALS = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3,
             "3rd": 3, "fourth": 4, "4th": 4, "fifth": 5, "5th": 5,
@@ -63,8 +80,20 @@ _STOP = frozenset("the a an and or of to in on for with is are was were "
                   "where which how why did do does can could should "
                   "would about from by at as".split())
 
+_NEG = frozenset("not no never neither none dont doesn't don't isnt "
+                 "isn't aren't arent wasn't wasnt weren't werent won't "
+                 "wont cannot can't cant without lack lacks lacking "
+                 "fail fails failed hardly barely nor nobody nothing "
+                 "nowhere".split())
+
+_NUM = re.compile(r"\d+(?:\.\d+)?")
+
 
 class FindError(Exception):
+    pass
+
+
+class UrlError(FindError):
     pass
 
 
@@ -77,53 +106,72 @@ class SourceLimitReached(FindError):
 
 
 def _tok(text):
-    return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [w for w in re.findall(r"[a-z0-9']+", (text or "").lower())
             if w not in _STOP and len(w) > 1]
 
 
-def canonical_url(url):
-    """Canonical form for dedup: lowercase scheme+host, no fragment,
-    no tracking params, no trailing slash on path."""
-    if not isinstance(url, str) or not url or len(url) > MAX_URL:
-        raise FindError("url missing or over %d chars" % MAX_URL)
-    p = urlparse(url.strip())
-    if p.scheme not in ("http", "https") or not p.hostname:
-        raise FindError("url must be absolute http(s)")
-    host = p.hostname.lower()
-    if host.startswith("www."):
-        host = host[4:]
-    q = urlencode([(k, v) for k, v in parse_qsl(p.query)
-                   if not _TRACKING_PARAMS.match(k)])
-    path = p.path.rstrip("/")
-    return urlunparse(("https", host, path, "", q, ""))
+def _canon(url):
+    try:
+        return canonical_url(url, max_url=MAX_URL, error=UrlError)
+    except UrlCanonError as e:
+        raise UrlError(str(e))
 
 
-def parse_window(query, now):
-    """Resolve recency words to an (after, before) window or None.
-    Boundaries are inclusive-exclusive [after, before) on epoch days."""
+def _shift(now, tz_offset_minutes):
+    """Owner-local epoch used for calendar boundaries."""
+    return now + tz_offset_minutes * 60
+
+
+def _month_edge(y, m):
+    return calendar.timegm((y, m, 1, 0, 0, 0, 0, 1, 0))
+
+
+def parse_window(query, now, tz_offset_minutes=0):
+    """Resolve recency words to an [after, before) epoch window or None.
+    Owner-local calendar semantics: today/yesterday are local days;
+    this/last week are ISO Monday weeks; this/last month are calendar
+    months; past week/month are rolling 7/30 days; latest/recent/news/
+    current is a rolling 7 days."""
     q = query.lower()
-    day0 = int(now // DAY) * DAY
+    loc = _shift(now, tz_offset_minutes)
+    day0 = int(loc // DAY) * DAY
+    back = -tz_offset_minutes * 60
     if re.search(r'\b(today|tonight)\b', q):
-        return (day0, day0 + DAY)
+        return (day0 + back, day0 + DAY + back)
     if re.search(r'\byesterday\b', q):
-        return (day0 - DAY, day0)
-    if re.search(r'\b(this week|past week|last week)\b', q):
-        return (day0 - 7 * DAY, day0 + DAY)
-    if re.search(r'\b(this month|past month|last month)\b', q):
-        return (day0 - 30 * DAY, day0 + DAY)
+        return (day0 - DAY + back, day0 + back)
+    g = time.gmtime(loc)
+    if re.search(r'\bthis week\b', q):
+        w0 = day0 - g.tm_wday * DAY
+        return (w0 + back, w0 + 7 * DAY + back)
+    if re.search(r'\blast week\b', q):
+        w0 = day0 - g.tm_wday * DAY
+        return (w0 - 7 * DAY + back, w0 + back)
+    if re.search(r'\bpast week\b|\bpast 7 days\b', q):
+        return (day0 - 7 * DAY + back, day0 + DAY + back)
+    if re.search(r'\bthis month\b', q):
+        return (_month_edge(g.tm_year, g.tm_mon) + back,
+                _month_edge(g.tm_year + (g.tm_mon == 12), g.tm_mon % 12 + 1) + back)
+    if re.search(r'\blast month\b', q):
+        prev_y = g.tm_year - (g.tm_mon == 1)
+        prev_m = (g.tm_mon - 2) % 12 + 1
+        return (_month_edge(prev_y, prev_m) + back,
+                _month_edge(g.tm_year, g.tm_mon) + back)
+    if re.search(r'\bpast month\b|\bpast 30 days\b', q):
+        return (day0 - 30 * DAY + back, day0 + DAY + back)
     if re.search(r'\b(latest|recent|recently|news|breaking|current)\b', q):
-        return (day0 - 7 * DAY, day0 + DAY)
+        return (day0 - 7 * DAY + back, day0 + DAY + back)
     m = re.search(r'\bin (20\d\d)\b', q)
     if m:
-        after = calendar.timegm((int(m.group(1)), 1, 1, 0, 0, 0, 0, 1, 0))
-        before = calendar.timegm((int(m.group(1)) + 1, 1, 1, 0, 0, 0, 0, 1, 0))
-        return (after, before)
+        y = int(m.group(1))
+        return (_month_edge(y, 1), _month_edge(y + 1, 1))
     return None
 
 
 def _fallback_decompose(query):
     """Deterministic decomposition: comparisons and conjunctions split,
-    otherwise the query stands alone. Never more than 4 parts."""
+    otherwise the query stands alone. REFUSES over-cap decompositions -
+    silently dropping a requested subject would change the question."""
     q = query.strip()
     m = re.match(r'(?is)^(?:compare|comparison of)\s+(.+?)\s+'
                  r'(?:and|with|versus|vs\.?)\s+(.+)$', q)
@@ -137,7 +185,12 @@ def _fallback_decompose(query):
         if p and p.lower() not in seen:
             seen.add(p.lower())
             out.append(p)
-    return out[:MAX_SUBQUERIES] or [q]
+    if not out:
+        out = [q]
+    if len(out) > MAX_SUBQUERIES:
+        raise FindError("question decomposes into %d parts, cap is %d"
+                        % (len(out), MAX_SUBQUERIES))
+    return out
 
 
 def _validate_subqueries(subs):
@@ -153,6 +206,33 @@ def _validate_subqueries(subs):
             raise FindError("subquery over %d chars" % MAX_SUBQUERY)
         out.append(s.strip())
     return out
+
+
+def reference_support(claim_text, content):
+    """Deterministic reference support gate (stdlib, source-only).
+    Best sentence-window token overlap must clear MIN_SUPPORT_OVERLAP,
+    every numeric token in the claim must appear in that window, and
+    the window's negation words must exactly equal the claim's - a
+    high-overlap window that adds or drops a negation is a suspected
+    contradiction, not support. Production wiring should inject the
+    existing checked_answer gate via support_fn instead."""
+    ct = set(_tok(claim_text))
+    if not ct:
+        return False
+    cneg = ct & _NEG
+    cnums = set(_NUM.findall(claim_text))
+    for w in re.split(r'(?<=[.!?\n])\s+', content or ""):
+        wt = set(_tok(w))
+        if not wt:
+            continue
+        if len(ct & wt) / float(len(ct)) < MIN_SUPPORT_OVERLAP:
+            continue
+        if (wt & _NEG) != cneg:
+            continue
+        if cnums and not cnums <= set(_NUM.findall(w)):
+            continue
+        return True
+    return False
 
 
 class Plan(object):
@@ -192,19 +272,19 @@ class Find(object):
                 return p
         raise FindError("no such plan")
 
-    def _next_seq(self, owner):
-        return len(self._plans(owner)) + 1
-
-    def plan(self, owner, query, now, decompose_fn=None):
+    def plan(self, owner, query, now, decompose_fn=None, tz_offset_minutes=0):
         """Build a query plan. Pure decision: subqueries + window.
         decompose_fn (optional) is validated; bad output refuses the
-        whole plan with zero effects."""
+        whole plan with zero effects. tz_offset_minutes is the owner's
+        local offset for calendar words (default UTC)."""
         if not owner or not isinstance(owner, str):
             raise FindError("owner required")
         if not isinstance(query, str) or not query.strip():
             raise FindError("query required")
         if len(query) > MAX_QUERY:
             raise FindError("query over %d chars" % MAX_QUERY)
+        if not isinstance(tz_offset_minutes, int) or isinstance(tz_offset_minutes, bool):
+            raise FindError("tz_offset_minutes must be int minutes")
         plans = self._plans(owner)
         if len(plans) >= MAX_PLANS_PER_OWNER:
             raise PlanLimitReached("plan cap %d reached" % MAX_PLANS_PER_OWNER)
@@ -212,19 +292,22 @@ class Find(object):
             subs = _validate_subqueries(decompose_fn(query))
         else:
             subs = _validate_subqueries(_fallback_decompose(query))
-        window = parse_window(query, now)
-        p = Plan(self.id_factory("pl", self._next_seq(owner), now),
+        window = parse_window(query, now, tz_offset_minutes)
+        p = Plan(self.id_factory("pl", len(plans) + 1, now),
                  owner, query.strip(), subs, window, now)
         plans.append(p)
         return p
 
-    def verify(self, owner, pid, claims, fetch_fn, now):
+    def verify(self, owner, pid, claims, fetch_fn, now, support_fn=None):
         """Verify claimed citations against fetched content. Each claim:
         {"text": str, "url": str, "title": str?, "published": float?}.
-        A citation survives only when fetch_fn(url) returns content
-        whose tokens support the claim text. Dropped citations are
-        recorded with their reason. Atomic: over-cap input refuses the
-        whole batch with zero effects."""
+        A citation survives only when fetch_fn(url) returns content that
+        supports the claim (support_fn if given, else reference_support).
+        Dropped citations are recorded with their reason. ATOMIC: all
+        derived state is computed and validated first; any refusal
+        (over-cap batch, source-cap) leaves prior plan state and the
+        session byte-identical."""
+        support = support_fn or reference_support
         p = self._plan(owner, pid)
         if not isinstance(claims, (list, tuple)):
             raise FindError("claims must be a list")
@@ -246,8 +329,8 @@ class Find(object):
                      "title": (c.get("title") or "").strip(),
                      "published": c.get("published")}
             try:
-                canon = canonical_url(c["url"])
-            except FindError:
+                canon = _canon(c["url"])
+            except UrlError:
                 entry["reason"] = "bad_url"
                 dropped.append(entry)
                 continue
@@ -262,19 +345,26 @@ class Find(object):
                 entry["reason"] = "empty_content"
                 dropped.append(entry)
                 continue
-            ct, ft = set(_tok(c["text"])), set(_tok(content))
-            if not ct or len(ct & ft) / float(len(ct)) < MIN_SUPPORT_OVERLAP:
+            try:
+                ok = bool(support(c["text"], content))
+            except Exception:
+                entry["reason"] = "support_error"
+                dropped.append(entry)
+                continue
+            if not ok:
                 entry["reason"] = "unsupported"
                 dropped.append(entry)
                 continue
             verified.append(entry)
-        p.claims = list(claims)
+        sources = self._build_sources(verified)  # raises BEFORE any commit
+        p.claims = [dict(c) for c in claims]
         p.verified = verified
         p.dropped = dropped
-        p.sources = self._build_sources(verified)
-        self.store.sessions[owner] = list(p.sources)
-        return {"pid": pid, "verified": verified, "dropped": dropped,
-                "sources": p.sources}
+        p.sources = sources
+        self.store.sessions[owner] = [dict(s) for s in sources]
+        return {"pid": pid, "verified": [dict(v) for v in verified],
+                "dropped": [dict(d) for d in dropped],
+                "sources": [dict(s) for s in sources]}
 
     def _build_sources(self, verified):
         seen, out = {}, []
@@ -307,13 +397,13 @@ class Find(object):
         idx = n - 1 if n > 0 else len(sources) - 1
         if idx < 0 or idx >= len(sources):
             return None
-        return {"index": idx + 1, "source": sources[idx]}
+        return {"index": idx + 1, "source": dict(sources[idx])}
 
     def sources(self, owner, pid):
-        return list(self._plan(owner, pid).sources)
+        return [dict(s) for s in self._plan(owner, pid).sources]
 
     def session(self, owner):
-        return list(self.store.sessions.get(owner) or [])
+        return [dict(s) for s in (self.store.sessions.get(owner) or [])]
 
     def export(self, owner):
         return [{"pid": p.pid, "query": p.query, "subqueries": p.subqueries,

@@ -71,7 +71,8 @@ def _snippet(text, terms, width=MAX_SNIPPET):
 
 
 class Record(object):
-    __slots__ = ("rid", "owner", "kind", "text", "source", "ts", "tokens")
+    __slots__ = ("rid", "owner", "kind", "text", "source", "ts",
+                 "text_tokens", "meta_tokens")
 
     def __init__(self, rid, owner, kind, text, source, ts):
         self.rid = rid
@@ -80,7 +81,10 @@ class Record(object):
         self.text = text
         self.source = source
         self.ts = ts
-        self.tokens = set(_tok(text) + _tok(kind) + _tok(source))
+        # ranking reads TEXT tokens only; kind/source are metadata and
+        # are reported as matched_fields, never scored as text evidence
+        self.text_tokens = set(_tok(text))
+        self.meta_tokens = {"kind": set(_tok(kind)), "source": set(_tok(source))}
 
 
 class MemPersonalStore(object):
@@ -110,10 +114,15 @@ class FindPersonal(object):
             raise FindPersonalError("text over %d chars" % MAX_TEXT)
         if not isinstance(source, str):
             raise FindPersonalError("source must be str")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)) \
+                or ts != ts or ts in (float("inf"), float("-inf")):
+            raise FindPersonalError("ts must be a finite number")
         recs = self._records(owner)
         if len(recs) >= MAX_RECORDS:
             raise RecordLimitReached("record cap %d reached" % MAX_RECORDS)
         rid = self.id_factory("rec", len(recs) + 1, ts)
+        if rid in recs:
+            raise FindPersonalError("record id collision: %s" % rid)
         recs[rid] = Record(rid, owner, kind.strip(), text.strip(),
                            source.strip(), ts)
         return rid
@@ -131,22 +140,41 @@ class FindPersonal(object):
         if not terms:
             return []
         scored = []
+        meta_only = []
         for rec in self._records(owner).values():
-            if not rec.tokens:
-                continue
-            hit = len(terms & rec.tokens)
-            if not hit:
-                continue
-            score = hit / float(len(terms))
-            if score < MIN_SCORE:
-                continue
-            scored.append((score, rec.ts, rec.rid, rec))
+            hit = len(terms & rec.text_tokens)
+            matched = [fld for fld in ("kind", "source")
+                       if terms & rec.meta_tokens[fld]]
+            if hit:
+                matched.insert(0, "text")
+            score = hit / float(len(terms)) if hit else 0.0
+            if hit and score >= MIN_SCORE:
+                scored.append((score, rec.ts, rec.rid, rec, matched))
+            elif matched:
+                # metadata-only hit: no text evidence, never outranks
+                meta_only.append((rec.ts, rec.rid, rec, matched))
         # score desc, ts desc (recency tie-break), rid asc (stable)
         scored.sort(key=lambda s: (-s[0], -s[1], s[2]))
-        return [{"rid": rec.rid, "kind": rec.kind, "source": rec.source,
-                 "ts": rec.ts, "score": round(score, 4),
-                 "snippet": _snippet(rec.text, terms)}
-                for score, _ts, _rid, rec in scored[:limit]]
+        meta_only.sort(key=lambda s: (-s[0], s[1]))
+        out = [{"rid": rec.rid, "kind": rec.kind, "source": rec.source,
+                "ts": rec.ts, "score": round(score, 4),
+                "matched_fields": matched,
+                "snippet": _snippet(rec.text, terms)}
+               for score, _ts, _rid, rec, matched in scored]
+        out += [{"rid": rec.rid, "kind": rec.kind, "source": rec.source,
+                 "ts": rec.ts, "score": 0.0, "matched_fields": matched,
+                 "snippet": None}
+                for _ts, _rid, rec, matched in meta_only]
+        return out[:limit]
+
+    def remove(self, owner, rid):
+        """Delete one record by id (source-edit/forget propagation).
+        Returns True when a record was removed, False when absent."""
+        recs = self.store.records.get(owner)
+        if not recs or rid not in recs:
+            return False
+        del recs[rid]
+        return True
 
     def wipe(self, owner):
         """Delete every record the owner has. Returns the count removed."""
