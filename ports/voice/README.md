@@ -65,18 +65,27 @@ no activation. The accepted runtime-contract.md is unchanged.
   replay provider work or effects; resolution only via the authorized
   browser read-only /voice/result within the original 300s TTL.
 
-## Pending joint-interface alignment
+## Joint-interface alignment (Rev4 / OpenAPI 1.0.3)
 
-Two adapter<->canonical interface points are EXPLICITLY parked pending
-their coordinated canonical + reference + adapter revision; the adapter
-stays strict and must NOT be unilaterally relaxed:
+The coordinated canonical + reference + adapter revision (PR #17)
+settles both parked points in this adapter's favor; NO adapter change
+was needed:
 
 1. lease_id echo: revalidate responses MUST echo lease_id, request_id
-   and expires_at (an omitted lease_id is non-conformant here).
-2. expires_at typing: this adapter requires a NUMERIC (finite)
-   expires_at; their canonical currently emits an ISO STRING. The type
-   will be settled in the same coordinated revision; until then a
-   string expires_at is rejected (bad_binding:expires_at), NOT coerced.
+   and the ORIGINAL expires_at - exactly this adapter's existing strict
+   binding.
+2. expires_at typing: all wire expires_at values are finite numeric UTC
+   Unix seconds (FRACTIONAL allowed) - this adapter's _require_finite
+   already accepts finite ints AND floats, so fractional seconds bind
+   without relaxation. ISO strings remain rejected.
+
+Independently verified against the PR #17 head on a real scratch
+Postgres: issue/redeem/revalidate all emit finite floats and revalidate
+echoes the original expiry exactly (fractional). KNOWN REMAINING GAP
+(theirs, pending follow-up): the merged /voice/result recovery output
+still emits an ISO string while Rev4/1.0.3 declare numeric - the
+adapter never calls recovery (browser-side), so this does not affect
+the binding.
 
 ## Not here (activation gates, per docs/voice/implementation-status.md)
 
