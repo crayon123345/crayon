@@ -17,5 +17,7 @@ def handle(uid,chat,text,out):
         due+=timedelta(hours=1);adjusted+=1
     # Uses existing requested reminder semantics and current timezone calculation.
     result=T.set_reminder({'uid':uid,'chat_id':chat},text='How did '+m[2].rstrip('?.!')+' go? Want to talk it through?',in_minutes=(int(m[1])+adjusted)*60)
+    if result.get('verified') and result.get('delivery'):
+        result['note']='Follow-up scheduled for '+str(result.get('due_local','your requested time'))+'. Delivery: '+result['delivery']+'. Free-host delivery is best-effort.'
     out.send(chat,result.get('note') or ('Follow-up scheduled for '+str(result.get('due_local','your requested time'))+'. Free-host delivery is best-effort.' if result.get('verified') else 'Follow-up was not confirmed.'))
     return True
