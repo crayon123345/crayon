@@ -144,3 +144,8 @@ footer{padding:6px 18px calc(12px + env(safe-area-inset-bottom));background:line
 .sel option{color:#1b1719;background:#fff}
 @media (max-width:600px){.sel{max-width:64px;font-size:11px}}
 .wchg{font:600 14px var(--sans)}.wchg.up{color:var(--ok)}.wchg.dn{color:var(--accent)}
+
+/* export menu */
+#exportmenu{position:fixed;z-index:60;background:#1c1a1e;border:1px solid #33303a;border-radius:12px;padding:6px;box-shadow:0 12px 40px rgba(0,0,0,.45);display:flex;flex-direction:column;min-width:170px}
+#exportmenu button{background:none;border:0;color:#e8e4ea;text-align:left;padding:9px 12px;border-radius:8px;font-size:14px;cursor:pointer}
+#exportmenu button:hover{background:#2a2730}

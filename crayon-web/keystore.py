@@ -14,6 +14,7 @@ ALLOWED = {"OPENROUTER_API_KEY": re.compile(r"^sk-or-[\w-]{10,250}$"), "TELEGRAM
            "TWILIO_ACCOUNT_SID": re.compile(r"^AC[0-9a-fA-F]{32}$"),
            "TWILIO_AUTH_TOKEN": re.compile(r"^[0-9a-fA-F]{32}$"),
            "TWILIO_WA_FROM": re.compile(r"^whatsapp:\+[0-9]{8,15}$"),
+           "D360_API_KEY": re.compile(r"^\S{10,250}$"),
            "TELEGRAM_BOT_TOKEN": re.compile(r"^[0-9]{8,12}:[A-Za-z0-9_-]{30,40}$")}
 PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>Crayon setup</title>
 <body style="font:16px system-ui;max-width:420px;margin:40px auto;padding:0 16px"><h3>Crayon key setup</h3>
