@@ -1,5 +1,15 @@
 # /ports/voice - synthetic staging adapter (REV3)
 
+> STATUS: INCOMPLETE DISABLED SCAFFOLD. Transport-injected, unmounted, no
+> routes, no provider calls, no activation. Remaining obligations before
+> any activation consideration: enforceable provider/work cancellation
+> (process isolation or provider-side cancel API - threads cannot be
+> force-killed, so there is NO post-close-effect guarantee for
+> noncooperative work), durable stores, canonical session validation,
+> scoped credential rotation, rate quotas, feature flags, consent display,
+> ASGI websocket gateway, revocation push, erasure, real
+> browser/device/codec/provider roundtrips.
+
 Adapter-side client for the canonical voice API v1 (docs/voice, REV3).
 STAGING ONLY: transport-injected, no routes, no provider calls, no device,
 no activation. The accepted runtime-contract.md is unchanged.
@@ -16,10 +26,19 @@ no activation. The accepted runtime-contract.md is unchanged.
   Ordinary transport failures (builtin `TimeoutError`/`OSError`) fail
   closed exactly like an explicit `TransportTimeout`, on every path.
   Startup ordering is load-bearing: the FIRST validation completes before
-  the worker is started at all (a denied startup means zero work effects),
-  and on any close the worker is cooperatively cancelled
-  (`work(lease, cancel)` receives a threading.Event) and JOINED before the
-  error propagates - no effect lands after close.
+  the worker is started at all (a denied startup means zero work effects).
+  Cancellation is COOPERATIVE ONLY: on close the worker's threading.Event
+  is set and it is joined with a bounded timeout; a worker that ignores
+  cancel and outlives the join is DETECTED (is_alive) and surfaced as
+  `worker_survived_cancel` (original denial chained), and the adapter
+  marks itself permanently UNCLEAN and refuses all further work - but
+  post-close effects from the survivor are UNBOUNDED. There is no
+  no-after-close-effects guarantee for noncooperative work. Enforceable
+  cancellation (process isolation) is listed as future work above.
+  ALL incoming timing values are clamped to contract bounds:
+  `revalidate_seconds` can tighten but never widen past the 15s cadence
+  (a 3600s canonical value is clamped; non-positive falls back to 15),
+  which also bounds the cancellation join timeout.
 - Incremental caps: elapsed time from redeem and audio bytes
   (`note_audio_bytes`) are tracked per lease; first breach of the
   600s / 20MB caps ends the turn (CapExceeded, lease closed). Negative or
@@ -54,7 +73,7 @@ revocation push, erasure, real browser/device/codec/provider roundtrips.
 
 ## Tests
 
-`pytest ports/voice` - 41 synthetic tests, including a genuine threaded
+`pytest ports/voice` - 46 synthetic tests, including a genuine threaded
 redeem race (barrier-synchronized, exactly one winner), a real lost-commit
 (canonical commits, response transport dies -> CommitUnknown + close + no
 replay), exact 120s expiry boundary, incremental 600s/20MB cap enforcement,
@@ -66,9 +85,15 @@ origin parsing (empty host, credentials, path, query, fragment, look-alike
 host) plus allowlist rejection, revalidate request_id/expires_at binding,
 wall-clock cadence under genuinely blocking work (threaded, 15s gap
 asserted) and denial-during-blocking-work close, negative byte-increment
-rejection, and server-cap clamping to contract bounds. REV5 rework
-coverage (effect-recording fakes): denied startup produces ZERO work
-effects (worker never invoked); revocation during blocked work sets
-cancel, joins the worker inside run_turn, and asserts NO effect after
-close; success path joins the worker cleanly; allowlist is mandatory
-(absent/empty construction refuses, no module-level default exists).
+rejection, and server-cap clamping to contract bounds. REV5/REV6 rework coverage (effect-recording fakes): denied startup
+produces ZERO work effects (worker never invoked); revocation during
+blocked COOPERATIVE work sets cancel, joins the worker inside run_turn,
+and asserts no effect after close; success path joins the worker cleanly;
+a NONCOOPERATIVE worker that ignores cancel and outlives the bounded join
+is detected (worker_survived_cancel, denial chained) and the adapter then
+refuses redeem/revalidate/drive/bytes/progress/final/provider-guard as
+adapter_unclean; allowlist is mandatory (absent/empty construction
+refuses, no module-level default exists); canonical revalidate_seconds of
+3600 and 0 are both clamped to the 15s contract cadence; a revalidate
+response OMITTING lease_id is rejected as non-conformant bad_binding
+(coordinated canonical+adapter spec: lease_id echo required).

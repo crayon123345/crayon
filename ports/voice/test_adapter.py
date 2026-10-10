@@ -607,3 +607,119 @@ def test_f7_allowlist_required_no_implicit_trust():
     # no module-level default remains to smuggle authority back in
     import adapter as mod
     assert not hasattr(mod, "DEFAULT_ALLOWED_ORIGINS")
+
+
+def test_f6_noncooperative_worker_survivor_is_detected_not_ignored():
+    """A worker that ignores cancel and outlives the bounded join must be
+    DETECTED and SURFACED (worker_survived_cancel), with the original
+    denial chained - never silently ignored."""
+    now = [1000.0]
+    c, a = make(clock=lambda: now[0])
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    lease.revalidate_seconds = 0.2   # short join timeout for the probe
+    worker_release = threading.Event()
+    def work(l, cancel):
+        worker_release.wait(30)      # ignores cancel entirely
+        return True
+    outcome = {}
+    def run():
+        try:
+            a.run_turn(lease, work,
+                       sleep=lambda s: now.__setitem__(0, now[0] + s))
+        except AdapterError as e:
+            outcome["e"] = e
+    th = threading.Thread(target=run)
+    th.start()
+    time.sleep(0.3)                  # let the turn start + first check pass
+    c.revoke_lease(lease.lease_id)   # next scheduled check denies
+    th.join(timeout=15)
+    assert not th.is_alive()
+    err = outcome.get("e")
+    assert isinstance(err, AdapterError)
+    assert err.code.startswith("worker_survived_cancel"), err.code
+    assert isinstance(err.__cause__, AdapterError)   # original denial chained
+    assert not lease.active
+    worker_release.set()             # test-level cleanup of the leaked worker
+
+
+def test_f8_server_revalidate_seconds_clamped_to_contract():
+    """A canonical advertising revalidate_seconds=3600 must NOT widen the
+    15s cadence (or the join timeout): clamped to the contract value."""
+    c = FakeCanonical()
+    orig = c.__call__
+    def wide(method, path, headers, body):
+        status, data = orig(method, path, headers, body)
+        if path.endswith("/redeem"):
+            data = dict(data); data["revalidate_seconds"] = 3600
+        return status, data
+    a = VoiceAdapter(wide, "scoped-x", allowed_origins={ORIGIN})
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert lease.revalidate_seconds == REVALIDATE_SECONDS == 15
+
+
+def test_f8_nonpositive_revalidate_seconds_falls_back_to_contract():
+    c = FakeCanonical()
+    orig = c.__call__
+    def zero(method, path, headers, body):
+        status, data = orig(method, path, headers, body)
+        if path.endswith("/redeem"):
+            data = dict(data); data["revalidate_seconds"] = 0
+        return status, data
+    a = VoiceAdapter(zero, "scoped-x", allowed_origins={ORIGIN})
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert lease.revalidate_seconds == 15
+
+
+def test_f8_omitted_lease_id_in_revalidate_is_bad_binding():
+    """Coordinated spec: canonical MUST echo lease_id. An omission is
+    non-conformant and closes the lease - never silently accepted."""
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    orig = c.__call__
+    def omit(method, path, headers, body):
+        status, data = orig(method, path, headers, body)
+        if path.endswith("/revalidate"):
+            data = dict(data); data.pop("lease_id", None)
+        return status, data
+    a._t = omit
+    with pytest.raises(AdapterError) as e:
+        a.revalidate(lease)
+    assert e.value.code == "bad_binding:revalidate" and not lease.active
+
+
+def test_f8_unclean_adapter_refuses_all_further_work():
+    """After a survivor is detected, the adapter is permanently unclean:
+    every public operation fails closed."""
+    now = [1000.0]
+    c, a = make(clock=lambda: now[0])
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    lease.revalidate_seconds = 0.2
+    worker_release = threading.Event()
+    def work(l, cancel):
+        worker_release.wait(30)
+        return True
+    def run():
+        try:
+            a.run_turn(lease, work,
+                       sleep=lambda s: now.__setitem__(0, now[0] + s))
+        except AdapterError:
+            pass
+    th = threading.Thread(target=run)
+    th.start(); time.sleep(0.3)
+    c.revoke_lease(lease.lease_id)
+    th.join(timeout=15)
+    assert a._unclean is True
+    lease2 = a.__dict__  # any further work refuses:
+    for fn in (lambda: a.redeem(c.issue(), ORIGIN, "transcribe"),
+               lambda: a.revalidate(lease),
+               lambda: a.drive_once(lease),
+               lambda: a.note_audio_bytes(lease, 1),
+               lambda: a.progress(lease, "progress", "running"),
+               lambda: a.final(lease, "done", transcript_text="x"),
+               lambda: a.provider_connect_guard(lease)):
+        with pytest.raises(AdapterError) as e:
+            fn()
+        assert e.value.code.startswith(("adapter_unclean",
+                                        "worker_survived_cancel",
+                                        "lease_closed")), e.value.code
+    worker_release.set()

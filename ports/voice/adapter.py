@@ -92,7 +92,16 @@ class Lease:
             "max_bytes": min(lim.get("max_bytes", CONTRACT_MAX_BYTES),
                              CONTRACT_MAX_BYTES),
         }
-        self.revalidate_seconds = body.get("revalidate_seconds", REVALIDATE_SECONDS)
+        # Clamp incoming timing to the contract cadence: the server may
+        # tighten but NEVER widen the 15s revalidation cadence (a 3600s
+        # server value would silently disable active liveness AND stretch
+        # the cancellation join timeout). Non-positive/garbage -> contract.
+        try:
+            rs = float(body.get("revalidate_seconds", REVALIDATE_SECONDS))
+        except (TypeError, ValueError):
+            rs = REVALIDATE_SECONDS
+        self.revalidate_seconds = (REVALIDATE_SECONDS if rs <= 0
+                                   else min(rs, REVALIDATE_SECONDS))
         self.redeemed_at = clock()
         self.bytes_used = 0
         self.active = True
@@ -122,6 +131,7 @@ class VoiceAdapter:
         self._clock = clock
         self._allowed = frozenset(allowed_origins)
         self._lock = threading.Lock()
+        self._unclean = False  # set when a worker survives cancellation
 
     # -- transport ------------------------------------------------------
     def _call(self, path, body):
@@ -152,6 +162,7 @@ class VoiceAdapter:
     def redeem(self, ticket, observed_origin, mode):
         """Redeem a ticket taken from the FIRST websocket frame only.
         The ticket must never appear in a URL; it goes in the body."""
+        self._require_clean()
         if not ticket or not mode:
             raise AdapterError("malformed", 400)
         self._check_origin(observed_origin)
@@ -178,6 +189,7 @@ class VoiceAdapter:
     def note_audio_bytes(self, lease, n):
         """Incrementally account audio bytes; first cap breach ends the turn.
         Negative or non-numeric increments are rejected, never applied."""
+        self._require_clean()
         with self._lock:
             self._require_active(lease)
             try:
@@ -194,6 +206,7 @@ class VoiceAdapter:
         """Check before provider connect and every 15s wall-clock. ANY
         denial, non-active response, binding mismatch, or
         unavailable/timed-out/failed validation closes the lease."""
+        self._require_clean()
         try:
             data = self._call("/voice/internal/revalidate",
                               {"version": 1, "lease_id": lease.lease_id})
@@ -203,8 +216,11 @@ class VoiceAdapter:
         except AdapterError:
             self._close(lease, "denied")
             raise
-        # Full response binding: the canonical must answer about THIS lease.
-        if (data.get("lease_id", lease.lease_id) != lease.lease_id
+        # Full response binding: the canonical must answer about THIS
+        # lease. lease_id is REQUIRED in the response - an omitted lease_id
+        # is non-conformant (coordinated canonical+adapter spec), not a
+        # reason to relax the check.
+        if (data.get("lease_id") != lease.lease_id
                 or data.get("request_id") != lease.request_id
                 or data.get("expires_at") != lease.expires_at):
             self._close(lease, "bad_binding")
@@ -217,6 +233,7 @@ class VoiceAdapter:
     def drive_once(self, lease):
         """One active-cadence step: caps check + revalidate. Any exception
         here means the lease closed."""
+        self._require_clean()
         with self._lock:
             self._require_active(lease)
             self._check_caps(lease)
@@ -234,10 +251,17 @@ class VoiceAdapter:
            lease.revalidate_seconds of wall-clock time regardless of how
            long work blocks.
         3. On ANY failed check the lease closes, `cancel` (a
-           threading.Event) is set, and the worker is JOINED before the
-           error propagates - work must observe `cancel` cooperatively, so
-           no effect lands after close. On normal completion the worker is
-           joined the same way (cleanup).
+           threading.Event) is set, and the worker is JOINED (bounded by
+           the clamped cadence) before the error propagates.
+
+        SCAFFOLD LIMITATION (explicit): cancellation is COOPERATIVE ONLY.
+        Threads cannot be force-killed: a worker that ignores `cancel`
+        and outlives the bounded join is DETECTED (is_alive) and surfaced
+        as worker_survived_cancel, the adapter marks itself permanently
+        UNCLEAN and refuses all further work - but post-close effects
+        from the surviving worker are UNBOUNDED. There is NO
+        no-after-close-effects guarantee for noncooperative work.
+        Enforceable cancellation (process isolation) is future work.
 
         Returns work's result; re-raises work errors."""
         # (a) validate first: a denial here means the worker never runs.
@@ -265,18 +289,41 @@ class VoiceAdapter:
                 if outcome.get("finished"):
                     break
                 sleep(min(max(next_check - self._clock(), 0.0), 0.05) or 0.001)
-        except BaseException:
+        except BaseException as e:
             cancel.set()                    # (b) cooperative cancellation
             t.join(timeout=lease.revalidate_seconds)  # joined before raise
+            if t.is_alive():
+                # Non-cooperative worker survived the bounded join. This is
+                # DETECTED and surfaced, never silently ignored: the lease
+                # is closed, but the worker may still produce effects.
+                # SCAFFOLD LIMITATION: threads cannot be force-killed, so
+                # there is NO post-close guarantee for noncooperative work.
+                # The adapter marks itself permanently unclean and refuses
+                # all further work. Original denial chains as __cause__.
+                self._unclean = True
+                raise AdapterError(
+                    "worker_survived_cancel: cancellation is cooperative "
+                    "only; worker ignored cancel and outlived the join "
+                    "timeout - adapter is now UNCLEAN and refuses further "
+                    "work; post-close effects from the survivor are "
+                    "UNBOUNDED (enforceable process isolation is future "
+                    "work)", 500) from e
             raise
         cancel.set()
         t.join(timeout=lease.revalidate_seconds)      # cleanup join
+        if t.is_alive():
+            self._unclean = True
+            raise AdapterError(
+                "worker_survived_cancel: worker outlived the cleanup join "
+                "timeout after a finished turn - adapter is now UNCLEAN "
+                "and refuses further work", 500)
         if "error" in outcome:
             raise outcome["error"]
         return outcome.get("value", False)
 
     # -- progress/final ----------------------------------------------------
     def progress(self, lease, type_, state, text=None):
+        self._require_clean()
         with self._lock:
             self._require_active(lease)
             if lease.final_payload is not None:
@@ -304,6 +351,7 @@ class VoiceAdapter:
         (canonical duplicate path). Lost response (timeout OR ordinary
         transport failure) or liveness denial: CommitUnknown + close,
         never replay."""
+        self._require_clean()
         with self._lock:
             self._require_active(lease)
             if state not in FINAL_STATES:
@@ -349,8 +397,19 @@ class VoiceAdapter:
                 raise
 
     # -- helpers ---------------------------------------------------------
+    def _require_clean(self):
+        """After an unclean close (a worker survived cancellation) the
+        adapter permanently refuses further work: its post-close state can
+        no longer be guaranteed."""
+        if self._unclean:
+            raise AdapterError(
+                "adapter_unclean: a worker survived cancellation earlier; "
+                "this adapter refuses further work (scaffold fail-safe)",
+                500)
+
     def provider_connect_guard(self, lease):
         """Must pass immediately before any provider connect."""
+        self._require_clean()
         return self.revalidate(lease)
 
     @staticmethod
