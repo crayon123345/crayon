@@ -173,7 +173,7 @@ async def chat(req: Request):
         return JSONResponse({"error": "Crayon is busy right now. Try again in a few seconds."}, status_code=503)
     mail_on = False
     try:
-        mail_on = bool(body.get("mail")) and gmail_auth.current_user(req) is not None
+        mail_on = os.environ.get("CRAYON_INTEGRATED")!="on" and bool(body.get("mail")) and gmail_auth.current_user(req) is not None
     except Exception:
         mail_on = False
     agent_on = bool(body.get("agent"))
