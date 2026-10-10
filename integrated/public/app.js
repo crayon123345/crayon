@@ -438,14 +438,31 @@
         const rest = acc.replace(ig[0], '').trim(); if (rest) bub.innerHTML = md(rest); else bub.parentElement.remove();
         const promptTxt = ig[1].trim().split('\n')[0].slice(0, 400);
         const card = searchCard('Creating an image');
+        if (location.pathname === '/studio') {
+          card.classList.remove('busy'); card.querySelector('.st').textContent = 'Image generation is parked until a verified free provider is chosen.';
+          msg = '[Image generation is unavailable. No image or provider request was made. Do not claim success.]';
+          continue;
+        }
         const url = '/api/image?prompt=' + encodeURIComponent(promptTxt);
         const im2 = new Image();
-        im2.src = url; im2.alt = promptTxt; im2.style.cssText = 'max-width:280px;width:100%;border-radius:12px;display:block';
-        im2.onload = () => { card.classList.remove('busy'); card.querySelector('.st').textContent = 'Image ready - tap to open full size'; };
-        im2.onerror = () => { card.classList.remove('busy'); card.querySelector('.st').textContent = 'Image creation failed - try again'; };
+        im2.alt = promptTxt; im2.style.cssText = 'max-width:280px;width:100%;border-radius:12px;display:block';
+        const loaded = new Promise(resolve => {
+          const timer = setTimeout(() => resolve(false), 45000);
+          im2.onload = () => { clearTimeout(timer); resolve(im2.naturalWidth > 0); };
+          im2.onerror = () => { clearTimeout(timer); resolve(false); };
+        });
         const a = document.createElement('a'); a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.appendChild(im2);
         card.querySelector('.srcs').appendChild(a);
-        msg = '[The image was generated and shown in the chat.]';
+        im2.src = url;
+        const imageReady = await loaded;
+        card.classList.remove('busy');
+        if (imageReady) {
+          card.querySelector('.st').textContent = 'Image ready - tap to open full size';
+          msg = '[The image loaded successfully and was shown in the chat.]';
+        } else {
+          card.querySelector('.st').textContent = 'Image did not load. Generation is not confirmed.';
+          msg = '[The image did not load. Generation is not confirmed. Do not claim success or automatically retry.]';
+        }
         continue;
       }
       const m = acc.match(/```python-run\n([\s\S]*?)```/);

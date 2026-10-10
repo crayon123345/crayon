@@ -36,3 +36,18 @@ def test_latest_raw_adapters_remain_disabled():
   assert c.post('/api/stt',content=b'Synthetic').status_code==404
   assert c.post('/whatsapp/d360',json={}).status_code==404
   assert c.post('/setup/d360-webhook',json={}).status_code==404
+
+def test_integrated_image_generation_parked_before_identity_or_provider(monkeypatch):
+ monkeypatch.setattr(A.memory,'identity',lambda req:(_ for _ in ()).throw(AssertionError('no identity or provider processing')))
+ with TestClient(A.app) as c:
+  r=c.get('/api/image?prompt=synthetic')
+ assert r.status_code==503 and 'parked' in r.json()['error']
+
+def test_image_completion_waits_for_load_and_studio_has_no_request():
+ source=(ROOT/'public/static/app.js').read_text()
+ block=source[source.index("const ig = acc.match"):source.index("const m = acc.match(/```python-run")]
+ assert 'const imageReady = await loaded' in block
+ assert block.index('im2.onload =')<block.index('im2.src = url;')<block.index('const imageReady = await loaded')
+ assert 'Generation is not confirmed' in block
+ assert block.index("location.pathname === '/studio'")<block.index('const url =')
+ assert '[The image was generated and shown in the chat.]' not in block
