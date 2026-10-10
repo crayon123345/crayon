@@ -20,7 +20,7 @@ genuinely fresh URL produces one).
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (30/30 tests) but NOT wired into the
+Complete as a tested module (35/35 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. DIFF FACTS ONLY: run() returns {"tid", "topic", "new": [...]} or
@@ -56,7 +56,9 @@ running app. Named limits, exactly:
    MAX_DIFF_ITEMS = 10 (probe: 50/50 over-cap diffs refused whole),
    MAX_KNOWN_ITEMS = 500 per track (round-3; the run cap < known cap
    so only cross-run growth can reach it - probe: 0/50 over-cap runs
-   committed, known set byte-stable).
+   committed, known set byte-stable). Reads create no state for
+   unknown owners and non-str owners refuse cleanly (round-5 nits);
+   a throwing id_factory changes nothing (round-5).
 8. OVERFLOW REJECTS, NEVER TRUNCATES: topic 200 / url 500 / title 200;
    malformed ports raise the declared error (tested).
 9. CLOCKS + IDS INJECTED; NOT MOUNTED: no timers, no cron, no network,
@@ -65,7 +67,14 @@ running app. Named limits, exactly:
 ## Integration surface
 
 - `add(owner, topic, now)` -> tid; `remove(owner, tid)`; `list(owner)`
-- `run(owner, tid, results, now)` -> {"tid", "topic", "new": [...]} | None
+- `run(owner, tid, results, now)` -> baseline fact on the first
+  non-empty run, then {"tid", "topic", "new": [...]} | None
+- `rebase(owner, tid, results, now)` -> EXPLICIT RECOVERY (round-5):
+  replaces the known set with a fresh result set - the caller-guided
+  way out of a DiffLimitReached deadlock (probe: 106/106 deadlocks
+  recovered; under-cap diffs never need it). Refuses empty / invalid /
+  over-cap input with zero effects; diff continuity breaks EXPLICITLY,
+  by the caller's choice (first_seen knowledge resets).
 
 The integration owns: the re-search schedule (ports/schedule), running
 the search, and mapping diff facts into ports/patterns cards

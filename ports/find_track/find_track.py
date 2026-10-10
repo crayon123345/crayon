@@ -87,6 +87,11 @@ class NoMatch(TrackError):
     pass
 
 
+def _check_owner(owner):
+    if not owner or not isinstance(owner, str):
+        raise TrackError("owner required")
+
+
 def canonical_url(url):
     try:
         return _shared_canonical_url(url, max_url=MAX_URL, error=TrackError)
@@ -120,35 +125,42 @@ class FindTrack(object):
         self.id_factory = id_factory or (lambda p, s, n: "%s%d" % (p, s))
 
     def _tracks(self, owner):
+        # write path only (add) - creates the owner's dict
         return self.store.tracks.setdefault(owner, {})
 
+    def _tracks_read(self, owner):
+        # read path - never creates state
+        return self.store.tracks.get(owner) or {}
+
     def _track(self, owner, tid):
-        t = self._tracks(owner).get(tid)
+        t = self._tracks_read(owner).get(tid)
         if t is None:
             raise NoMatch("no such track")
         return t
 
     def add(self, owner, topic, now):
-        if not owner or not isinstance(owner, str):
-            raise TrackError("owner required")
+        _check_owner(owner)
         if not isinstance(topic, str) or not topic.strip():
             raise TrackError("topic required")
         if len(topic) > MAX_TOPIC:
             raise TrackError("topic over %d chars" % MAX_TOPIC)
-        tracks = self._tracks(owner)
-        if len(tracks) >= MAX_TRACKS:
+        tracks = self.store.tracks.get(owner)
+        if tracks is not None and len(tracks) >= MAX_TRACKS:
             raise TrackLimitReached("track cap %d reached" % MAX_TRACKS)
-        seq = self.store.seq[owner] = self.store.seq.get(owner, 0) + 1
-        tid = self.id_factory("trk", seq, now)
-        if tid in tracks:
-            self.store.seq[owner] -= 1  # nothing consumed on refusal
+        next_seq = self.store.seq.get(owner, 0) + 1
+        tid = self.id_factory("trk", next_seq, now)  # may throw: zero state
+        if tracks is not None and tid in tracks:
             raise TrackError("track id collision: %s" % tid)
+        if tracks is None:
+            tracks = self.store.tracks[owner] = {}
+        self.store.seq[owner] = next_seq  # sequence advances on commit only
         tracks[tid] = Track(tid, owner, topic.strip(), now)
         return tid
 
     def remove(self, owner, tid):
-        tracks = self._tracks(owner)
-        if tid not in tracks:
+        _check_owner(owner)
+        tracks = self.store.tracks.get(owner)
+        if not tracks or tid not in tracks:
             raise NoMatch("no such track")
         del tracks[tid]
 
@@ -163,26 +175,9 @@ class FindTrack(object):
         a no-op (returns None, stays unseeded). Later runs return
         {"tid", "new": [...]} when new items were found - plain diff
         facts for ports/patterns to surface - else None."""
+        _check_owner(owner)
         t = self._track(owner, tid)
-        if not isinstance(results, (list, tuple)):
-            raise TrackError("results must be a list")
-        if len(results) > MAX_RUN_ITEMS:
-            raise TrackError("run over %d items" % MAX_RUN_ITEMS)
-        seen, items = set(), []
-        for r in results:
-            if not isinstance(r, dict) or not isinstance(r.get("url"), str):
-                raise TrackError("each result needs a url")
-            title = r.get("title") or ""
-            if not isinstance(title, str):
-                raise TrackError("title must be str")
-            if len(title) > MAX_TITLE:
-                raise TrackError("title over %d chars" % MAX_TITLE)
-            canon = canonical_url(r["url"])  # raises on bad/over-long
-            if canon in seen:
-                continue
-            seen.add(canon)
-            items.append({"canonical": canon, "url": r["url"].strip(),
-                          "title": title.strip()})
+        seen, items = self._validate_results(results)
         if len(t.known) + len(seen - t.known) > MAX_KNOWN_ITEMS:
             raise KnownLimitReached("known-set cap %d reached"
                                     % MAX_KNOWN_ITEMS)
@@ -215,8 +210,54 @@ class FindTrack(object):
             it["first_seen"] = now
         return {"tid": tid, "topic": t.topic, "new": new}
 
+    def _validate_results(self, results):
+        if not isinstance(results, (list, tuple)):
+            raise TrackError("results must be a list")
+        if len(results) > MAX_RUN_ITEMS:
+            raise TrackError("run over %d items" % MAX_RUN_ITEMS)
+        seen, items = set(), []
+        for r in results:
+            if not isinstance(r, dict) or not isinstance(r.get("url"), str):
+                raise TrackError("each result needs a url")
+            title = r.get("title") or ""
+            if not isinstance(title, str):
+                raise TrackError("title must be str")
+            if len(title) > MAX_TITLE:
+                raise TrackError("title over %d chars" % MAX_TITLE)
+            canon = canonical_url(r["url"])  # raises on bad/over-long
+            if canon in seen:
+                continue
+            seen.add(canon)
+            items.append({"canonical": canon, "url": r["url"].strip(),
+                          "title": title.strip()})
+        return seen, items
+
+    def rebase(self, owner, tid, results, now):
+        """EXPLICIT RECOVERY (round-5): replace the track's known set
+        with a fresh result set - the caller-guided way out of a
+        DiffLimitReached deadlock (e.g. a known-1 track facing 11+
+        new URLs). Refuses empty (a baseline must carry items),
+        over-bounds input, or a set over MAX_KNOWN_ITEMS - zero
+        effects on refusal. Resets first_seen knowledge for replaced
+        items; diff continuity is broken EXPLICITLY, by the caller's
+        choice. Returns a rebaseline fact."""
+        _check_owner(owner)
+        t = self._track(owner, tid)
+        seen, items = self._validate_results(results)
+        if not items:
+            raise TrackError("rebase needs at least one item")
+        if len(seen) > MAX_KNOWN_ITEMS:
+            raise KnownLimitReached("known-set cap %d reached"
+                                    % MAX_KNOWN_ITEMS)
+        t.known = set(seen)
+        t.seeded = True
+        t.last_run_at = now
+        return {"tid": tid, "topic": t.topic, "rebaseline": True,
+                "seeded": len(items), "new": []}
+
     def list(self, owner):
+        _check_owner(owner)
         return [{"tid": t.tid, "topic": t.topic, "created_at": t.created_at,
                  "last_run_at": t.last_run_at, "seeded": t.seeded,
                  "known": len(t.known)}
-                for t in self._tracks(owner).values()]
+                for t in self._tracks_read(owner).values()]

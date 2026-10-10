@@ -187,6 +187,65 @@ class DiffTests(unittest.TestCase):
         self.assertIsNone(f.run("u1", tid, [], T0 + 2 * HOUR))
         self.assertEqual(f.list("u1")[0]["known"], 1)
 
+    def test_rebase_recovers_diff_deadlock(self):
+        # round-5: known-1 track + 11+ new deadlocks at the diff cap;
+        # rebase() is the explicit caller-guided recovery
+        f = make()
+        tid = f.add("u1", "t", T0)
+        f.run("u1", tid, [item(1)], T0)  # baseline, known=1
+        self.assertRaises(DiffLimitReached, f.run, "u1", tid,
+                          [item(i) for i in range(1, MAX_DIFF_ITEMS + 3)], T0)
+        d = f.rebase("u1", tid,
+                     [item(i) for i in range(1, MAX_DIFF_ITEMS + 3)], T0 + 1)
+        self.assertTrue(d["rebaseline"])
+        self.assertEqual(d["seeded"], MAX_DIFF_ITEMS + 2)
+        self.assertEqual(f.list("u1")[0]["known"], MAX_DIFF_ITEMS + 2)
+        # quiet on replay, diffs resume after rebase
+        self.assertIsNone(f.run("u1", tid,
+                                [item(i) for i in range(1, MAX_DIFF_ITEMS + 3)],
+                                T0 + 2))
+        d2 = f.run("u1", tid,
+                   [item(i) for i in range(1, MAX_DIFF_ITEMS + 4)], T0 + 3)
+        self.assertEqual(len(d2["new"]), 1)
+
+    def test_rebase_refusals_zero_effects(self):
+        f = make()
+        tid = f.add("u1", "t", T0)
+        f.run("u1", tid, [item(1)], T0)
+        before = f.list("u1")[0]
+        self.assertRaises(TrackError, f.rebase, "u1", tid, [], T0)  # empty
+        self.assertRaises(TrackError, f.rebase, "u1", tid,
+                          [{"url": "notaurl"}], T0)
+        self.assertRaises(NoMatch, f.rebase, "u1", "trk_t999", [item(1)], T0)
+        after = f.list("u1")[0]
+        self.assertEqual(before["known"], after["known"])
+
+    def test_reads_create_no_state(self):
+        # round-5 nit: list/run/remove/rebase on an unknown owner must
+        # not create an empty dict in the store
+        s = MemTrackStore()
+        f = FindTrack(s, id_factory=ids)
+        self.assertEqual(f.list("ghost"), [])
+        self.assertRaises(NoMatch, f.run, "ghost", "trk_t001", [], T0)
+        self.assertRaises(NoMatch, f.remove, "ghost", "trk_t001")
+        self.assertRaises(NoMatch, f.rebase, "ghost", "trk_t001", [item(1)], T0)
+        self.assertNotIn("ghost", s.tracks)
+
+    def test_unhashable_owner_rejects_cleanly(self):
+        f = make()
+        self.assertRaises(TrackError, f.list, ["u"])
+        self.assertRaises(TrackError, f.run, ["u"], "x", [], T0)
+        self.assertRaises(TrackError, f.remove, ["u"], "x")
+        self.assertRaises(TrackError, f.add, ["u"], "t", T0)
+        self.assertRaises(TrackError, f.rebase, ["u"], "x", [item(1)], T0)
+
+    def test_throwing_factory_zero_effects(self):
+        s = MemTrackStore()
+        f = FindTrack(s, id_factory=lambda p, sq, n: 1 / 0)
+        self.assertRaises(ZeroDivisionError, f.add, "u9", "t", T0)
+        self.assertNotIn("u9", s.tracks)
+        self.assertNotIn("u9", s.seq)
+
     def test_known_cap_unreachable_in_one_run(self):
         # the run cap (50) is strictly below the known cap (500), so a
         # single run can never breach the known cap - the run cap fires
