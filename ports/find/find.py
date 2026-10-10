@@ -29,8 +29,9 @@ Design invariants:
    and recorded - never presented.
 2. FAIL-CLOSED QUOTE EVIDENCE: the reference gate supports a claim
    only on verbatim, sentence-bounded quote evidence with EXACT numeric
-   tokens (sign, %, and separators are load-bearing: "1,500" !=
-   "1.500", "5" != "-5" != "5%", "3.5" != "3-5"), a minimum evidence
+   tokens (currency, sign, %, and separators are load-bearing:
+   "1,500" != "1.500", "5" != "-5" != "5%", "3.5" != "3-5", "$5" !=
+   "\u20ac5"), a minimum evidence
    length, negation/hedge parity and a numeric-continuation guard -
    "the drug cures cancer" inside "Claims that the drug cures cancer
    are false." and "revenue was 10 million" inside "revenue was 10
@@ -237,10 +238,13 @@ def _validate_subqueries(subs):
     return out
 
 
-# Numeric tokens are exact: sign, % and separator characters are
-# load-bearing, so "1,500" != "1.500", "5" != "-5" != "5%", "3.5" !=
-# "3-5". Anything else tokenizes as lowercase alphanumerics.
-_TOKEN = re.compile(r"-?\d+(?:[.,/\-]\d+)*%?|[a-z0-9]+")
+# Numeric tokens are exact: currency symbol, sign, % and separator
+# characters are load-bearing, so "1,500" != "1.500", "5" != "-5" !=
+# "5%", "3.5" != "3-5", "$5" != "€5" != "5". Anything else
+# tokenizes as lowercase alphanumerics.
+_TOKEN = re.compile(r"[$\u20ac\u00a3\u00a5\u20b9\u20a9\u20bd\u00a2]?-?"
+                    r"\d+(?:[.,/\-]\d+)*[%$\u20ac\u00a3\u00a5\u20b9\u20a9\u20bd\u00a2]?"
+                    r"|[a-z0-9]+")
 
 
 def _gate_tokens(text):
@@ -248,12 +252,23 @@ def _gate_tokens(text):
 
 
 def _gate_sent_tokens(content):
-    # sentence split that never breaks inside a numeric token: a
-    # sentence mark preceded by a digit is a decimal/separator, not a
-    # boundary ("1.500 was listed." splits only after "listed")
+    # sentence boundary = sentence mark + whitespace (or newline); the
+    # decimal exception is ONLY digit.digit with no whitespace, so
+    # "1.5" stays whole while "enrolled 50. Patients were cured" and
+    # "Revenue was 15. Today is Monday" DO split
     raw = (content or "").lower()
-    parts = re.split(r"(?<!\d)[.!?;](?=\s|$)|[\r\n]+", raw)
+    parts = re.split(r"[.!?;](?=\s)|[\r\n]+", raw)
     return [_gate_tokens(p) for p in parts]
+
+
+def _evidence_tokens(text):
+    # content-bearing tokens: any numeric token counts (a number is
+    # evidence), words count when they are non-stopword and > 1 char
+    out = []
+    for t in _gate_tokens(text):
+        if any(c.isdigit() for c in t) or (t not in _STOP and len(t) > 1):
+            out.append(t)
+    return out
 
 
 def reference_support(claim_text, content):
@@ -262,9 +277,10 @@ def reference_support(claim_text, content):
     guards:
     - SENTENCE-BOUNDED: the claim's exact token sequence appears
       inside ONE content sentence;
-    - EXACT NUMERICS: numeric tokens compare exactly, sign, % and
-      separators included - "1,500" != "1.500", "5" != "-5" != "5%",
-      "3.5" != "3-5" (round-4: NO unfolding anywhere);
+    - EXACT NUMERICS: numeric tokens compare exactly - currency
+      symbol, sign, % and separators are all load-bearing: "1,500" !=
+      "1.500", "5" != "-5" != "5%", "3.5" != "3-5", "$5" != "\u20ac5"
+      (round-4/5: NO unfolding anywhere);
     - MINIMUM EVIDENCE: the claim carries >= MIN_EVIDENCE_TOKENS
       content tokens - "yes" or "the" can never verify;
     - NEGATION/HEDGE PARITY: the sentence's negation + hedge frame
@@ -282,7 +298,7 @@ def reference_support(claim_text, content):
     claim = _gate_tokens(claim_text)
     if not claim or not isinstance(content, str) or not content.strip():
         return False
-    if len(_tok(claim_text)) < MIN_EVIDENCE_TOKENS:
+    if len(_evidence_tokens(claim_text)) < MIN_EVIDENCE_TOKENS:
         return False
     claim_marks = set(claim) & (_NEG | _NEG_STEMS | _HEDGE)
     n = len(claim)

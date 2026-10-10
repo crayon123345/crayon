@@ -150,6 +150,36 @@ class RoundOneRegressionTests(unittest.TestCase):
         self.assertRaises(FindPersonalError, f.find, "u1", "visa", T0, limit=1.5)
         self.assertRaises(FindPersonalError, f.find, "u1", "visa", T0, limit=True)
 
+    def test_meta_score_strictly_below_min_even_double_match(self):
+        # round-5 nit: a term in BOTH kind and source must still score
+        # strictly below MIN_SCORE (union count, ratio capped at 1.0)
+        f = make()
+        f.add("u1", "visa", "completely unrelated text", T0, source="visa")
+        r = f.find("u1", "visa", T0)
+        self.assertEqual(r[0]["matched_fields"], ["kind", "source"])
+        self.assertGreater(r[0]["score"], 0.0)
+        self.assertLess(r[0]["score"], MIN_SCORE)
+
+    def test_throwing_factory_zero_effects(self):
+        # round-5 nit: a throwing id_factory advances no sequence and
+        # creates no owner entry
+        s = MemPersonalStore()
+        f = FindPersonal(s, id_factory=lambda p, sq, n: 1 / 0)
+        self.assertRaises(ZeroDivisionError, f.add, "u9", "note", "text", T0)
+        self.assertNotIn("u9", s.records)
+        self.assertNotIn("u9", s.seq)
+
+    def test_unhashable_owner_rejects_cleanly(self):
+        # round-5 nit: non-str owner raises FindPersonalError on every
+        # public method, never a raw TypeError
+        f = make()
+        self.assertRaises(FindPersonalError, f.find, ["u"], "visa", T0)
+        self.assertRaises(FindPersonalError, f.count, ["u"])
+        self.assertRaises(FindPersonalError, f.replace, ["u"], "r", "k", "t", T0)
+        self.assertRaises(FindPersonalError, f.remove, ["u"], "r")
+        self.assertRaises(FindPersonalError, f.wipe, ["u"])
+        self.assertRaises(FindPersonalError, f.add, ["u"], "k", "t", T0)
+
     def test_reads_create_no_state(self):
         # round-4 nit: find/replace/count on an unknown owner must not
         # create an empty dict in the store
