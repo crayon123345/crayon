@@ -272,6 +272,30 @@ class SupportGateTests(unittest.TestCase):
             "the trial enrolled 50",
             'The trial enrolled 50." Officials confirmed.'))
 
+    def test_sign_load_bearing_around_currency(self):
+        # round-7: sign in EITHER position around the symbol is exact
+        for claim, cont in (
+                ("the charge was $5", "the charge was -$5 today."),
+                ("the charge was -$5", "the charge was $5 today."),
+                ("the charge was \u20ac5", "the charge was -\u20ac5 today."),
+                ("the charge was \u00a35", "the charge was -\u00a35 today."),
+                ("the charge was $5", "the charge was $-5 today."),
+                ("the charge was $-5", "the charge was $5 today.")):
+            self.assertFalse(reference_support(claim, cont), (claim, cont))
+        for tok in ("$5", "-$5", "$-5", "-5", "5"):
+            self.assertTrue(reference_support(
+                "the charge was %s" % tok, "the charge was %s today." % tok))
+
+    def test_splitter_guillemet_and_cjk_closers(self):
+        # round-7: U+00BB and U+300D join the closing class
+        for closer in ("\u00BB", "\u300D"):
+            self.assertFalse(reference_support(
+                "revenue was 15 today",
+                "Revenue was 15.%s Today is Monday." % closer))
+            self.assertTrue(reference_support(
+                "revenue was 15",
+                "Revenue was 15.%s Today is Monday." % closer))
+
     def test_splitter_decimal_exception(self):
         # digit.digit with no whitespace is a decimal, not a boundary
         self.assertTrue(reference_support(
