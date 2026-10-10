@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Crayon - ask me anything</title>
+<meta name="description" content="Crayon is a friendly AI assistant. Open the page and ask anything.">
+<meta property="og:title" content="Crayon">
+<meta property="og:description" content="A friendly AI assistant. Ask me anything.">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#131112">
+<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Crayon"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><img src="/static/crayon.svg" alt="" width="28" height="28"><span>Crayon</span></div>
+  <div class="hright"><img id="avatar" class="avatar hide" alt=""><span id="acct" class="acct hide"></span><button id="signin" class="ghost hide" type="button">Sign in</button><button id="mailbtn" class="ghost hide" type="button">Connect Gmail</button><button id="sharebtn" class="ghost" title="Get a read-only link to this chat">Share</button><button id="forget" class="ghost" title="Delete everything Crayon remembers about you">Forget me</button><button id="new" class="ghost" title="Start a new chat">New chat</button></div>
+</header>
+<main id="scroll">
+  <section id="hero">
+    <img src="/static/crayon.svg" alt="Crayon" class="face" width="88" height="88">
+    <h1>What can I do for you?</h1>
+    <p class="sub">Crayon searches the web, runs code, reads your files and makes things for you.</p>
+    <div class="cards">
+      <button class="card" data-prompt="Search the web and give me a short briefing on the biggest AI news this week, with sources."><span class="ci">&#128269;</span><b>Research</b><small>Live web search with sources</small></button>
+      <button class="card" data-act="attach"><span class="ci">&#128206;</span><b>Analyze a file</b><small>Upload a CSV, doc or data</small></button>
+      <button class="card" data-prompt="Make a bar chart of the 5 most populous countries and give me the PNG and a CSV."><span class="ci">&#128202;</span><b>Make a chart</b><small>Code runs right here</small></button>
+      <button class="card" data-prompt="Write and run Python that finds the first 20 prime numbers and explain it briefly."><span class="ci">&#9889;</span><b>Write &amp; run code</b><small>Python in a sandbox</small></button>
+      <button class="card hide" data-mail="1" data-prompt="Summarize my 5 latest unread emails and tell me which need a reply."><span class="ci">&#9993;</span><b>Check my Gmail</b><small>Sign in to connect</small></button>
+    </div>
+  </section>
+  <section id="log" aria-live="polite"></section>
+</main>
+<footer>
+  <div id="files" class="files hide"></div>
+  <form id="form" autocomplete="off">
+    <button id="live" type="button" class="icon hide" title="Live voice conversation" aria-label="Live voice conversation"><svg viewBox="0 0 24 24" width="20" height="20"><path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    <button id="mic" type="button" class="icon hide" title="Talk to Crayon" aria-label="Voice input"><svg viewBox="0 0 24 24" width="20" height="20"><path d="M12 15a3.5 3.5 0 003.5-3.5v-5a3.5 3.5 0 10-7 0v5A3.5 3.5 0 0012 15zm6.5-3.5a6.5 6.5 0 01-13 0M12 18v3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    <button id="attach" type="button" class="icon" title="Add files" aria-label="Add files"><svg viewBox="0 0 24 24" width="20" height="20"><path d="M21 11.5l-8.6 8.6a5.5 5.5 0 01-7.8-7.8l8.6-8.6a3.7 3.7 0 015.2 5.2l-8.6 8.6a1.8 1.8 0 01-2.6-2.6l7.9-7.9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    <input id="fileinput" type="file" multiple hidden>
+    <button id="agentbtn" type="button" class="icon" title="Agent mode: hand Crayon a multi-step goal" aria-label="Agent mode" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20"><path d="M9 6l1.8 4.2L15 12l-4.2 1.8L9 18l-1.8-4.2L3 12l4.2-1.8L9 6zm9-3l.9 2.1L21 6l-2.1.9L18 9l-.9-2.1L15 6l2.1-.9L18 3zm0 12l.9 2.1L21 18l-2.1.9L18 21l-.9-2.1L15 18l2.1-.9L18 15z" fill="currentColor"/></svg></button>
+    <textarea id="input" rows="1" maxlength="8000" placeholder="Ask Crayon to do something..." aria-label="Message Crayon"></textarea>
+    <button id="send" type="submit" aria-label="Send">
+      <svg viewBox="0 0 24 24" width="20" height="20"><path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </form>
+  <p class="note">Crayon is an AI and can make mistakes. Crayon remembers your chats on this device so it can continue them later - <b>Forget me</b> wipes that instantly. <a href="/privacy" style="color:inherit">Privacy</a></p>
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>
