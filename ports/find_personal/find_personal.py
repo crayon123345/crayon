@@ -55,6 +55,11 @@ class NoRecord(FindPersonalError):
     pass
 
 
+def _check_owner(owner):
+    if not owner or not isinstance(owner, str):
+        raise FindPersonalError("owner required")
+
+
 def _tok(text):
     return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
             if w not in _STOP and len(w) > 1]
@@ -111,9 +116,10 @@ class FindPersonal(object):
         return self.store.records.get(owner) or {}
 
     def add(self, owner, kind, text, ts, source=""):
-        """Feed one record. Overflow rejects; cap refuses zero-effects."""
-        if not owner or not isinstance(owner, str):
-            raise FindPersonalError("owner required")
+        """Feed one record. Overflow rejects; cap refuses zero-effects.
+        A throwing id_factory changes NOTHING - it runs before any
+        store mutation, and the sequence advances only on commit."""
+        _check_owner(owner)
         if not isinstance(kind, str) or not kind.strip():
             raise FindPersonalError("kind required")
         if len(kind) > MAX_KIND:
@@ -127,14 +133,16 @@ class FindPersonal(object):
         if isinstance(ts, bool) or not isinstance(ts, (int, float)) \
                 or ts != ts or ts in (float("inf"), float("-inf")):
             raise FindPersonalError("ts must be a finite number")
-        recs = self._records(owner)
-        if len(recs) >= MAX_RECORDS:
+        recs = self.store.records.get(owner)
+        if recs is not None and len(recs) >= MAX_RECORDS:
             raise RecordLimitReached("record cap %d reached" % MAX_RECORDS)
-        self.store.seq[owner] = self.store.seq.get(owner, 0) + 1
-        rid = self.id_factory("rec", self.store.seq[owner], ts)
-        if rid in recs:
-            self.store.seq[owner] -= 1  # nothing consumed on refusal
+        next_seq = self.store.seq.get(owner, 0) + 1
+        rid = self.id_factory("rec", next_seq, ts)  # may throw: zero state
+        if recs is not None and rid in recs:
             raise FindPersonalError("record id collision: %s" % rid)
+        if recs is None:
+            recs = self.store.records[owner] = {}
+        self.store.seq[owner] = next_seq  # sequence advances on commit only
         recs[rid] = Record(rid, owner, kind.strip(), text.strip(),
                            source.strip(), ts)
         return rid
@@ -144,6 +152,7 @@ class FindPersonal(object):
         matches, best first; empty list when nothing clears MIN_SCORE.
         `now` is the injected clock (invariant 7), validated here so a
         future recency weighting cannot receive a bogus one."""
+        _check_owner(owner)
         if isinstance(now, bool) or not isinstance(now, (int, float)) \
                 or now != now or now in (float("inf"), float("-inf")):
             raise FindPersonalError("now must be a finite number")
@@ -173,8 +182,9 @@ class FindPersonal(object):
                 # metadata-only hit: no text evidence - a small
                 # deterministic score strictly below MIN_SCORE, so it
                 # ranks but never outranks a text hit
-                meta_hit = len(terms & rec.meta_tokens["kind"]) + \
-                    len(terms & rec.meta_tokens["source"])
+                meta_hit = len(terms & (rec.meta_tokens["kind"]
+                                        | rec.meta_tokens["source"]))
+                # ratio capped at 1.0 by the union -> strictly below
                 mscore = (meta_hit / float(len(terms))) * MIN_SCORE * 0.5
                 meta_only.append((mscore, rec.ts, rec.rid, rec, matched))
         # score desc, ts desc (recency tie-break), rid asc (stable)
@@ -194,6 +204,7 @@ class FindPersonal(object):
     def remove(self, owner, rid):
         """Delete one record by id (source-forget propagation).
         Returns True when a record was removed, False when absent."""
+        _check_owner(owner)
         recs = self.store.records.get(owner)
         if not recs or rid not in recs:
             return False
@@ -206,6 +217,7 @@ class FindPersonal(object):
         in place under the SAME rid; on any refusal the old record is
         preserved untouched. Returns True. Raises NoRecord when rid is
         absent - use add() for new records."""
+        _check_owner(owner)
         recs = self._records_read(owner)
         if rid not in recs:
             raise NoRecord("no such record")
@@ -230,6 +242,7 @@ class FindPersonal(object):
 
     def wipe(self, owner):
         """Delete every record the owner has. Returns the count removed."""
+        _check_owner(owner)
         recs = self.store.records.get(owner)
         if not recs:
             return 0
@@ -238,4 +251,5 @@ class FindPersonal(object):
         return n
 
     def count(self, owner):
+        _check_owner(owner)
         return len(self._records_read(owner))
