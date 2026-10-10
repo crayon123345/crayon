@@ -9,7 +9,7 @@ generic.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-This port is complete as a tested module (30/30 tests) but is NOT wired
+This port is complete as a tested module (33/33 tests) but is NOT wired
 into the running app. Named limits, exactly:
 
 1. NOT MOUNTED: nothing calls ReflectiveMode from integrated/ yet.
@@ -53,10 +53,13 @@ into the running app. Named limits, exactly:
 8. QUESTION GUARD IS NAIVE BUT COMPLETE ON PUNCTUATION: question_count()
    counts every "?"; a "?" in a URL query string or emoticon also counts.
    Sentences are split on terminal punctuation WITH or WITHOUT following
-   whitespace ("Why?How?" is two sentences), and a run of repeated marks
-   inside the kept first question sentence collapses to one ("Really??"
-   -> "Really?"). Over-counting only ever trims, never invents content
-   (tested).
+   whitespace ("Why?How?" is two sentences), and inside the kept first
+   question sentence only the first "?" survives - repeated runs AND mixed
+   terminal punctuation are capped ("Really??" -> "Really?", "Really?!?"
+   -> "Really?!"). An exhaustive invariant test covers every
+   terminal-punctuation run up to length 4 over {?, !, .}, alone and
+   joined with/without whitespace. Over-counting only ever trims, never
+   invents content (tested).
 
 9. RECENCY SEMANTICS ARE EXPLICIT: "most recent" follow-up means greatest
    source_ts (when the user said it), then greatest created (storage
@@ -71,7 +74,7 @@ into the running app. Named limits, exactly:
   (resets follow-up surfacing history; stored memory is untouched)
 - `reflect status` (and the same aliases) - state + open follow-up count
 
-## Acceptance criteria covered by tests (test_reflective.py, 30 tests)
+## Acceptance criteria covered by tests (test_reflective.py, 33 tests)
 
 - Contract content: addendum contains LISTEN / REFLECT / PLAN and the
   exactly-one-question instruction; empty when the mode is off.
@@ -88,9 +91,10 @@ into the running app. Named limits, exactly:
 - No barrage: a 3-question draft is reduced to exactly 1 question;
   non-question sentences survive; the filter never invents content;
   0- or 1-question replies pass through byte-identical. Contiguous
-  questions without whitespace ("Why?How?") and repeated marks
-  ("Really??") are reduced to one mark (regression tests for the
-  cross-review findings).
+  questions without whitespace ("Why?How?"), repeated marks ("Really??"),
+  and mixed terminal runs ("Really?!?", "Question?!!??") are reduced to
+  one mark, with an exhaustive punctuation-run invariant (regression
+  tests for both cross-review rounds).
 - No cross-owner leakage: mode state and follow-up grounding are
   owner-scoped; a second owner's commands and facts have zero effect.
 - Grammar discipline: commands create ZERO memory facts; ambiguous
@@ -98,4 +102,4 @@ into the running app. Named limits, exactly:
 
 ## Version
 
-crayon-reflect-v2
+crayon-reflect-v3

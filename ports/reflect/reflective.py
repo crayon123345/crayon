@@ -26,7 +26,7 @@ Design rules (same discipline as ports/memory):
 
 import re
 
-CONTRACT_VERSION = "crayon-reflect-v2"
+CONTRACT_VERSION = "crayon-reflect-v3"
 MAX_FOLLOWUP_TEXT = 200
 
 # Duck-typed FactStore interface (satisfied by ports/memory MemFactStore and
@@ -191,7 +191,12 @@ class ReflectiveMode:
         for s in ReflectiveMode._sentences(text):
             if "?" in s:
                 if not seen_question:
-                    out.append(re.sub(r"\?{2,}", "?", s))
+                    # Cap question marks over the WHOLE kept segment, not
+                    # just adjacent runs: keep the first "?", strip every
+                    # later one ("Really?!?" -> "Really?!",
+                    # "Question?!!??" -> "Question?!!").
+                    first = s.find("?")
+                    out.append(s[:first + 1] + s[first + 1:].replace("?", ""))
                     seen_question = True
                 # else: drop the extra question sentence
             else:

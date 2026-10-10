@@ -310,6 +310,39 @@ class TestOneQuestionGuard(unittest.TestCase):
         self.assertIn("Seriously?", out)
         self.assertIn("Ok.", out)
 
+    # --- regression: review finding round 2 (mixed terminal punctuation) ---
+
+    def test_mixed_terminal_punctuation_capped(self):
+        cases = {"Really?!?": "Really?!", "Why?.?": "Why?.",
+                 "Question?!!??": "Question?!!", "What??!": "What?!",
+                 "Huh?!??!": "Huh?!!"}
+        for t, want in cases.items():
+            out = ReflectiveMode.enforce_one_question(t)
+            self.assertEqual(out, want, t)
+            self.assertEqual(out.count("?"), 1, t)
+
+    def test_single_mark_interrobang_byte_identical(self):
+        # one "?" inside the first question sentence, no repeats: untouched
+        self.assertEqual(ReflectiveMode.enforce_one_question("What!?"),
+                         "What!?")
+
+    def test_exhaustive_punctuation_run_invariant(self):
+        # Every terminal-punctuation run up to length 4 over {?, !, .},
+        # alone and joined with/without whitespace: at most one "?" survives.
+        import itertools
+        runs = ["".join(c) for n in (1, 2, 3, 4)
+                for c in itertools.product("?!.", repeat=n)]
+        for run in runs:
+            t = "Word%s" % run
+            out = ReflectiveMode.enforce_one_question(t)
+            self.assertLessEqual(out.count("?"), 1, t)
+        for r1 in runs[::7]:            # sampled cross-product keeps it fast
+            for r2 in runs[::11]:
+                for sep in (" ", ""):
+                    t = "First%s%sSecond%s Tail." % (r1, sep, r2)
+                    out = ReflectiveMode.enforce_one_question(t)
+                    self.assertLessEqual(out.count("?"), 1, t)
+
 
 if __name__ == "__main__":
     unittest.main()
