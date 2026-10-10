@@ -62,7 +62,7 @@ def issue(header,origin,body,ip):
   counts=db.q("SELECT count(*) FILTER (WHERE user_id=%s AND session_hash=%s) AS owner_count,count(*) FILTER (WHERE ip_hash=%s) AS ip_count FROM voice_tickets WHERE issued_at>now()-interval '60 seconds'",(uid,session_hash,ip_hash),'one')
   if counts['owner_count']>=6 or counts['ip_count']>=30:raise TicketError('rate_limit',429)
   row=db.q("INSERT INTO voice_tickets(ticket_hash,user_id,session_hash,conversation_id,origin,mode,request_id,expires_at,ip_hash) VALUES(%s,%s,%s,%s,%s,%s,%s,now()+interval '120 seconds',%s) RETURNING expires_at",(A.digest(ticket),uid,session_hash,body['conversation_id'],origin,body['mode'],rid,ip_hash),'one')
- return {'version':1,'ticket':ticket,'request_id':rid,'conversation_id':body['conversation_id'],'mode':body['mode'],'expires_at':str(row['expires_at']),'expires_in':120,'audio_limits':{'max_seconds':600,'max_bytes':20000000},'revalidate_seconds':15,'recovery_seconds':300}
+ return {'version':1,'ticket':ticket,'request_id':rid,'conversation_id':body['conversation_id'],'mode':body['mode'],'expires_at':row['expires_at'].timestamp(),'expires_in':120,'audio_limits':{'max_seconds':600,'max_bytes':20000000},'revalidate_seconds':15,'recovery_seconds':300}
 def redeem(header,body):
  require_enabled();adapter_hash=adapter(header,'redeem');strict(body,['version','ticket','observed_origin','mode']);exact_origin(body['observed_origin'])
  if not isinstance(body['ticket'],str) or not A.PATTERN.fullmatch(body['ticket']):raise TicketError('malformed',400)
@@ -77,7 +77,7 @@ def redeem(header,body):
   db.q('UPDATE voice_tickets SET redeemed_at=now() WHERE ticket_hash=%s',(A.digest(body['ticket']),),'none')
   lease=secrets.token_urlsafe(32)
   out=db.q("INSERT INTO voice_leases(lease_hash,user_id,session_hash,conversation_id,origin,mode,request_id,adapter_hash,expires_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,now()+interval '600 seconds') RETURNING expires_at",(A.digest(lease),row['user_id'],row['session_hash'],row['conversation_id'],row['origin'],row['mode'],row['request_id'],adapter_hash),'one')
- return {'version':1,'lease_id':lease,'request_id':row['request_id'],'conversation_id':row['conversation_id'],'mode':row['mode'],'origin':row['origin'],'expires_at':str(out['expires_at']),'revalidate_seconds':15,'audio_limits':{'max_seconds':600,'max_bytes':20000000}}
+ return {'version':1,'lease_id':lease,'request_id':row['request_id'],'conversation_id':row['conversation_id'],'mode':row['mode'],'origin':row['origin'],'expires_at':out['expires_at'].timestamp(),'revalidate_seconds':15,'audio_limits':{'max_seconds':600,'max_bytes':20000000}}
 
 def revalidate(header,body):
  require_enabled();adapter_hash=adapter(header,'revalidate');strict(body,['version','lease_id'])
@@ -87,7 +87,7 @@ def revalidate(header,body):
  if row['revoked']:raise TicketError('revoked',410)
  if not row['valid']:raise TicketError('expired',410)
  live_session(row['user_id'],row['session_hash']);__import__('cr_conversations').require(row['user_id'],row['conversation_id'])
- return {'version':1,'active':True,'request_id':row['request_id'],'expires_at':str(row['expires_at']),'next_check_seconds':15}
+ return {'version':1,'active':True,'lease_id':body['lease_id'],'request_id':row['request_id'],'expires_at':row['expires_at'].timestamp(),'next_check_seconds':15}
 def revoke(header,origin,body):
  require_enabled();exact_origin(origin);strict(body,['version','request_id']);
  if not isinstance(body['request_id'],str) or not A.PATTERN.fullmatch(body['request_id']):raise TicketError('malformed',400)

@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Canonical voice adapter reference",
-    "version": "1.0.2",
-    "description": "Review-only. No live endpoint/consent/activation. Exact HTTPS Origin + ticket binding, no native or UA exception. Lost-final-response ruling: deny after expiry/revocation, ambiguous commit resolved only by authorized read-only recovery."
+    "version": "1.0.3",
+    "description": "Review-only. No live endpoint/consent/activation. Exact HTTPS Origin + ticket binding, no native or UA exception. Lost-final-response ruling: deny after expiry/revocation, ambiguous commit resolved only by authorized read-only recovery. Revision4 requires lease echo and finite numeric UTC Unix seconds for wire expires_at."
   },
   "paths": {
     "/voice/session": {
@@ -55,7 +55,74 @@
         },
         "responses": {
           "201": {
-            "description": "Accepted"
+            "description": "Accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "version",
+                    "ticket",
+                    "request_id",
+                    "conversation_id",
+                    "mode",
+                    "expires_at",
+                    "expires_in",
+                    "audio_limits",
+                    "revalidate_seconds",
+                    "recovery_seconds"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "ticket": {
+                      "type": "string"
+                    },
+                    "request_id": {
+                      "type": "string"
+                    },
+                    "conversation_id": {
+                      "type": "string"
+                    },
+                    "mode": {
+                      "type": "string"
+                    },
+                    "expires_at": {
+                      "type": "number",
+                      "description": "Finite UTC Unix seconds from canonical server/database clock; fractional seconds allowed; never ISO string/NaN/Infinity."
+                    },
+                    "expires_in": {
+                      "type": "integer"
+                    },
+                    "audio_limits": {
+                      "type": "object",
+                      "required": [
+                        "max_seconds",
+                        "max_bytes"
+                      ],
+                      "properties": {
+                        "max_seconds": {
+                          "type": "number",
+                          "maximum": 600
+                        },
+                        "max_bytes": {
+                          "type": "integer",
+                          "maximum": 20000000
+                        }
+                      }
+                    },
+                    "revalidate_seconds": {
+                      "type": "integer"
+                    },
+                    "recovery_seconds": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
           },
           "400": {
             "description": "Malformed"
@@ -152,7 +219,70 @@
             "description": "Unavailable fail closed"
           },
           "200": {
-            "description": "Accepted"
+            "description": "Accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "version",
+                    "lease_id",
+                    "request_id",
+                    "conversation_id",
+                    "mode",
+                    "origin",
+                    "expires_at",
+                    "revalidate_seconds",
+                    "audio_limits"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "lease_id": {
+                      "type": "string"
+                    },
+                    "request_id": {
+                      "type": "string"
+                    },
+                    "conversation_id": {
+                      "type": "string"
+                    },
+                    "mode": {
+                      "type": "string"
+                    },
+                    "origin": {
+                      "type": "string"
+                    },
+                    "expires_at": {
+                      "type": "number",
+                      "description": "Finite UTC Unix seconds from canonical server/database clock; fractional seconds allowed; never ISO string/NaN/Infinity."
+                    },
+                    "revalidate_seconds": {
+                      "type": "integer"
+                    },
+                    "audio_limits": {
+                      "type": "object",
+                      "required": [
+                        "max_seconds",
+                        "max_bytes"
+                      ],
+                      "properties": {
+                        "max_seconds": {
+                          "type": "number",
+                          "maximum": 600
+                        },
+                        "max_bytes": {
+                          "type": "integer",
+                          "maximum": 20000000
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -217,7 +347,45 @@
             "description": "Unavailable fail closed"
           },
           "200": {
-            "description": "Accepted"
+            "description": "Accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "version",
+                    "active",
+                    "lease_id",
+                    "request_id",
+                    "expires_at",
+                    "next_check_seconds"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "active": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "lease_id": {
+                      "type": "string"
+                    },
+                    "request_id": {
+                      "type": "string"
+                    },
+                    "expires_at": {
+                      "type": "number",
+                      "description": "Finite UTC Unix seconds from canonical server/database clock; fractional seconds allowed; never ISO string/NaN/Infinity."
+                    },
+                    "next_check_seconds": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -509,7 +677,47 @@
             "description": "Owned result recovery TTL expired"
           },
           "200": {
-            "description": "Owner/session/conversation-bound read-only final recovery,300s TTL"
+            "description": "Owner/session/conversation-bound read-only final recovery,300s TTL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "version",
+                    "request_id",
+                    "conversation_id",
+                    "state",
+                    "events",
+                    "expires_at"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "request_id": {
+                      "type": "string"
+                    },
+                    "conversation_id": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string"
+                    },
+                    "events": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "expires_at": {
+                      "type": "number",
+                      "description": "Finite UTC Unix seconds from canonical server/database clock; fractional seconds allowed; never ISO string/NaN/Infinity."
+                    }
+                  }
+                }
+              }
+            }
           },
           "401": {
             "description": "Canonical authentication absent, expired or revoked"

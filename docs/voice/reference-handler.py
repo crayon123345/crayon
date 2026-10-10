@@ -26,7 +26,9 @@ def revalidate(request, auth, clock, leases):
     body=request.strict_body('version','lease_id')
     bound=leases.active_owned_adapter(body['lease_id'],adapter,clock.now())
     auth.require_live_session(bound.owner,bound.session) # unavailable means deny
-    return {'active':True,'next_check_seconds':15}
+    return {'version':1,'active':True,'lease_id':body['lease_id'],
+            'request_id':bound.request_id,'expires_at':bound.expires_at,
+            'next_check_seconds':15} # finite UTC Unix seconds, no ISO strings
 
 def final(request, auth, clock, leases, finals, history):
     adapter=auth.scoped_adapter(request.bearer,'final')

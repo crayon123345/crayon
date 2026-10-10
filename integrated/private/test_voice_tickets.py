@@ -1,5 +1,6 @@
 import pytest,types,sys
 from contextlib import nullcontext
+from datetime import datetime,timezone
 import cr_voice_tickets as V
 @pytest.fixture
 def config(monkeypatch):
@@ -21,7 +22,7 @@ def test_issue_hash_only_locks_and_server_clock(config):
  def q(sql,p=(),fetch='all'):
   calls.append((sql,p))
   if 'owner_count' in sql:return {'owner_count':0,'ip_count':0}
-  if sql.startswith('INSERT'):return {'expires_at':'server-now-plus120'}
+  if sql.startswith('INSERT'):return {'expires_at':datetime(2026,10,10,tzinfo=timezone.utc)}
  config.setattr(V.db,'q',q);r=V.issue('Bearer '+'b'*43,'https://crayon.example',BODY,'ip')
  assert r['expires_in']==120 and len(r['ticket'])==43
  assert all(r['ticket'] not in str(p) for sql,p in calls)
@@ -40,9 +41,10 @@ def test_redeem_expiry_and_once_guard(config,valid,redeemed,code):
 
 def test_revalidate_scoped_and_session_live(config):
  config.setenv('CRAYON_VOICE_ADAPTER_CREDENTIALS','[{"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","scopes":["revalidate"]}]');calls=[]
- config.setattr(V.db,'q',lambda sql,p=(),fetch='all':calls.append((sql,p)) or {'valid':True,'revoked':False,'user_id':17,'session_hash':'hash','conversation_id':'c'*43,'request_id':'req','expires_at':'server'})
+ config.setattr(V.db,'q',lambda sql,p=(),fetch='all':calls.append((sql,p)) or {'valid':True,'revoked':False,'user_id':17,'session_hash':'hash','conversation_id':'c'*43,'request_id':'req','expires_at':datetime(2026,10,10,tzinfo=timezone.utc)})
  config.setattr(V,'live_session',lambda *a:calls.append(a))
- assert V.revalidate('Bearer '+'a'*43,{'version':1,'lease_id':'b'*43})['next_check_seconds']==15
+ result=V.revalidate('Bearer '+'a'*43,{'version':1,'lease_id':'b'*43})
+ assert result['next_check_seconds']==15 and result['lease_id']=='b'*43 and result['expires_at']==1791590400.0
  assert (17,'hash') in calls
  assert calls[0][1]==(V.A.digest('b'*43),V.A.digest('a'*43))
 def test_revocation_scoped_updates(config):

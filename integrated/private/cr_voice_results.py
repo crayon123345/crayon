@@ -82,7 +82,7 @@ def recover(header,origin,request_id):
   if not row:raise T.TicketError('unknown',404)
   if not row['valid']:raise T.TicketError('expired',410)
   if not db.q('SELECT id FROM web_conversations WHERE user_id=%s AND id=%s FOR SHARE',(uid,row['conversation_id']),'one'):raise T.TicketError('unknown',404)
- return {'version':1,'request_id':request_id,'conversation_id':row['conversation_id'],'state':row['state'],'events':row['events'],'expires_at':str(row['expires_at'])}
+ return {'version':1,'request_id':request_id,'conversation_id':row['conversation_id'],'state':row['state'],'events':row['events'],'expires_at':row['expires_at'].timestamp()}
 def erase_user(uid):
  db.q('DELETE FROM voice_results WHERE user_id=%s',(uid,),'none')
 def cleanup():
