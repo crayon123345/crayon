@@ -227,6 +227,10 @@ class Schedule:
             raise ScheduleError("state must be pause/resume/cancel")
         now = int(now if now is not None else time.time())
         j = self._match_job(owner, match)
+        if j.state == "done":
+            raise ScheduleError(
+                "reminder already completed - it cannot be "
+                "paused, resumed or cancelled")
         j.state = state
         j.note(now, {"paused": "paused", "active": "resumed",
                      "cancelled": "cancelled"}[state])

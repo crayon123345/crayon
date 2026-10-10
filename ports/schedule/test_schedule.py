@@ -299,3 +299,17 @@ class Review5479xxxRegressionTests(unittest.TestCase):
         self.s.set_state(self.A, "job 48", "paused", now=T0)
         with self.assertRaises(JobLimitReached):
             self.s.add_job(self.A, "overflow 3", in_minutes=60, now=T0)
+
+    def test_completed_one_shot_cannot_be_resumed_or_refire(self):
+        self.s.add_job(self.A, "done job", in_minutes=1, now=T0)
+        fired = self.s.tick(self.A, T0 + 60)
+        self.assertEqual([j.text for j in fired], ["done job"])
+        for st in ("active", "paused", "cancelled"):
+            with self.assertRaises(ScheduleError):
+                self.s.set_state(self.A, "done job", st, now=T0 + 120)
+        # no refire even across many later ticks
+        for k in range(50):
+            self.assertEqual(self.s.tick(self.A, T0 + 120 + k * 60), [])
+        # snooze already refuses non-active jobs; confirm on done
+        with self.assertRaises(ScheduleError):
+            self.s.snooze(self.A, "done job", 10, now=T0 + 120)

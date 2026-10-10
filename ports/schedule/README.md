@@ -7,7 +7,7 @@ run history. Stands alone.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-This port is complete as a tested module (21/21 tests) but is NOT wired
+This port is complete as a tested module (27/27 tests) but is NOT wired
 into the running app. Named limits, exactly:
 
 1. NOT MOUNTED and NO DELIVERY: this module owns schedule STATE and due
@@ -22,12 +22,18 @@ into the running app. Named limits, exactly:
    fire past the daily cap (MAX_FIRES_PER_DAY = 10 per owner) moves to
    the next local midnight. Both deferrals are recorded.
 4. TIMEZONE-SAFE: quiet hours, daily caps, and absolute-time commands
-   compute in the owner's declared IANA timezone (zoneinfo). Default is
+   compute in the owner's declared IANA timezone (zoneinfo). Names match
+   case-insensitively and are stored/rendered in canonical IANA casing;
+   invalid calendar dates in absolute commands refuse cleanly.
+   Completed (done) jobs are terminal: pause/resume/cancel refuse, and a
+   completed one-shot can never refire (500-attack probe). Default is
    UTC and the default is documented to the user in replies. An invalid
    timezone is refused with zero effects.
 5. DEDUPE: add_job with an active/paused job of the same normalized
    dedupe key returns the existing job instead of creating a second.
-6. CAPS REFUSE, NEVER EVICT: MAX_JOBS_PER_OWNER = 50; the 51st raises.
+6. CAPS REFUSE, NEVER EVICT: MAX_JOBS_PER_OWNER = 50 counts only LIVE
+   (active/paused) jobs, so cancelling or completing a job makes room
+   exactly as the refusal message prescribes; the 51st live job raises.
 7. CLOCKS ARE INJECTED: every time-dependent method takes `now`; the
    module reads the wall clock only when the integration omits it. The
    test suite is fully deterministic.
@@ -49,7 +55,7 @@ into the running app. Named limits, exactly:
 - `quiet hours <start> to <end>` / `quiet hours off` (local hours)
 - `export my reminders` - JSON (crayon-schedule-v1) incl. run history
 
-## Acceptance criteria covered by tests (test_schedule.py, 21 tests)
+## Acceptance criteria covered by tests (test_schedule.py, 27 tests)
 
 - One-shot jobs fire exactly once then complete; interval jobs
   reschedule; no double-fires; paused/cancelled jobs never fire; snooze
