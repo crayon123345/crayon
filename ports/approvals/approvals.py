@@ -197,12 +197,20 @@ class Approvals:
         return "%s_%012x%06x" % (prefix, now, self._seq)
 
     def _validate_fields(self, action, target):
-        action = (action or "").strip()[:MAX_ACTION]
-        target = (target or "").strip()[:MAX_TARGET]
+        action = (action or "").strip()
+        target = (target or "").strip()
         if not action:
             raise ApprovalError("action required")
         if not target:
             raise ApprovalError("target required")
+        # REJECT overflow - truncating would alias two distinct long
+        # actions/targets onto one exact-match key
+        if len(action) > MAX_ACTION:
+            raise ApprovalError("action too long (%d chars max)"
+                                % MAX_ACTION)
+        if len(target) > MAX_TARGET:
+            raise ApprovalError("target too long (%d chars max)"
+                                % MAX_TARGET)
         return action, target
 
     # ---------- core API ----------

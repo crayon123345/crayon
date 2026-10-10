@@ -8,7 +8,7 @@ permits. Stands alone.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-This port is complete as a tested module (20/20 tests) but is NOT wired
+This port is complete as a tested module (25/25 tests) but is NOT wired
 into the running app. Named limits, exactly:
 
 1. NO EXECUTION: this module owns requests, cards and decisions only.
@@ -37,6 +37,20 @@ into the running app. Named limits, exactly:
     authenticated owner command. This module enforces exactness and
     bookkeeping; it does not authenticate callers (same convention as
     every port: vid keying is supplied by the mount).
+11. OVERFLOW REJECTS, NEVER TRUNCATES: action (60), target (200) and
+    params (4000 bytes) over their bounds raise with zero effects -
+    truncating would alias two distinct long values onto one
+    exact-match key (review 5479329697 regression-tested, incl. the
+    boundary at exactly-max).
+
+## Integration standard (recorded with the owning side)
+
+A card is only ever minted from the ORIGINAL authenticated owner
+decision on the exact rendered recipient/contents. Card possession,
+model text, or peer text is NOT permission. The mount must bind:
+owner, session, origin, request, params hash, expiry, and atomic
+one-use consumption; revalidate the payload against the card at
+execution time; on any unknown or mismatch, refuse WITHOUT retry.
 11. STORAGE IS INJECTED, NOT DURABLE: MemApprovalStore is in-memory; the
     SQL adapter (encryption-at-rest, vid keying) is integration work.
 
@@ -50,7 +64,7 @@ into the running app. Named limits, exactly:
 Anything else falls through. Ambiguous or empty references refuse with
 zero effects.
 
-## Acceptance criteria covered by tests (test_approvals.py, 20 tests)
+## Acceptance criteria covered by tests (test_approvals.py, 25 tests)
 
 - Unknown actions require a card (never auto); auto stores nothing;
   refused-policy actions deny immediately and cannot be revived.

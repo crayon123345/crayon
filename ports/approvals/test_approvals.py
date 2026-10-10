@@ -203,3 +203,39 @@ class AuditTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Review5479329697RegressionTests(unittest.TestCase):
+    """Truncation aliasing: overflow must REJECT, never truncate."""
+
+    def setUp(self):
+        self.s = make()
+
+    def test_overlength_target_rejected_on_request_zero_effects(self):
+        long_t = "t" * 201
+        with self.assertRaises(ApprovalError):
+            self.s.request("v_a", "post.message", long_t, now=T0)
+        self.assertEqual(self.s.list_pending("v_a"), [])
+
+    def test_overlength_action_rejected_on_request(self):
+        with self.assertRaises(ApprovalError):
+            self.s.request("v_a", "a" * 61, "t", now=T0)
+        self.assertEqual(self.s.list_pending("v_a"), [])
+
+    def test_overlength_rejected_on_issue_card(self):
+        with self.assertRaises(ApprovalError):
+            self.s.issue_card("v_a", "post.message", "t" * 201, now=T0)
+
+    def test_no_aliasing_between_distinct_long_targets(self):
+        # two targets sharing a 200-char prefix must stay distinct errors,
+        # never one aliased binding
+        t1 = "x" * 199 + "aa"
+        t2 = "x" * 199 + "ab"
+        for t in (t1, t2):
+            with self.assertRaises(ApprovalError):
+                self.s.request("v_a", "post.message", t, now=T0)
+        self.assertEqual(self.s.list_pending("v_a"), [])
+
+    def test_boundary_lengths_accepted(self):
+        r, _ = self.s.request("v_a", "a" * 60, "t" * 200, now=T0)
+        self.assertEqual(r.state, "pending")
