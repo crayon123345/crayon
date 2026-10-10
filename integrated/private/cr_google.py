@@ -315,7 +315,7 @@ def current_draft(uid):
 
 
 
-def send_draft(uid, ident, short_hash, channel='telegram'):
+def send_draft(uid, ident, short_hash, channel='telegram',return_receipt=False):
     if db.kv_get('google_signature_pending_'+str(uid),None):raise GoogleError('Finish your signature name and review the new draft first.')
     import base64
     from email.message import EmailMessage
@@ -339,7 +339,8 @@ def send_draft(uid, ident, short_hash, channel='telegram'):
         db.q("DELETE FROM google_email_drafts WHERE id=%s AND user_id=%s",(ident,uid),"none")
         db.audit(uid,"google_email_sent",mid)
         db.audit(uid,"google_email_send_receipt",json.dumps({"message_id":mid,"channel":channel,"from":content["from"],"to":content["to"],"cc":content.get("cc",[]),"bcc":content.get("bcc",[]),"subject":content["subject"]}))
-        return "Email sent to "+", ".join(content["to"])+". Google confirmed the send."
+        text="Email sent to "+", ".join(content["to"])+". Google confirmed the send."
+        return {"text":text,"message_id":mid} if return_receipt else text
     except Exception:
         db.q("UPDATE google_email_drafts SET status='uncertain' WHERE id=%s AND user_id=%s",(ident,uid),"none")
         raise GoogleError("Send stopped or outcome is uncertain. Check Gmail Sent before creating another draft.") from None
