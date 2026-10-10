@@ -260,16 +260,26 @@ def test_same_key_concurrent_sends_exactly_one_effect():
         assert sum(1 for r in results if r.duplicate) == 1
 
 
-def test_failed_send_may_be_retried_explicitly():
+def test_failed_send_requires_explicit_retry_then_reclaims():
     m, a = make(fail={ME: 130429})
     with pytest.raises(WhatsAppError):
         a.send_template(ME, "hello_world", idempotency_key="k-f")
     assert a.outbox_record("k-f")["state"] == "failed"
+    # a plain re-send is NOT a retry: refused without touching Meta
     m.fail.clear()
-    r = a.send_template(ME, "hello_world", idempotency_key="k-f")
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world", idempotency_key="k-f")
+    assert e.value.code == "explicit_retry_required"
+    assert len(m.calls) == 1                     # zero new effects
+    # the EXPLICIT retry path: attempts increment, history preserved
+    r = a.send_template(ME, "hello_world", idempotency_key="k-f", retry=True)
     assert r.ok and not r.duplicate
-    assert a.outbox_record("k-f")["attempts"] == 1  # re-claimed record
-    assert a.outbox_record("k-f")["state"] == "sent"
+    rec = a.outbox_record("k-f")
+    assert rec["attempts"] == 2 and rec["state"] == "sent"
+    assert len(rec["history"]) == 1
+    assert rec["history"][0]["state"] == "failed"
+    assert rec["history"][0]["failure_class"] == "retryable"  # 130429
+    assert len(m.calls) == 2                     # two DELIBERATE attempts
 
 
 # -- finding 3: locked atomic store, fail closed on corruption --------------
@@ -521,13 +531,16 @@ def test_5xx_is_unknown_never_blind_retried():
     assert len(m.calls) == 1        # exactly one effect, ever
 
 
-def test_4xx_is_definitive_and_reclaimable():
+def test_4xx_is_definitive_response_and_explicitly_reclaimable():
     m, a = make(fail={ME: 131047})
-    with pytest.raises(WhatsAppError):
+    with pytest.raises(WhatsAppError) as e:
         a.send_template(ME, "hello_world", idempotency_key="k-4xx")
-    assert a.outbox_record("k-4xx")["state"] == "failed"
-    m.fail.clear()                  # Meta recovers; explicit retry allowed
-    out = a.send_template(ME, "hello_world", idempotency_key="k-4xx")
+    assert "Definitive" in e.value.guidance     # per-code classification
+    rec = a.outbox_record("k-4xx")
+    assert rec["state"] == "failed" and rec["failure_class"] == "definitive"
+    m.fail.clear()
+    out = a.send_template(ME, "hello_world", idempotency_key="k-4xx",
+                          retry=True)
     assert out.ok and len(m.calls) == 2   # two EXPLICIT attempts
 
 
@@ -659,3 +672,111 @@ def test_note_inbound_never_regresses_window():
     a.note_inbound(ME)                # must not regress the window
     now[0] = 10_000 + 23 * 3600
     assert a.in_window(ME)
+
+
+# ==========================================================================
+# REVIEW 3 fix set (their repros on 6c6bf32) - effects counted, not state
+# ==========================================================================
+
+# -- 1: failed-reclaim compares content BEFORE any mutation ------------------
+
+def test_failed_key_changed_content_conflict_no_overwrite_no_second_effect():
+    m, a = make(fail={ME: 131000})
+    with pytest.raises(WhatsAppError):
+        a.send_template(ME, "hello_world", idempotency_key="k-fc")
+    assert len(m.calls) == 1                     # one effect so far
+    before = dict(a.outbox_record("k-fc"))
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "changed_template", idempotency_key="k-fc",
+                        retry=True)
+    assert e.value.code == "idempotency_conflict"
+    assert len(m.calls) == 1                     # NO second effect
+    after = a.outbox_record("k-fc")
+    assert after["request"] == before["request"]  # record NOT overwritten
+    assert after["state"] == "failed"
+    assert after["attempts"] == before["attempts"]
+
+
+# -- 2: explicit retry parameter with preserved attempts/history -------------
+# (covered by test_failed_send_requires_explicit_retry_then_reclaims:
+#  plain resend refused with ZERO new effects; retry=True increments
+#  attempts and appends the prior failure to history)
+
+# -- 3: per-code classification, not per-class -------------------------------
+
+@pytest.mark.parametrize("code,klass", [
+    (130429, "retryable"),     # "Try again later" (official guidance)
+    (131056, "retryable"),     # "Wait and retry the operation"
+    (131000, "retryable"),     # "Try again. If the error persists..."
+    (131047, "definitive"),    # send a template instead
+    (131030, "definitive"),    # not in allowed list
+    (131050, "definitive"),    # "Do not retry"
+    (139999, "definitive"),    # unlisted code fails closed
+])
+def test_failure_classified_per_meta_error_code(code, klass):
+    m, a = make(fail={ME: code})
+    with pytest.raises(WhatsAppError):
+        a.send_template(ME, "hello_world", idempotency_key=f"k-{code}")
+    rec = a.outbox_record(f"k-{code}")
+    assert rec["state"] == "failed"
+    assert rec["failure_class"] == klass
+    assert len(m.calls) == 1
+
+
+# -- 4: batch acceptance is ONE atomic store transaction ---------------------
+
+def test_batch_applied_in_single_store_transaction(tmp_path):
+    path = str(tmp_path / "outbox.json")
+    store = JsonOutboxStore(path)
+    now = [1000.0]
+    m, a = make(now=now, store=store)
+    writes = []
+    orig = store._mutate
+    def spy(fn):
+        writes.append(1)
+        return orig(fn)
+    store._mutate = spy
+    body, sig = webhook([msg(mid="wam-a1", ts=1000),
+                         msg(mid="wam-a2", ts=1000),
+                         msg(mid="wam-a3", ts=1000)])
+    out = a.handle_inbound_webhook(body, sig)
+    assert len(out) == 3
+    assert len(writes) == 1        # the WHOLE batch = one locked write
+    # and the dedupe marks + window landed atomically
+    m2, a2 = make(now=now, store=JsonOutboxStore(path))
+    assert a2.handle_inbound_webhook(body, sig) == []
+    assert a2.in_window(ME)
+
+
+def test_rejected_batch_writes_nothing(tmp_path):
+    path = str(tmp_path / "outbox.json")
+    store = JsonOutboxStore(path)
+    now = [1000.0]
+    m, a = make(now=now, store=store)
+    before = open(path).read()
+    body, sig = webhook([msg(mid="wam-z1", ts=1000),
+                         msg(mid="wam-z2", ts=1000 + 99999)])
+    with pytest.raises(WhatsAppError):
+        a.handle_inbound_webhook(body, sig)
+    assert open(path).read() == before   # byte-identical: zero mutation
+
+
+# -- 5: durable receipts + reconciliation boundary ---------------------------
+
+def test_status_receipts_durable_across_restart(tmp_path):
+    path = str(tmp_path / "outbox.json")
+    now = [1000.0]
+    m1, a1 = make(now=now, store=JsonOutboxStore(path))
+    payload = {"entry": [{"id": WABA, "changes": [{"value": {
+        "metadata": {"phone_number_id": PNID},
+        "statuses": [{"id": "wamid.durable", "status": "read",
+                      "timestamp": "1000", "recipient_id": ME}]}}]}]}
+    body = json.dumps(payload).encode()
+    sig = "sha256=" + hmac.new(SECRET.encode(), body,
+                               hashlib.sha256).hexdigest()
+    assert a1.handle_inbound_webhook(body, sig) == []
+    # fresh instance on the same store: receipt survives
+    m2, a2 = make(now=now, store=JsonOutboxStore(path))
+    assert a2.receipt("wamid.durable")["status"] == "read"
+    assert len(a2.statuses) == 1
+    assert not a2.in_window(ME)           # receipts still open nothing

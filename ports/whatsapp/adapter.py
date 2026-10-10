@@ -59,6 +59,52 @@ WINDOW_SECONDS = 24 * 3600
 RETRY_HORIZON_SECONDS = 7 * 24 * 3600
 MAX_FUTURE_SKEW_SECONDS = 300
 
+# Per-CODE failure classification, grounded in the official Cloud API
+# error-codes reference
+# (https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes):
+# codes whose official guidance is "try again later / wait and retry" are
+# RETRYABLE; codes whose guidance is do-not-retry / fix-the-cause-first
+# are DEFINITIVE. A 4xx response is always a definitive RESPONSE (the
+# message certainly did not send); the class says whether re-sending the
+# SAME content is sensible after backoff. Unlisted codes default to
+# DEFINITIVE (fail closed: no retry is ever suggested without support).
+RETRYABLE_CODES = frozenset({
+    80007,    # WABA rate limit: "Try again later or reduce..."
+    130429,   # throughput reached: "Try again later..."
+    131048,   # spam-restriction send limit: check quality, limits lift
+    131056,   # pair rate limit: "Wait and retry the operation"
+    131064,   # template-classification limit: "automatically lifted"
+    133016,   # registration attempt limit: "Try again once unblocked"
+    131000,   # unknown error: "Try again. If the error persists..."
+})
+DEFINITIVE_CODES = frozenset({
+    100,      # unsupported/misspelled parameters
+    130403,   # business blocked the user: "Do not retry"
+    130472,   # marketing experiment exclusion
+    131005,   # permission not granted
+    131008,   # missing required parameter
+    131009,   # invalid parameter value
+    131021,   # sender == recipient
+    131026,   # undeliverable (not a WhatsApp number etc.)
+    131030,   # recipient not in allowed test list
+    131042,   # payment method error
+    131045,   # phone number registration error
+    131047,   # outside 24h window: send a template instead
+    131049,   # ecosystem engagement limit: resend "will only result in
+              # another error"
+    131050,   # user opted out of marketing: "Do not retry"
+    131051,   # unsupported message type
+    132001,   # template does not exist in this language
+    141006,   # business-level send block
+    141010,   # business not verified
+})
+
+
+def failure_class(code):
+    """'retryable' or 'definitive' per the official error-codes reference;
+    unlisted codes are DEFINITIVE (fail closed)."""
+    return "retryable" if code in RETRYABLE_CODES else "definitive"
+
 ERROR_MAP = {
     141006: ("business-level send block (generic payment-method label)",
              "Do NOT attach a card. Complete the business profile (Legal "
@@ -223,18 +269,32 @@ class JsonOutboxStore:
         return self._mutate(
             lambda rows: [k for k in rows if k.startswith(prefix)])
 
-    def claim(self, key, record, claimant):
-        """Atomically insert if absent OR if the prior record is a
-        definitively-failed send being retried. Returns "claimed" iff WE
-        hold the claim, "held" if the same content was already claimed.
-        Same key + DIFFERENT content raises StoreConflict."""
+    def claim(self, key, record, claimant, allow_retry=False):
+        """Atomic claim. Content is compared BEFORE any mutation, on every
+        path: same key + DIFFERENT content raises StoreConflict with the
+        prior record untouched (never overwritten, never a second effect).
+        Returns "claimed_fresh" (no prior), "claimed_retry" (prior failed
+        AND allow_retry; attempts/history carried forward atomically),
+        "failed_blocked" (prior failed, no explicit retry - no mutation),
+        or "held" (same content already claimed/sent/unknown)."""
         def fn(rows):
             prior = rows.get(key)
-            if prior is None or prior.get("state") == "failed":
+            if prior is None:
                 rows[key] = record
-                return "claimed"
+                return "claimed_fresh"
             if prior.get("request") != record.get("request"):
-                raise StoreConflict(key)
+                raise StoreConflict(key)  # compare first: ZERO mutation
+            if prior.get("state") == "failed":
+                if not allow_retry:
+                    return "failed_blocked"
+                record["attempts"] = prior.get("attempts", 0) + 1
+                record["history"] = prior.get("history", []) + [{
+                    "state": prior.get("state"),
+                    "last_error": prior.get("last_error"),
+                    "failure_class": prior.get("failure_class"),
+                    "finished_at": prior.get("finished_at")}]
+                rows[key] = record
+                return "claimed_retry"
             return "held"
         return self._mutate(fn)
 
@@ -247,6 +307,42 @@ class JsonOutboxStore:
         def fn(rows):
             rows.pop(key, None)
         self._mutate(fn)
+
+    def apply_inbound(self, messages, statuses, now, window_senders,
+                      horizon):
+        """ONE atomic op for a whole webhook entry set: dedupe marks,
+        monotonic window extends, durable receipts, and horizon pruning
+        all commit together or not at all. Returns the accepted
+        (non-duplicate) messages."""
+        def fn(rows):
+            # prune dedupe + receipt horizon inside the same transaction
+            for k in [k for k in rows
+                      if k.startswith(("seen:", "rcpt:"))
+                      and now - (rows[k] or {}).get("ts", 0) >= horizon]:
+                del rows[k]
+            accepted = []
+            for m in messages:
+                k = "seen:" + m["id"]
+                if k in rows:
+                    continue  # duplicate delivery: idempotent
+                rows[k] = {"ts": now}
+                sender = m.get("from", "")
+                if sender in window_senders:
+                    ts = int(float(str(m["timestamp"])))
+                    wk = "win:" + sender
+                    prior = rows.get(wk)
+                    if prior is None or ts > prior.get("ts", 0):
+                        rows[wk] = {"ts": ts}  # monotonic: forward only
+                accepted.append(m)
+            for st in statuses:
+                sid = st.get("id")
+                if sid:
+                    rows["rcpt:" + sid] = {"ts": now, "status": st}
+            return accepted
+        return self._mutate(fn)
+
+    def receipt(self, wamid):
+        return self._mutate(lambda rows: rows.get("rcpt:" + wamid))
 
 
 class MemOutboxStore:
@@ -265,14 +361,25 @@ class MemOutboxStore:
         with self._lk:
             return [k for k in self._rows if k.startswith(prefix)]
 
-    def claim(self, key, record, claimant):
+    def claim(self, key, record, claimant, allow_retry=False):
         with self._lk:
             prior = self._rows.get(key)
-            if prior is None or prior.get("state") == "failed":
+            if prior is None:
                 self._rows[key] = record
-                return "claimed"
+                return "claimed_fresh"
             if prior.get("request") != record.get("request"):
-                raise StoreConflict(key)
+                raise StoreConflict(key)  # compare first: ZERO mutation
+            if prior.get("state") == "failed":
+                if not allow_retry:
+                    return "failed_blocked"
+                record["attempts"] = prior.get("attempts", 0) + 1
+                record["history"] = prior.get("history", []) + [{
+                    "state": prior.get("state"),
+                    "last_error": prior.get("last_error"),
+                    "failure_class": prior.get("failure_class"),
+                    "finished_at": prior.get("finished_at")}]
+                self._rows[key] = record
+                return "claimed_retry"
             return "held"
 
     def put(self, key, record):
@@ -282,6 +389,37 @@ class MemOutboxStore:
     def delete(self, key):
         with self._lk:
             self._rows.pop(key, None)
+
+    def apply_inbound(self, messages, statuses, now, window_senders,
+                      horizon):
+        with self._lk:
+            for k in [k for k in self._rows
+                      if k.startswith(("seen:", "rcpt:"))
+                      and now - (self._rows[k] or {}).get("ts", 0) >= horizon]:
+                del self._rows[k]
+            accepted = []
+            for m in messages:
+                k = "seen:" + m["id"]
+                if k in self._rows:
+                    continue
+                self._rows[k] = {"ts": now}
+                sender = m.get("from", "")
+                if sender in window_senders:
+                    ts = int(float(str(m["timestamp"])))
+                    wk = "win:" + sender
+                    prior = self._rows.get(wk)
+                    if prior is None or ts > prior.get("ts", 0):
+                        self._rows[wk] = {"ts": ts}
+                accepted.append(m)
+            for st in statuses:
+                sid = st.get("id")
+                if sid:
+                    self._rows["rcpt:" + sid] = {"ts": now, "status": st}
+            return accepted
+
+    def receipt(self, wamid):
+        with self._lk:
+            return self._rows.get("rcpt:" + wamid)
 
 
 class WhatsAppStagingAdapter:
@@ -338,25 +476,28 @@ class WhatsAppStagingAdapter:
         self._instance = uuid.uuid4().hex
         self._outbox = outbox_store if outbox_store is not None \
             else MemOutboxStore()
-        self.statuses = []  # explicit receipt log (never windows)
+
+    @property
+    def statuses(self):
+        """Durable receipt log (rcpt: rows in the store). Receipts are
+        never messages and never open windows. RECONCILIATION BOUNDARY:
+        the adapter only persists raw status receipts keyed by wamid and
+        exposes them; matching receipts to outbox records and resolving
+        'unknown' sends is the canonical engine's job at activation."""
+        return [self._outbox.receipt(k[5:])["status"]
+                for k in self._outbox.keys_with_prefix("rcpt:")
+                if self._outbox.receipt(k[5:])]
+
+    def receipt(self, wamid):
+        """Durable receipt lookup by Meta message id (wamid)."""
+        rec = self._outbox.receipt(wamid)
+        return rec.get("status") if rec else None
 
     @property
     def resource(self):
         return f"whatsapp:waba:{self._waba_id}:phone:{self._pnid}"
 
     # -- durable replay/window state ---------------------------------------
-    def _seen_get(self, mid):
-        return self._outbox.get(f"seen:{mid}")
-
-    def _seen_put(self, mid, ts):
-        self._outbox.put(f"seen:{mid}", {"ts": ts})
-
-    def _seen_prune(self, now):
-        for k in self._outbox.keys_with_prefix("seen:"):
-            rec = self._outbox.get(k)
-            if rec is None or now - rec.get("ts", 0) >= RETRY_HORIZON_SECONDS:
-                self._outbox.delete(k)
-
     def _window_get(self, sender):
         rec = self._outbox.get(f"win:{sender}")
         return rec.get("ts") if rec else None
@@ -409,32 +550,30 @@ class WhatsAppStagingAdapter:
                 for m in value.get("messages", []):
                     self._validate_message(m, now)
 
-        # PASS 2: apply. Per-message outcomes here are idempotent drops
-        # (duplicate delivery), never failures.
-        self._seen_prune(now)
+        # PASS 2: ONE atomic store transaction for the whole entry set -
+        # dedupe marks, monotonic window extends, durable receipts and
+        # horizon pruning commit together or not at all. Per-message
+        # outcomes inside are idempotent drops (duplicate delivery),
+        # never failures.
+        all_msgs = [m for entry in entries for change in
+                    entry.get("changes", [])
+                    for m in change.get("value", {}).get("messages", [])]
+        all_statuses = [st for entry in entries for change in
+                        entry.get("changes", [])
+                        for st in change.get("value", {}).get("statuses")
+                        or []]
+        accepted = self._outbox.apply_inbound(
+            all_msgs, all_statuses, now, set(self._bindings),
+            RETRY_HORIZON_SECONDS)
         out = []
-        for entry in entries:
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                # Status receipts: recorded explicitly, never messages,
-                # never windows.
-                for st in value.get("statuses", []) or []:
-                    self.statuses.append(st)
-                for m in value.get("messages", []):
-                    mid = m["id"]
-                    if self._seen_get(mid) is not None:
-                        continue  # duplicate delivery / retry: idempotent
-                    ts = int(float(str(m["timestamp"])))
-                    self._seen_put(mid, now)
-                    sender = m.get("from", "")
-                    text = (m.get("text") or {}).get("body")
-                    # Media: normalized with its type; content is NOT
-                    # downloaded (the adapter has no media fetch) - honest.
-                    norm = InboundMessage(sender, mid, ts,
-                                          m.get("type", "unknown"), text)
-                    if sender in self._bindings:
-                        self._window_extend(sender, ts)  # monotonic
-                    out.append(norm)
+        for m in accepted:
+            ts = int(float(str(m["timestamp"])))
+            sender = m.get("from", "")
+            text = (m.get("text") or {}).get("body")
+            # Media: normalized with its type; content is NOT downloaded
+            # (the adapter has no media fetch) - honest scaffold limit.
+            out.append(InboundMessage(sender, m["id"], ts,
+                                      m.get("type", "unknown"), text))
         return out
 
     @staticmethod
@@ -468,7 +607,7 @@ class WhatsAppStagingAdapter:
         return ts is not None and self._clock() - ts < WINDOW_SECONDS
 
     # -- outbound ---------------------------------------------------------
-    def send_text(self, recipient, text, idempotency_key=None):
+    def send_text(self, recipient, text, idempotency_key=None, retry=False):
         self._require_bound(recipient)
         if not self.in_window(recipient):
             raise WhatsAppError(131047, ERROR_MAP[131047][1])
@@ -478,10 +617,10 @@ class WhatsAppStagingAdapter:
                                 "to": recipient, "type": "text",
                                 "text": {"body": text}},
                                idempotency_key)
-        return self._dispatch(req)
+        return self._dispatch(req, retry=retry)
 
     def send_template(self, recipient, template, language="en_US",
-                      idempotency_key=None):
+                      idempotency_key=None, retry=False):
         self._require_bound(recipient)
         req = CanonicalRequest(recipient, "template",
                                {"messaging_product": "whatsapp",
@@ -490,7 +629,7 @@ class WhatsAppStagingAdapter:
                                 "template": {"name": template,
                                              "language": {"code": language}}},
                                idempotency_key)
-        return self._dispatch(req)
+        return self._dispatch(req, retry=retry)
 
     def _grant(self, req):
         """Canonical permission handoff, fully bound: allowed flag, echo
@@ -549,7 +688,7 @@ class WhatsAppStagingAdapter:
             time.sleep(0.005)
         return self._outbox.get(key) or {"state": "in_flight"}
 
-    def _dispatch(self, req):
+    def _dispatch(self, req, retry=False):
         grant = self._grant(req)  # every refusal lands before the store
         key = "send:" + req.idempotency_key
         record = {"state": "claimed",
@@ -560,13 +699,20 @@ class WhatsAppStagingAdapter:
                   "attempts": 1,
                   "claimed_at": self._clock()}
         try:
-            result = self._outbox.claim(key, record, self._instance)
+            result = self._outbox.claim(key, record, self._instance,
+                                        allow_retry=retry)
         except StoreConflict:
             raise WhatsAppError(
                 "idempotency_conflict",
                 "this idempotency key was already used with DIFFERENT "
                 "content - conflict, never a stale success; pick a new "
                 "key") from None
+        if result == "failed_blocked":
+            raise WhatsAppError(
+                "explicit_retry_required",
+                "this key's prior attempt failed; re-sending requires the "
+                "EXPLICIT retry flag (retry=True) so a resend is always a "
+                "deliberate act, with attempts/history preserved")
         if result == "held":
             prior = self._outbox.get(key)
             if (prior.get("state") == "claimed"
@@ -609,6 +755,7 @@ class WhatsAppStagingAdapter:
             record["state"] = "unknown"
             record["last_error"] = {"code": "transport_lost",
                                     "message": repr(e)}
+            record["finished_at"] = self._clock()
             self._outbox.put(key, record)
             raise WhatsAppError(
                 "send_unknown",
@@ -622,6 +769,7 @@ class WhatsAppStagingAdapter:
             record["state"] = "unknown"
             record["last_error"] = {"code": err.get("code", status),
                                     "message": err.get("message")}
+            record["finished_at"] = self._clock()
             self._outbox.put(key, record)
             raise WhatsAppError(
                 "send_unknown",
@@ -632,18 +780,27 @@ class WhatsAppStagingAdapter:
             # 4xx: Meta definitively refused. Re-claimable explicitly.
             err = (data or {}).get("error", {})
             code = err.get("code", 0)
+            fclass = failure_class(code)
             record["state"] = "failed"
+            record["failure_class"] = fclass
             record["last_error"] = {"code": code,
                                     "message": err.get("message")}
+            record["finished_at"] = self._clock()
             self._outbox.put(key, record)
             meaning, guidance = ERROR_MAP.get(
                 code, (err.get("message", "unknown Meta error"),
                        "Check the official Cloud API error reference."))
-            raise WhatsAppError(code, f"{meaning} - {guidance}")
+            cls_note = ("Retryable per the official error-codes reference "
+                        "(back off, then an EXPLICIT retry may resend the "
+                        "same content)." if fclass == "retryable" else
+                        "Definitive per the official error-codes reference "
+                        "(fix the cause first; do not resend unchanged).")
+            raise WhatsAppError(code, f"{meaning} - {guidance} {cls_note}")
         wamid = ((data or {}).get("messages") or [{}])[0].get("id")
         record["state"] = "sent"
         record["response"] = {"status": status, "wamid": wamid, "raw": data}
         record["receipt"] = {"wamid": wamid, "sent_at": self._clock()}
+        record["finished_at"] = self._clock()
         self._outbox.put(key, record)
         return CanonicalResponse(True, status, wamid=wamid, raw=data,
                                  grant_id=grant.get("grant_id"))

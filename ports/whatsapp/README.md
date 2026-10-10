@@ -57,10 +57,27 @@ automation of any personal number, no paid routes.
   (sha256 of the exact send body); (c) carry a finite, unexpired
   expires_at (NaN/Infinity/non-numeric rejected). No grant function, no
   send. The adapter performs this handoff itself.
-- CONTENT-BOUND IDEMPOTENCY: the same idempotency key with DIFFERENT
-  content is idempotency_conflict - NEVER a stale success replay. Same
-  key + same content returns the stored response with duplicate:true and
-  no new transport effect.
+- CONTENT-BOUND IDEMPOTENCY, COMPARED BEFORE ANY MUTATION: the same
+  idempotency key with DIFFERENT content is idempotency_conflict on EVERY
+  path (fresh, held, AND failed-reclaim) - the prior record is never
+  overwritten and no second effect occurs. Same key + same content
+  returns the stored response with duplicate:true and no new transport
+  effect.
+- EXPLICIT RETRY ONLY: a failed send is never resent by an ordinary
+  resend call (explicit_retry_required, zero transport). Re-claiming a
+  failed key requires retry=True - a deliberate act that increments
+  attempts and preserves the full prior-attempt history atomically inside
+  the claim.
+- PER-CODE FAILURE CLASSIFICATION: 4xx failures are classified
+  definitive vs retryable by META ERROR CODE (not by status class),
+  grounded in the official Cloud API error-codes reference
+  (https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes):
+  codes whose official guidance says "try again later/wait and retry"
+  (80007, 130429, 131048, 131056, 131064, 133016, 131000) are retryable;
+  do-not-retry/fix-first codes (incl. 130403, 131047, 131050, 131030,
+  132001, 141006, 141010) are definitive; UNLISTED codes default to
+  definitive (fail closed). The class is recorded on the outbox record
+  and carried in the error guidance.
 - Durable outbox with ATOMIC CLAIM and ATOMIC PUBLISH: exclusive flock on
   a sidecar lock file around read-modify-write, write-temp-then-rename
   with fsync(file)+fsync(dir), reload on every op. FAILS CLOSED
@@ -81,13 +98,19 @@ automation of any personal number, no paid routes.
   time (parseable timestamp, <=5min future skew, within Meta's documented
   SEVEN-DAY webhook retry horizon,
   https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/overview/).
-  ANY failure rejects the entire batch with ZERO state change - a batch
-  never partially mutates. Application is then idempotent: dedupe by
-  message id over the retry horizon, PERSISTED in the durable store
-  (dedupe and window state survive restart, tested). Status receipts are
-  recorded explicitly (adapter.statuses) and never open windows; media
-  messages normalize with their type and NO fetched content (the adapter
-  does not download media).
+  ANY failure rejects the entire batch with ZERO state change - verified
+  byte-identical store afterwards. Application is then ONE ATOMIC STORE
+  TRANSACTION for the whole entry set: dedupe marks, monotonic window
+  extends, durable receipts and horizon pruning commit together or not at
+  all (verified: exactly one locked write for a multi-message batch).
+  Dedupe by message id over the retry horizon is PERSISTED (survives
+  restart, tested). Status receipts are persisted DURABLY as rcpt:<wamid>
+  rows and never open windows; RECONCILIATION BOUNDARY: the adapter only
+  persists raw receipts and exposes receipt(wamid)/statuses - matching
+  receipts to outbox records and resolving 'unknown' sends is the
+  canonical engine's job at activation. Media messages normalize with
+  their type and NO fetched content: media download is an explicit
+  SCAFFOLD LIMITATION (no media fetch exists).
 - The 24h service window is MONOTONIC and PERSISTED: an older-timestamped
   inbound only ever extends a window forward - it can never regress or
   close a newer open window (tested at T vs T-1h, and against clock
@@ -101,7 +124,7 @@ Activation gates live with the canonical engine.
 
 ## Tests
 
-`pytest ports/whatsapp` - 55 synthetic tests, the review-fix repros
+`pytest ports/whatsapp` - 66 synthetic tests, the review-fix repros
 counting EFFECTS (transport calls), not just state: owner-verified
 recipient binding + cap, window logic, template vs free-form, 141006
 card-free guidance, 131000-as-generic-unknown, signature validation,
@@ -126,4 +149,14 @@ GOOD message not recorded, replayed cleanly afterwards), monotonic window
 (older inbound never regresses; note_inbound never regresses under clock
 skew), corrupt-store fail-closed, wrong-WABA / wrong-phone-id rejection,
 2-day delayed-retry dedupe with no window, far-future and
-beyond-horizon whole-batch rejection.
+beyond-horizon whole-batch rejection. Review-3 repros: failed-key
+changed-content conflict with NO record overwrite and NO second effect
+(content compared before any mutation); plain resend of a failed key
+refused (explicit_retry_required, zero transport) then retry=True
+re-claiming with attempts=2 and prior failure preserved in history;
+per-code classification parametrized over 7 codes (3 retryable, 3
+definitive, 1 unlisted-fail-closed); whole-batch application in exactly
+ONE locked store write (spy-verified) with dedupe+window atomic, and a
+rejected batch leaving the store byte-identical; status receipts durable
+across a fresh instance on the same store file (receipt lookup by wamid,
+still no window).
