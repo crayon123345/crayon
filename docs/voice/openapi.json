@@ -1,0 +1,539 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Canonical voice adapter reference",
+    "version": "1.0.2",
+    "description": "Review-only. No live endpoint/consent/activation. Exact HTTPS Origin + ticket binding, no native or UA exception. Lost-final-response ruling: deny after expiry/revocation, ambiguous commit resolved only by authorized read-only recovery."
+  },
+  "paths": {
+    "/voice/session": {
+      "post": {
+        "description": "Reference only, not deployed. See reference.md for atomic validation and activation gates.",
+        "security": [
+          {
+            "canonical": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "version",
+                  "conversation_id",
+                  "mode",
+                  "provider_consent_version"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "enum": [
+                      1
+                    ]
+                  },
+                  "conversation_id": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "transcribe",
+                      "speak",
+                      "live"
+                    ]
+                  },
+                  "provider_consent_version": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Accepted"
+          },
+          "400": {
+            "description": "Malformed"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Origin/consent/scope"
+          },
+          "404": {
+            "description": "Unknown/not-owned"
+          },
+          "409": {
+            "description": "Replay/sequence/final conflict"
+          },
+          "410": {
+            "description": "Expired/revoked"
+          },
+          "429": {
+            "description": "Rate limit"
+          },
+          "503": {
+            "description": "Unavailable fail closed"
+          }
+        }
+      }
+    },
+    "/voice/internal/redeem": {
+      "post": {
+        "description": "Reference only, not deployed. See reference.md for atomic validation and activation gates.",
+        "security": [
+          {
+            "adapter": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "version",
+                  "ticket",
+                  "observed_origin",
+                  "mode"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "enum": [
+                      1
+                    ]
+                  },
+                  "ticket": {
+                    "type": "string"
+                  },
+                  "observed_origin": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "Malformed"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Origin/consent/scope"
+          },
+          "404": {
+            "description": "Unknown/not-owned"
+          },
+          "409": {
+            "description": "Replay/sequence/final conflict"
+          },
+          "410": {
+            "description": "Expired/revoked"
+          },
+          "429": {
+            "description": "Rate limit"
+          },
+          "503": {
+            "description": "Unavailable fail closed"
+          },
+          "200": {
+            "description": "Accepted"
+          }
+        }
+      }
+    },
+    "/voice/internal/revalidate": {
+      "post": {
+        "description": "Reference only, not deployed. See reference.md for atomic validation and activation gates.",
+        "security": [
+          {
+            "adapter": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "version",
+                  "lease_id"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "enum": [
+                      1
+                    ]
+                  },
+                  "lease_id": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "Malformed"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Origin/consent/scope"
+          },
+          "404": {
+            "description": "Unknown/not-owned"
+          },
+          "409": {
+            "description": "Replay/sequence/final conflict"
+          },
+          "410": {
+            "description": "Expired/revoked"
+          },
+          "429": {
+            "description": "Rate limit"
+          },
+          "503": {
+            "description": "Unavailable fail closed"
+          },
+          "200": {
+            "description": "Accepted"
+          }
+        }
+      }
+    },
+    "/voice/revoke": {
+      "post": {
+        "description": "Reference only, not deployed. See reference.md for atomic validation and activation gates.",
+        "security": [
+          {
+            "canonical": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "version",
+                  "request_id"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "enum": [
+                      1
+                    ]
+                  },
+                  "request_id": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "Malformed"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Origin/consent/scope"
+          },
+          "404": {
+            "description": "Unknown/not-owned"
+          },
+          "409": {
+            "description": "Replay/sequence/final conflict"
+          },
+          "410": {
+            "description": "Expired/revoked"
+          },
+          "429": {
+            "description": "Rate limit"
+          },
+          "503": {
+            "description": "Unavailable fail closed"
+          },
+          "200": {
+            "description": "Accepted"
+          }
+        }
+      }
+    },
+    "/voice/internal/progress": {
+      "post": {
+        "description": "Reference only, not deployed. See reference.md for atomic validation and activation gates.",
+        "security": [
+          {
+            "adapter": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "version",
+                  "lease_id",
+                  "seq",
+                  "type",
+                  "state"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "enum": [
+                      1
+                    ]
+                  },
+                  "lease_id": {
+                    "type": "string"
+                  },
+                  "seq": {
+                    "type": "integer"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "accepted",
+                      "progress",
+                      "transcript_partial",
+                      "transcript_final",
+                      "answer_partial",
+                      "answer_final",
+                      "review_required",
+                      "artifact",
+                      "blocked",
+                      "done"
+                    ],
+                    "description": "Component progress event only, never atomic terminal final commit; final components eligible for short recovery, partials ephemeral."
+                  },
+                  "state": {
+                    "type": "string",
+                    "enum": [
+                      "queued",
+                      "running",
+                      "awaiting_review",
+                      "blocked",
+                      "done"
+                    ]
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "Malformed"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Origin/consent/scope"
+          },
+          "404": {
+            "description": "Unknown/not-owned"
+          },
+          "409": {
+            "description": "Replay/sequence/final conflict"
+          },
+          "410": {
+            "description": "Expired/revoked"
+          },
+          "429": {
+            "description": "Rate limit"
+          },
+          "503": {
+            "description": "Unavailable fail closed"
+          },
+          "200": {
+            "description": "Accepted"
+          }
+        }
+      }
+    },
+    "/voice/internal/final": {
+      "post": {
+        "description": "Reference only, not deployed. See reference.md for atomic validation and activation gates. Expired/revoked lease always denied before duplicate detection. 410 does not prove earlier commit failed; never replay provider work or effects. Browser authorized recovery only within original TTL.",
+        "security": [
+          {
+            "adapter": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "version",
+                  "lease_id",
+                  "request_id",
+                  "seq",
+                  "type",
+                  "state"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "enum": [
+                      1
+                    ]
+                  },
+                  "lease_id": {
+                    "type": "string"
+                  },
+                  "request_id": {
+                    "type": "string"
+                  },
+                  "seq": {
+                    "type": "integer"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "done"
+                    ]
+                  },
+                  "state": {
+                    "type": "string",
+                    "enum": [
+                      "done",
+                      "blocked"
+                    ]
+                  },
+                  "transcript_text": {
+                    "type": "string"
+                  },
+                  "answer_text": {
+                    "type": "string"
+                  },
+                  "error_code": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "New terminal final committed"
+          },
+          "400": {
+            "description": "Malformed"
+          },
+          "401": {
+            "description": "Unauthenticated"
+          },
+          "403": {
+            "description": "Origin/consent/scope"
+          },
+          "404": {
+            "description": "Unknown/not-owned"
+          },
+          "409": {
+            "description": "Replay/sequence/final conflict"
+          },
+          "410": {
+            "description": "Expired/revoked"
+          },
+          "429": {
+            "description": "Rate limit"
+          },
+          "503": {
+            "description": "Unavailable fail closed"
+          },
+          "200": {
+            "description": "Exact duplicate acknowledged only while original lease/session remains live and scoped adapter is valid"
+          }
+        }
+      }
+    },
+    "/voice/result": {
+      "get": {
+        "security": [
+          {
+            "canonical": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "410": {
+            "description": "Owned result recovery TTL expired"
+          },
+          "200": {
+            "description": "Owner/session/conversation-bound read-only final recovery,300s TTL"
+          },
+          "401": {
+            "description": "Canonical authentication absent, expired or revoked"
+          },
+          "403": {
+            "description": "Exact origin rejected"
+          },
+          "404": {
+            "description": "Unknown or not owned by current owner/session/conversation; no existence leak"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "canonical": {
+        "type": "http",
+        "scheme": "bearer"
+      },
+      "adapter": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  }
+}
