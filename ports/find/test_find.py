@@ -238,6 +238,38 @@ class SupportGateTests(unittest.TestCase):
         self.assertTrue(reference_support(
             "rates rose 3-5 percent", "rates rose 3-5 percent last year."))
 
+    def test_currency_symbols_load_bearing(self):
+        # round-5: currency signs are exact like sign/%
+        self.assertFalse(reference_support(
+            "the fee was $5 today", "the fee was \u20ac5 today."))
+        self.assertFalse(reference_support(
+            "the fee was \u20ac5 today", "the fee was $5 today."))
+        self.assertFalse(reference_support(
+            "the fee was 5 dollars", "the fee was \u20ac5 dollars."))
+        self.assertTrue(reference_support(
+            "the fee was $5 today", "the fee was $5 today."))
+        self.assertTrue(reference_support(
+            "the fee was \u20b95 today", "the fee was \u20b95 today."))
+
+    def test_splitter_digit_period_whitespace(self):
+        # round-5: sentence mark + whitespace splits even after digits
+        self.assertFalse(reference_support(
+            "the trial enrolled 50 patients were cured",
+            "The trial enrolled 50. Patients were cured."))
+        self.assertFalse(reference_support(
+            "revenue was 15 today", "Revenue was 15. Today is Monday."))
+
+    def test_splitter_decimal_exception(self):
+        # digit.digit with no whitespace is a decimal, not a boundary
+        self.assertTrue(reference_support(
+            "revenue was 1.5", "Revenue was 1.5. Costs fell."))
+
+    def test_min_evidence_counts_numbers(self):
+        # a numeric token is evidence; pure filler is not
+        self.assertTrue(reference_support(
+            "revenue was 1.5", "Revenue was 1.5. Costs fell."))
+        self.assertFalse(reference_support("it", "it works"))
+
     def test_quote_spanning_sentences_refused(self):
         self.assertFalse(reference_support(
             "alpha beta gamma", "alpha beta. gamma arrives."))
