@@ -8,23 +8,27 @@ passes to the model layer. Stands alone.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (14/14 tests) but NOT wired into the
+Complete as a tested module (16/16 tests) but NOT wired into the
 running app. Named limits, exactly:
 
-1. STYLE IS NOT CAPABILITY: style text claiming abilities ("you can
-   make calls", "I can book flights", "always-on", "I have access
-   to...") is REJECTED at write time against an explicit marker list
-   (tested, 500-injection probe). Personality is tone, never a promise
-   of ability - and the rendered profile says so in its note field.
+1. STYLE IS NOT CAPABILITY: custom style TRAITS are a CLOSED tone-only
+   vocabulary (19 words like brief/warm/precise/light humor) - there is
+   no free-text trait channel at all, so no lexical filter has to catch
+   capability claims in traits (500-injection probe). The free-form
+   style NAME keeps a lexical claim filter ("you can X", "I can X",
+   "always-on", "ignore approval"...) as SECONDARY defense - it is a
+   documented limit, not model-safety proof. Personality is tone, never
+   a promise of ability - and the rendered profile says so in its note
+   field.
 2. OWNER-EXPLICIT ONLY: style changes only on explicit owner commands;
    nothing infers or adapts style from behavior.
 3. RENDERING IS PURE: profile() returns the same dict for the same
    stored state (1000-render probe). No clocks, no randomness.
 4. PRESETS ARE CLOSED: concise / warm / playful / formal. Unknown
    presets refuse with zero effects.
-5. BOUNDS REFUSE: 12 traits max, 60 chars per trait, 400 total chars,
-   40-char name. Overflow refuses and leaves the existing profile
-   untouched.
+5. BOUNDS REFUSE, NEVER TRUNCATE: 12 traits max, 60 chars per trait,
+   40-char name. Overflow REFUSES with zero effects - truncation would
+   silently rename a style (boundary tested at exactly-max).
 6. OWNER-STRICT: one profile per owner; a second owner's writes and
    clears have zero effect on the first.
 7. NO PROFILE = DEFAULT VOICE: profile() returns None and the app's

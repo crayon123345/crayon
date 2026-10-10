@@ -42,12 +42,25 @@ PRESETS = {
     "formal": ["polished", "precise", "structured"],
 }
 
-# phrases that turn a persona into a capability claim - rejected
+# CLOSED tone vocabulary: custom style traits must come from this list.
+# Tone dimensions only - there is no free-text trait channel, so no
+# lexical filter has to catch capability claims in traits at all.
+TONE_VOCABULARY = (
+    "brief", "direct", "warm", "friendly", "encouraging", "casual",
+    "playful", "polished", "precise", "structured", "patient", "calm",
+    "upbeat", "gentle", "energetic", "plain words", "short sentences",
+    "no filler", "light humor",
+)
+
+# phrases that turn a style NAME into a capability claim - rejected.
+# NOTE: lexical, a known limit (see README); traits need no filter
+# because they are closed-vocabulary.
 CLAIM_MARKERS = (
     "you can ", "i can ", "i will ", "i'll ", "able to",
     "always-on", "always on", "24/7", "access to your",
     "i have access", "book ", "buy ", "purchase", "call ",
     "text your", "message your", "send ", "pay ",
+    "ignore ", "approval",
 )
 
 
@@ -117,25 +130,35 @@ class Personality:
         return p
 
     def set_custom(self, owner, name, traits, now=None):
-        """traits: iterable of short trait phrases."""
-        name = _norm(name)[:MAX_STYLE_NAME]
+        """traits: iterable of tone words from TONE_VOCABULARY (closed)."""
+        name = _norm(name)
         if not name:
             raise PersonalityError("style name required")
+        # REJECT overflow - truncating would silently rename the style
+        if len(name) > MAX_STYLE_NAME:
+            raise PersonalityError("style name too long (%d chars max)"
+                                   % MAX_STYLE_NAME)
         _reject_claims(name)
         clean = []
         for t in (traits or []):
-            t = _norm(t)[:MAX_TRAIT_LEN]
-            if t:
-                _reject_claims(t)
+            t = _norm(t).lower()
+            if not t:
+                continue
+            if len(t) > MAX_TRAIT_LEN:
+                raise PersonalityError("trait too long (%d chars max)"
+                                       % MAX_TRAIT_LEN)
+            if t not in TONE_VOCABULARY:
+                raise PersonalityError(
+                    "unknown tone %r - pick from: %s"
+                    % (t, ", ".join(TONE_VOCABULARY)))
+            if t not in clean:
                 clean.append(t)
         if not clean:
-            raise PersonalityError("at least one trait required")
+            raise PersonalityError("at least one trait required (from: "
+                                   "%s)" % ", ".join(TONE_VOCABULARY))
         if len(clean) > MAX_TRAITS:
             raise PersonalityError("too many traits (%d max)"
                                    % MAX_TRAITS)
-        if sum(len(t) for t in clean) > MAX_TRAIT_CHARS:
-            raise PersonalityError("traits too long (%d chars max)"
-                                   % MAX_TRAIT_CHARS)
         p = Profile(owner, "custom", name, clean, int(now or 0))
         self.store.put(p)
         return p
