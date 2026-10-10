@@ -2,9 +2,9 @@ import sys, os, unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from find_track import (FindTrack, MemTrackStore, TrackError,
-                        TrackLimitReached, DiffLimitReached, NoMatch,
+                        TrackLimitReached, DiffLimitReached, KnownLimitReached, NoMatch,
                         canonical_url, MAX_TRACKS, MAX_TOPIC,
-                        MAX_DIFF_ITEMS, MAX_RUN_ITEMS, MAX_URL, MAX_TITLE)
+                        MAX_DIFF_ITEMS, MAX_KNOWN_ITEMS, MAX_RUN_ITEMS, MAX_URL, MAX_TITLE)
 
 T0 = 1791633600
 HOUR = 3600
@@ -59,13 +59,27 @@ class AddRemoveTests(unittest.TestCase):
 
 
 class DiffTests(unittest.TestCase):
-    def test_first_run_returns_all_items(self):
+    def test_first_run_is_baseline_no_diff(self):
+        # round-3: the first accepted run SEEDS the known set without
+        # diffing - returns an explicit baseline fact, never a diff
         f = make()
         tid = f.add("u1", "t", T0)
         d = f.run("u1", tid, [item(1), item(2)], T0 + HOUR)
-        self.assertEqual(len(d["new"]), 2)
-        self.assertEqual(d["tid"], tid)
-        self.assertEqual(d["topic"], "t")
+        self.assertEqual(d, {"tid": tid, "topic": "t", "baseline": True,
+                             "seeded": 2, "new": []})
+        self.assertEqual(f.list("u1")[0]["known"], 2)
+        self.assertTrue(f.list("u1")[0]["seeded"])
+
+    def test_first_run_over_diff_cap_is_baseline_not_deadlock(self):
+        # round-3 regression: an initial result set bigger than
+        # MAX_DIFF_ITEMS is a baseline, NOT DiffLimitReached
+        f = make()
+        tid = f.add("u1", "t", T0)
+        d = f.run("u1", tid, [item(i) for i in range(MAX_DIFF_ITEMS + 5)],
+                  T0 + HOUR)
+        self.assertTrue(d["baseline"])
+        self.assertEqual(d["seeded"], MAX_DIFF_ITEMS + 5)
+        self.assertEqual(f.list("u1")[0]["known"], MAX_DIFF_ITEMS + 5)
 
     def test_second_run_same_set_no_diff(self):
         f = make()
@@ -84,9 +98,8 @@ class DiffTests(unittest.TestCase):
     def test_items_carry_first_seen(self):
         f = make()
         tid = f.add("u1", "t", T0)
-        d1 = f.run("u1", tid, [item(1)], T0 + HOUR)
+        f.run("u1", tid, [item(1)], T0 + HOUR)  # baseline
         d2 = f.run("u1", tid, [item(1), item(2)], T0 + 2 * HOUR)
-        self.assertEqual(d1["new"][0]["first_seen"], T0 + HOUR)
         self.assertEqual(d2["new"][0]["first_seen"], T0 + 2 * HOUR)
 
     def test_run_cap_refuses_zero_effects(self):
@@ -124,29 +137,58 @@ class DiffTests(unittest.TestCase):
     def test_diff_cap_refuses_whole_run(self):
         f = make()
         tid = f.add("u1", "t", T0)
+        f.run("u1", tid, [item(1000)], T0)  # baseline
+        before = f.list("u1")[0]["known"]
         self.assertRaises(DiffLimitReached, f.run, "u1", tid,
                           [item(i) for i in range(MAX_DIFF_ITEMS + 1)], T0)
-        self.assertEqual(f.list("u1")[0]["known"], 0)  # nothing committed
+        self.assertEqual(f.list("u1")[0]["known"], before)  # nothing committed
 
     def test_dedup_within_run_canonical(self):
         f = make()
         tid = f.add("u1", "t", T0)
         d = f.run("u1", tid, [{"url": "https://www.a.com/x?utm_source=n#f"},
                               {"url": "https://a.com/x"}], T0)
-        self.assertEqual(len(d["new"]), 1)
+        self.assertEqual(d["seeded"], 1)  # duplicates collapse even at baseline
+        self.assertEqual(f.list("u1")[0]["known"], 1)
 
     def test_scheme_port_are_identity(self):
         f = make()
         tid = f.add("u1", "t", T0)
         d = f.run("u1", tid, [{"url": "http://a.example:8080/x"},
                               {"url": "https://a.example:9090/x"}], T0)
-        self.assertEqual(len(d["new"]), 2)  # distinct resources
+        self.assertEqual(d["seeded"], 2)  # distinct resources
 
     def test_ipv6_item(self):
         f = make()
         tid = f.add("u1", "t", T0)
-        d = f.run("u1", tid, [{"url": "https://[::1]:8080/x"}], T0)
+        f.run("u1", tid, [{"url": "https://a.com/seed"}], T0)  # baseline
+        d = f.run("u1", tid, [{"url": "https://a.com/seed"},
+                              {"url": "https://[::1]:8080/x"}], T0)
         self.assertEqual(d["new"][0]["canonical"], "https://[::1]:8080/x")
+
+    def test_known_cap_unreachable_in_one_run(self):
+        # the run cap (50) is strictly below the known cap (500), so a
+        # single run can never breach the known cap - the run cap fires
+        # first; the known cap binds across runs (tested below)
+        f = make()
+        tid = f.add("u1", "t", T0)
+        self.assertLess(MAX_RUN_ITEMS, MAX_KNOWN_ITEMS)
+        self.assertRaises(TrackError, f.run, "u1", tid,
+                          [item(i) for i in range(MAX_RUN_ITEMS + 1)], T0)
+        self.assertFalse(f.list("u1")[0]["seeded"])
+
+    def test_known_cap_refuses_across_runs(self):
+        f = make()
+        tid = f.add("u1", "t", T0)
+        f.run("u1", tid, [item(i) for i in range(MAX_RUN_ITEMS)], T0)  # baseline
+        n = MAX_RUN_ITEMS
+        while n < MAX_KNOWN_ITEMS:
+            f.run("u1", tid, [item(i) for i in range(n, n + 10)], T0)
+            n += 10
+        before = f.list("u1")[0]["known"]
+        self.assertRaises(KnownLimitReached, f.run, "u1", tid,
+                          [item(i) for i in range(n, n + 10)], T0)
+        self.assertEqual(f.list("u1")[0]["known"], before)  # zero effects
 
     def test_determinism(self):
         a, b = make(), make()

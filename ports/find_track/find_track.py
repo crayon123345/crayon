@@ -11,10 +11,16 @@ authoritative decision state, owned by patterns.
 
 Design invariants:
 
-1. DIFF FACTS ONLY: run() returns {"tid", "new": [...]} or None. No
-   cards, no dismissal, no reopening - those are patterns' lifecycle.
-   The no-nagging property is structural: a seen URL is in the known
-   set forever, so a stale replay produces an EMPTY diff forever.
+1. DIFF FACTS ONLY: run() returns {"tid", "new": [...]} or None (a
+   baseline run returns {"tid", "baseline": True, "seeded": n, "new":
+   []}). No cards, no dismissal, no reopening - those are patterns'
+   lifecycle. The no-nagging property is structural: a seen URL is in
+   the known set forever, so a stale replay produces an EMPTY diff
+   forever.
+   BASELINE IS EXPLICIT: a track's FIRST accepted run seeds the known
+   set without diffing - an initial result set of any size (up to
+   MAX_RUN_ITEMS / MAX_KNOWN_ITEMS) is a baseline, never a "diff" and
+   never blocked by MAX_DIFF_ITEMS (round-3: no first-run deadlock).
 2. EVIDENCE IS VISIBLE: every diff item carries its canonical identity,
    the original url, title and a per-item first_seen timestamp.
 3. DETERMINISTIC DIFFING: an item is its canonical url (scheme + port
@@ -32,7 +38,8 @@ Design invariants:
    overwrite a live track; injected collisions refuse before
    assignment.
 7. CAPS REFUSE, NEVER EVICT: MAX_TRACKS per owner, MAX_RUN_ITEMS per
-   run, MAX_DIFF_ITEMS per returned diff; overflow raises zero-effects.
+   run, MAX_DIFF_ITEMS per returned diff, MAX_KNOWN_ITEMS per track;
+   overflow raises zero-effects.
 8. OVERFLOW REJECTS, NEVER TRUNCATES: over-length topic/url/title
    raises; truncation could alias distinct items.
 9. CLOCKS + IDS INJECTED; NOT MOUNTED: no timers, no cron, no network,
@@ -54,6 +61,7 @@ MAX_DIFF_ITEMS = 10  # new items returned per run
 MAX_RUN_ITEMS = 50   # result-set size per run
 MAX_URL = 500
 MAX_TITLE = 200
+MAX_KNOWN_ITEMS = 500  # known-set cap per track; refuse-whole, never evict
 
 
 class TrackError(Exception):
@@ -65,6 +73,10 @@ class TrackLimitReached(TrackError):
 
 
 class DiffLimitReached(TrackError):
+    pass
+
+
+class KnownLimitReached(TrackError):
     pass
 
 
@@ -81,7 +93,7 @@ def canonical_url(url):
 
 class Track(object):
     __slots__ = ("tid", "owner", "topic", "created_at", "last_run_at",
-                 "known")
+                 "seeded", "known")
 
     def __init__(self, tid, owner, topic, now):
         self.tid = tid
@@ -89,6 +101,7 @@ class Track(object):
         self.topic = topic
         self.created_at = now
         self.last_run_at = None
+        self.seeded = False  # first accepted run is the baseline
         self.known = set()  # canonical urls seen in any accepted run
 
 
@@ -140,7 +153,10 @@ class FindTrack(object):
         """Diff one result set against the track's known set. results:
         [{"url": str, "title": str?}]. Atomic: over-bounds input, any
         invalid item, or a diff over MAX_DIFF_ITEMS refuses the WHOLE
-        run with zero effects. Returns {"tid", "new": [...]} when new
+        run with zero effects. The FIRST accepted run is a baseline:
+        it seeds the known set and returns {"tid", "baseline": True,
+        "seeded": n, "new": []} - MAX_DIFF_ITEMS never blocks a
+        baseline. Later runs return {"tid", "new": [...]} when new
         items were found - plain diff facts for ports/patterns to
         surface - else None."""
         t = self._track(owner, tid)
@@ -163,6 +179,18 @@ class FindTrack(object):
             seen.add(canon)
             items.append({"canonical": canon, "url": r["url"].strip(),
                           "title": title.strip()})
+        if len(t.known) + len(seen - t.known) > MAX_KNOWN_ITEMS:
+            raise KnownLimitReached("known-set cap %d reached"
+                                    % MAX_KNOWN_ITEMS)
+        if not t.seeded:
+            # BASELINE: the first accepted run seeds the known set
+            # without diffing - a big initial result set is a baseline,
+            # never a diff and never blocked by MAX_DIFF_ITEMS
+            t.known |= seen
+            t.seeded = True
+            t.last_run_at = now
+            return {"tid": tid, "topic": t.topic, "baseline": True,
+                    "seeded": len(items), "new": []}
         new = [it for it in items if it["canonical"] not in t.known]
         if len(new) > MAX_DIFF_ITEMS:
             raise DiffLimitReached("diff over %d items" % MAX_DIFF_ITEMS)
@@ -177,5 +205,6 @@ class FindTrack(object):
 
     def list(self, owner):
         return [{"tid": t.tid, "topic": t.topic, "created_at": t.created_at,
-                 "last_run_at": t.last_run_at, "known": len(t.known)}
+                 "last_run_at": t.last_run_at, "seeded": t.seeded,
+                 "known": len(t.known)}
                 for t in self._tracks(owner).values()]

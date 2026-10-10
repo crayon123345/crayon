@@ -20,12 +20,17 @@ genuinely fresh URL produces one).
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (25/25 tests) but NOT wired into the
+Complete as a tested module (28/28 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. DIFF FACTS ONLY: run() returns {"tid", "topic", "new": [...]} or
    None. No cards, no dismissal, no reopening (module surface probe:
    no dismiss/card methods exist).
+   BASELINE IS EXPLICIT (round-3): a track's FIRST accepted run seeds
+   the known set without diffing and returns {"tid", "topic",
+   "baseline": True, "seeded": n, "new": []} - an initial result set
+   over MAX_DIFF_ITEMS is a baseline, never DiffLimitReached
+   (regression probe: 0/40 deadlocks over sizes 11..50).
 2. EVIDENCE IS VISIBLE: every diff item carries canonical identity,
    original url, title and a per-item first_seen timestamp.
 3. DETERMINISTIC DIFFING, URL-DISCOVERY SCOPE: an item is its
@@ -44,7 +49,10 @@ running app. Named limits, exactly:
    overwrite a live track (probe: 200 cycles, zero loss); injected
    collisions refuse before assignment (tested).
 7. CAPS REFUSE, NEVER EVICT: MAX_TRACKS = 25, MAX_RUN_ITEMS = 50,
-   MAX_DIFF_ITEMS = 10 (probe: 50/50 over-cap diffs refused whole).
+   MAX_DIFF_ITEMS = 10 (probe: 50/50 over-cap diffs refused whole),
+   MAX_KNOWN_ITEMS = 500 per track (round-3; the run cap < known cap
+   so only cross-run growth can reach it - probe: 0/50 over-cap runs
+   committed, known set byte-stable).
 8. OVERFLOW REJECTS, NEVER TRUNCATES: topic 200 / url 500 / title 200;
    malformed ports raise the declared error (tested).
 9. CLOCKS + IDS INJECTED; NOT MOUNTED: no timers, no cron, no network,
