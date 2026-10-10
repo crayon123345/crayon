@@ -9,6 +9,16 @@ def init():
       id TEXT PRIMARY KEY,user_id BIGINT NOT NULL,session_hash TEXT NOT NULL,
       encrypted TEXT NOT NULL,content_hash TEXT NOT NULL,status TEXT DEFAULT 'pending',
       expires_at TIMESTAMPTZ NOT NULL)""",fetch='none')
+    db.q("""CREATE TABLE IF NOT EXISTS web_send_decisions(
+      id BIGSERIAL PRIMARY KEY,review_id TEXT NOT NULL,content_hash TEXT NOT NULL,
+      user_id BIGINT NOT NULL,session_hash TEXT NOT NULL,decision TEXT NOT NULL,
+      phase TEXT NOT NULL,message_id TEXT,ts TIMESTAMPTZ NOT NULL DEFAULT now())""",fetch='none')
+
+def send_decision(uid,header,body,phase,message_id=None):
+    # Insert-only operational log. No token, email content or recipient stored.
+    db.q("INSERT INTO web_send_decisions(review_id,content_hash,user_id,session_hash,decision,phase,message_id) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+      (body['review_id'],body['hash'],uid,A.digest(header[7:]),body['decision'],phase,message_id),'none')
+
 
 def connections(uid):
     import cr_connections as X
@@ -105,6 +115,7 @@ def confirm(uid,header,body):
     data=json.loads(A._cipher().decrypt(row['encrypted'].encode()))
     if hashlib.sha256(json.dumps(data,sort_keys=True).encode()).hexdigest()!=row['content_hash']:raise ValueError('Review changed. No action made.')
     kind,p=data['kind'],data['payload']
+    if kind=='email':send_decision(uid,header,body,'accepted')
     try:
         if body['decision']=='cancel':
             if kind=='workspace_create':pass
@@ -118,7 +129,9 @@ def confirm(uid,header,body):
         elif kind=='workspace_create':
             result=__import__('cr_workspace_create').apply(uid,p)
             text=(p['kind'].capitalize()+' created: '+p['title']+'\n'+str(result.get('url') or result.get('id') or '')+'\n'+result['note']) if result.get('created') else result['note']
-        elif kind=='email':text=G.send_draft(uid,p['id'],p['hash'],channel='web')
+        elif kind=='email':
+            receipt=G.send_draft(uid,p['id'],p['hash'],channel='web',return_receipt=True)
+            text=receipt['text'];send_decision(uid,header,body,'sent',receipt['message_id'])
         elif kind=='calendar':text=__import__('cr_calendar_draft').create(uid,p['id'],p['hash'],channel='web')
         elif kind=='forget':
             import cr_memory as M
@@ -128,9 +141,13 @@ def confirm(uid,header,body):
                 text='Saved fact removed. Chat history and other records were not deleted.'
         elif kind=='sheet':text=json.dumps(__import__('cr_workspace').sheet_apply(uid,p['payload'],p['hash']),ensure_ascii=False)
         else:raise ValueError('Action unavailable.')
+        if kind=='email' and body['decision']=='cancel':send_decision(uid,header,body,'cancelled')
         db.q('DELETE FROM web_action_reviews WHERE id=%s AND user_id=%s',(body['review_id'],uid),'none')
         return {'text':text}
     except Exception:
+        if kind=='email':
+            try:send_decision(uid,header,body,'stopped_or_uncertain')
+            except Exception:pass
         db.q("UPDATE web_action_reviews SET status='stopped' WHERE id=%s AND user_id=%s",(body['review_id'],uid),'none')
         raise G.GoogleError('Action stopped or uncertain. Check the destination before preparing another request. No automatic retry.') from None
 

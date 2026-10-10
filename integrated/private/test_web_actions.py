@@ -39,7 +39,7 @@ def test_confirmation_exact_one_use(config):
     def q(sql,p=(),fetch='all'):
         if sql.startswith('UPDATE web_action_reviews SET status=') and "'claimed'" in sql:
             claims.append(p);return row if len(claims)==1 else None
-    config.setattr(X.db,'q',q);config.setattr(X.G,'send_draft',lambda *a,**kw:sent.append(a) or 'Sent')
+    config.setattr(X.db,'q',q);config.setattr(X.G,'send_draft',lambda *a,**kw:sent.append(a) or {'text':'Sent','message_id':'msg-test'})
     body={'review_id':'r','hash':digest,'decision':'confirm'}
     assert X.confirm(17,'Bearer '+'a'*43,body)['text']=='Sent'
     with pytest.raises(ValueError):X.confirm(17,'Bearer '+'a'*43,body)
@@ -132,3 +132,48 @@ def test_compose_preserves_exact_roles_and_session_review(monkeypatch):
     seen=[];monkeypatch.setattr(X,'preview',lambda uid,h,b:seen.append((uid,h,b)) or {'review_id':'ticket'})
     assert X.compose_preview(10,'Bearer token',{'message':'Write a mail to sam@example.com asking for a domain'})=={'review_id':'ticket'}
     assert seen[0][1]=='Bearer token' and seen[0][2]['kind']=='email'
+
+def test_send_decision_receipt_is_append_only_without_content(config):
+    import hashlib
+    data={'kind':'email','payload':{'id':'draft','hash':'short'},'text':'Private email body never audit'}
+    digest=hashlib.sha256(json.dumps(data,sort_keys=True).encode()).hexdigest()
+    row={'encrypted':A._cipher().encrypt(json.dumps(data).encode()).decode(),'content_hash':digest}
+    seen=[]
+    def q(sql,p=(),fetch='all'):
+        seen.append((sql,p))
+        if sql.startswith('UPDATE web_action_reviews') and "'claimed'" in sql:return row
+    config.setattr(X.db,'q',q)
+    def send(*a,**kw):
+        assert kw['return_receipt'] is True
+        assert any(sql.startswith('INSERT INTO web_send_decisions') and p[-2]=='accepted' for sql,p in seen)
+        return {'text':'Sent','message_id':'gmail-real-id'}
+    config.setattr(X.G,'send_draft',send)
+    X.confirm(17,'Bearer '+'a'*43,{'review_id':'r','hash':digest,'decision':'confirm'})
+    inserts=[p for sql,p in seen if sql.startswith('INSERT INTO web_send_decisions')]
+    assert inserts==[('r',digest,17,A.digest('a'*43),'confirm','accepted',None),('r',digest,17,A.digest('a'*43),'confirm','sent','gmail-real-id')]
+    assert all('Private email body' not in str(p) and 'a'*43 not in str(p) for p in inserts)
+    assert not any(sql.startswith(('UPDATE web_send_decisions','DELETE FROM web_send_decisions')) for sql,p in seen)
+
+def test_send_decision_audit_failure_blocks_send(config):
+    import hashlib
+    data={'kind':'email','payload':{'id':'draft','hash':'short'},'text':'Body'}
+    digest=hashlib.sha256(json.dumps(data,sort_keys=True).encode()).hexdigest()
+    row={'encrypted':A._cipher().encrypt(json.dumps(data).encode()).decode(),'content_hash':digest}
+    def q(sql,p=(),fetch='all'):
+        if sql.startswith('UPDATE web_action_reviews') and "'claimed'" in sql:return row
+        if sql.startswith('INSERT INTO web_send_decisions'):raise RuntimeError('Audit unavailable')
+    config.setattr(X.db,'q',q);config.setattr(X.G,'send_draft',lambda *a,**kw:pytest.fail('send blocked before audit'))
+    with pytest.raises(RuntimeError):X.confirm(17,'Bearer '+'a'*43,{'review_id':'r','hash':digest,'decision':'confirm'})
+
+def test_cancel_decision_retained_without_send(config):
+    import hashlib
+    data={'kind':'email','payload':{'id':'draft','hash':'short'},'text':'Body'}
+    digest=hashlib.sha256(json.dumps(data,sort_keys=True).encode()).hexdigest()
+    row={'encrypted':A._cipher().encrypt(json.dumps(data).encode()).decode(),'content_hash':digest};seen=[]
+    def q(sql,p=(),fetch='all'):
+        if sql.startswith('UPDATE web_action_reviews') and "'claimed'" in sql:return row
+        if sql.startswith('INSERT INTO web_send_decisions'):seen.append(p)
+    config.setattr(X.db,'q',q);config.setattr(X.G,'cancel_draft',lambda *a,**kw:'Cancelled')
+    config.setattr(X.G,'send_draft',lambda *a,**kw:pytest.fail('cancel cannot send'))
+    X.confirm(17,'Bearer '+'a'*43,{'review_id':'r','hash':digest,'decision':'cancel'})
+    assert [p[-2] for p in seen]==['accepted','cancelled']
