@@ -60,12 +60,34 @@ def _norm(text):
     return re.sub(r"\s+", " ", (text or "").strip()).lower()
 
 
-def valid_tz(name):
+_tz_canon_cache = None
+
+
+def canonical_tz_name(name):
+    """Return the canonical-cased IANA name for NAME, case-insensitively.
+
+    Users type "asia/calcutta"; the zoneinfo database is case-sensitive.
+    Match case-insensitively and hand back the canonical casing so stored
+    settings and rendered replies always carry the real IANA name.
+    Raises BadTimezone with zero effects when nothing matches.
+    """
+    global _tz_canon_cache
     try:
-        return ZoneInfo(name)
+        return ZoneInfo(name) and name  # fast path: already canonical
     except (ZoneInfoNotFoundError, ValueError, KeyError):
+        pass
+    if _tz_canon_cache is None:
+        from zoneinfo import available_timezones
+        _tz_canon_cache = {n.lower(): n for n in available_timezones()}
+    canon = _tz_canon_cache.get((name or "").lower())
+    if canon is None:
         raise BadTimezone("unknown timezone %r (use an IANA name like "
                           "Asia/Calcutta)" % name)
+    return canon
+
+
+def valid_tz(name):
+    return ZoneInfo(canonical_tz_name(name))
 
 
 class Job:
@@ -138,8 +160,7 @@ class MemScheduleStore:
         return self._tz.get(owner, "UTC")
 
     def set_tz(self, owner, name):
-        valid_tz(name)  # raises BadTimezone
-        self._tz[owner] = name
+        self._tz[owner] = canonical_tz_name(name)  # raises BadTimezone
 
     def get_quiet(self, owner):
         return self._quiet.get(owner, DEFAULT_QUIET)
@@ -175,9 +196,11 @@ class Schedule:
             for j in self.store.list(owner, states=("active", "paused")):
                 if j.dedupe_key == dk:
                     return j, False            # dedupe: already exists
-        if self.store.count(owner) >= MAX_JOBS_PER_OWNER:
+        live = len(self.store.list(owner, states=("active", "paused")))
+        if live >= MAX_JOBS_PER_OWNER:
             raise JobLimitReached(
-                "schedule is full (%d jobs); cancel some first"
+                "schedule is full (%d active/paused jobs); cancel some "
+                "first - cancelled and completed jobs do not count"
                 % MAX_JOBS_PER_OWNER)
         j = Job(owner, kind, text, int(fire_at), interval_min=interval_min,
                 dedupe_key=dedupe_key)
@@ -352,8 +375,12 @@ class Schedule:
                      r"\s+(?:to\s+)?(.+)$", low)
         if m:
             tz = valid_tz(self.store.get_tz(owner))
-            loc = datetime.strptime(m.group(1) + " " + m.group(2),
-                                    "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+            try:
+                loc = datetime.strptime(m.group(1) + " " + m.group(2),
+                                        "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+            except ValueError:
+                return ("That date or time does not exist (%s %s) - "
+                        "nothing scheduled." % (m.group(1), m.group(2)))
             ts = int(loc.astimezone(timezone.utc).timestamp())
             if ts <= now:
                 return "That time is in the past (%s)." % \
@@ -424,7 +451,7 @@ class Schedule:
                 self.set_timezone(owner, m.group(1))
             except BadTimezone as e:
                 return str(e)
-            return "Timezone set to %s." % m.group(1)
+            return "Timezone set to %s." % self.store.get_tz(owner)
 
         m = re.match(r"^quiet hours (\d{1,2})\s*(?:to|-)\s*(\d{1,2})$", low)
         if m:

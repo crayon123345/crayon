@@ -242,3 +242,60 @@ class TestIsolationAndGrammar(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Review5479xxxRegressionTests(unittest.TestCase):
+    """Regression tests for PR #23 provisional review findings."""
+
+    def setUp(self):
+        self.s = Schedule(MemScheduleStore())
+        self.A, self.B = "v_a", "v_b"
+
+    def test_lowercase_timezone_accepted_and_canonicalized(self):
+        self.s.set_timezone(self.A, "asia/calcutta")
+        self.assertEqual(self.s.store.get_tz(self.A), "Asia/Calcutta")
+        r = self.s.handle_message(self.A, "set timezone asia/calcutta",
+                                  now=T0)
+        self.assertIn("Asia/Calcutta", r)
+        self.assertEqual(self.s.store.get_tz(self.A), "Asia/Calcutta")
+
+    def test_unknown_timezone_still_refused_zero_effects(self):
+        with self.assertRaises(BadTimezone):
+            self.s.set_timezone(self.A, "asia/nowhere")
+        with self.assertRaises(BadTimezone):
+            self.s.set_timezone(self.A, "")
+        self.assertEqual(self.s.store.get_tz(self.A), "UTC")
+
+    def test_invalid_calendar_date_refused_zero_effects(self):
+        for bad in ("2026-02-30", "2026-13-01", "2025-02-29", "2026-04-31"):
+            r = self.s.handle_message(
+                self.A, "remind me at %s 10:00 to x" % bad, now=T0)
+            self.assertIn("does not exist", r)
+        self.assertEqual(self.s.store.count(self.A), 0)
+
+    def test_valid_date_and_time_still_schedule(self):
+        r = self.s.handle_message(
+            self.A, "remind me at 2026-10-11 09:30 to stretch", now=T0)
+        self.assertIn("reminder set", r.lower())
+        self.assertEqual(self.s.store.count(self.A), 1)
+
+    def test_cancelled_and_done_jobs_do_not_count_toward_cap(self):
+        # one early job so tick() completes exactly one job
+        self.s.add_job(self.A, "early job", in_minutes=1, now=T0)
+        for i in range(MAX_JOBS_PER_OWNER - 1):
+            self.s.add_job(self.A, "job %d" % i, in_minutes=60, now=T0)
+        with self.assertRaises(JobLimitReached):
+            self.s.add_job(self.A, "overflow", in_minutes=60, now=T0)
+        # completing a job frees a slot
+        fired = self.s.tick(self.A, T0 + 60)
+        self.assertEqual([j.text for j in fired], ["early job"])
+        self.s.add_job(self.A, "replacement", in_minutes=60, now=T0)
+        with self.assertRaises(JobLimitReached):
+            self.s.add_job(self.A, "overflow 2", in_minutes=60, now=T0)
+        # cancel frees a slot, as the refusal message promises
+        self.s.set_state(self.A, "job 0", "cancelled", now=T0)
+        self.s.add_job(self.A, "replacement 2", in_minutes=60, now=T0)
+        # pause does NOT free a slot - a paused job is still live
+        self.s.set_state(self.A, "job 48", "paused", now=T0)
+        with self.assertRaises(JobLimitReached):
+            self.s.add_job(self.A, "overflow 3", in_minutes=60, now=T0)
