@@ -148,7 +148,7 @@ def parse_window(query, now, tz_offset_minutes=0):
         w0 = day0 - g.tm_wday * DAY
         return (w0 - 7 * DAY + back, w0 + back)
     if re.search(r'\bpast week\b|\bpast 7 days\b', q):
-        return (day0 - 7 * DAY + back, day0 + DAY + back)
+        return (now - 7 * DAY, now)
     if re.search(r'\bthis month\b', q):
         return (_month_edge(g.tm_year, g.tm_mon) + back,
                 _month_edge(g.tm_year + (g.tm_mon == 12), g.tm_mon % 12 + 1) + back)
@@ -158,9 +158,9 @@ def parse_window(query, now, tz_offset_minutes=0):
         return (_month_edge(prev_y, prev_m) + back,
                 _month_edge(g.tm_year, g.tm_mon) + back)
     if re.search(r'\bpast month\b|\bpast 30 days\b', q):
-        return (day0 - 30 * DAY + back, day0 + DAY + back)
+        return (now - 30 * DAY, now)
     if re.search(r'\b(latest|recent|recently|news|breaking|current)\b', q):
-        return (day0 - 7 * DAY + back, day0 + DAY + back)
+        return (now - 7 * DAY, now)
     m = re.search(r'\bin (20\d\d)\b', q)
     if m:
         y = int(m.group(1))
@@ -208,31 +208,28 @@ def _validate_subqueries(subs):
     return out
 
 
+def _norm_words(text):
+    return re.sub(r"\s+", " ",
+                  re.sub(r"[^a-z0-9 ]", " ", (text or "").lower())).strip()
+
+
 def reference_support(claim_text, content):
-    """Deterministic reference support gate (stdlib, source-only).
-    Best sentence-window token overlap must clear MIN_SUPPORT_OVERLAP,
-    every numeric token in the claim must appear in that window, and
-    the window's negation words must exactly equal the claim's - a
-    high-overlap window that adds or drops a negation is a suspected
-    contradiction, not support. Production wiring should inject the
-    existing checked_answer gate via support_fn instead."""
-    ct = set(_tok(claim_text))
-    if not ct:
+    """FAIL-CLOSED quote-evidence gate (stdlib, source-only default).
+    A claim is supported ONLY when its full normalized text appears
+    verbatim (case/punctuation-insensitive, whitespace-folded) in the
+    fetched content - positive quote evidence. Paraphrase, shared-token
+    similarity, numeric coincidence and role reorderings all refuse:
+    "drug cures cancer" vs "drug causes cancer", "revenue 999 million"
+    vs "revenue 10 million ... workforce 999 people", "Alice acquired
+    Beta" vs "Beta acquired Alice". Paraphrase-level support is the
+    production gate's job - wire it via support_fn (checked_answer
+    adapter); anything the default cannot positively quote-verify is
+    dropped, never verified."""
+    claim = _norm_words(claim_text)
+    body = _norm_words(content)
+    if not claim or not body:
         return False
-    cneg = ct & _NEG
-    cnums = set(_NUM.findall(claim_text))
-    for w in re.split(r'(?<=[.!?\n])\s+', content or ""):
-        wt = set(_tok(w))
-        if not wt:
-            continue
-        if len(ct & wt) / float(len(ct)) < MIN_SUPPORT_OVERLAP:
-            continue
-        if (wt & _NEG) != cneg:
-            continue
-        if cnums and not cnums <= set(_NUM.findall(w)):
-            continue
-        return True
-    return False
+    return (" " + claim + " ") in (" " + body + " ")
 
 
 class Plan(object):
