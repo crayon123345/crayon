@@ -313,3 +313,46 @@ class Review5479xxxRegressionTests(unittest.TestCase):
         # snooze already refuses non-active jobs; confirm on done
         with self.assertRaises(ScheduleError):
             self.s.snooze(self.A, "done job", 10, now=T0 + 120)
+
+    def test_cancelled_is_terminal_and_resume_cap_guarded(self):
+        # round-2 review 5479287218: cancel+create+resume bypass
+        for i in range(MAX_JOBS_PER_OWNER):
+            self.s.add_job(self.A, "capjob %02d" % i, in_minutes=60,
+                           now=T0)
+        self.s.set_state(self.A, "capjob 00", "cancelled", now=T0)
+        self.s.add_job(self.A, "cap replacement", in_minutes=60, now=T0)
+        # 50 live again; the cancelled job must be terminal, not resumable
+        for st in ("active", "paused", "cancelled"):
+            with self.assertRaises(ScheduleError):
+                self.s.set_state(self.A, "capjob 00", st, now=T0 + 1)
+        job = [j for j in self.s.store.list(self.A)
+               if j.text == "capjob 00"][0]
+        self.assertEqual(job.state, "cancelled")
+        self.assertEqual(len(self.s.store.list(
+            self.A, states=("active", "paused"))), MAX_JOBS_PER_OWNER)
+        # and it never refires
+        for k in range(20):
+            self.assertNotIn("capjob 00",
+                             [j.text for j in
+                              self.s.tick(self.A, T0 + 3600 + k)])
+
+    def test_cancelled_terminal_even_with_room(self):
+        self.s.add_job(self.A, "dead job", in_minutes=60, now=T0)
+        self.s.set_state(self.A, "dead job", "cancelled", now=T0)
+        for st in ("active", "paused"):
+            with self.assertRaises(ScheduleError):
+                self.s.set_state(self.A, "dead job", st, now=T0 + 1)
+
+    def test_resume_paused_at_full_cap_not_falsely_refused(self):
+        # paused jobs are live: 49 active + 1 paused = cap; resuming the
+        # paused one must succeed (no count change, no bypass)
+        self.s.add_job(self.A, "capjob paused", in_minutes=60, now=T0)
+        for i in range(MAX_JOBS_PER_OWNER - 1):
+            self.s.add_job(self.A, "capjob filler %02d" % i,
+                           in_minutes=60, now=T0)
+        self.s.set_state(self.A, "capjob paused", "paused", now=T0)
+        with self.assertRaises(JobLimitReached):
+            self.s.add_job(self.A, "would be 51st live", in_minutes=60,
+                           now=T0)
+        j = self.s.set_state(self.A, "capjob paused", "active", now=T0)
+        self.assertEqual(j.state, "active")

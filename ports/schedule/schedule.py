@@ -227,10 +227,22 @@ class Schedule:
             raise ScheduleError("state must be pause/resume/cancel")
         now = int(now if now is not None else time.time())
         j = self._match_job(owner, match)
-        if j.state == "done":
+        if j.state in ("done", "cancelled"):
             raise ScheduleError(
-                "reminder already completed - it cannot be "
-                "paused, resumed or cancelled")
+                "reminder already %s - terminal states cannot be "
+                "paused, resumed or cancelled" % j.state)
+        if state == "active" and j.state not in ("active", "paused"):
+            # re-entering live from a NON-live state passes the live cap.
+            # (done/cancelled already refuse above, so this is defense in
+            # depth; a paused job is already live and resume cannot
+            # exceed the cap - refusing it would be a false positive.)
+            live = len(self.store.list(owner, states=("active",
+                                                      "paused")))
+            if live >= MAX_JOBS_PER_OWNER:
+                raise JobLimitReached(
+                    "schedule is full (%d active/paused jobs); cancel "
+                    "some first - this reminder stays %s"
+                    % (MAX_JOBS_PER_OWNER, j.state))
         j.state = state
         j.note(now, {"paused": "paused", "active": "resumed",
                      "cancelled": "cancelled"}[state])
