@@ -157,8 +157,10 @@ async def chat(req: Request):
         return JSONResponse({"error": "bad request"}, status_code=400)
     text = str(body.get("message", "")).strip()
     sid = str(body.get("session_id") or "")[:64] or uuid.uuid4().hex
-    vid0, _nv0 = memory.identity(req)
-    skey = vid0 + ":" + sid  # cache is per-visitor: a sid alone must never cross visitors
+    # Call identity() ONCE and reuse the result: for an unsigned first-time visitor each call
+    # mints a NEW vid, so two calls would diverge (cache key vs retained vid/cookie).
+    vid, new_vid = memory.identity(req)
+    skey = vid + ":" + sid  # cache is per-visitor: a sid alone must never cross visitors
     if not text:
         return JSONResponse({"error": "empty message"}, status_code=400)
     if len(text) > MAX_MSG:
@@ -175,7 +177,6 @@ async def chat(req: Request):
     except Exception:
         mail_on = False
     agent_on = bool(body.get("agent"))
-    vid, new_vid = memory.identity(req)
     hist = sessions.get(skey)
     if hist is None:
         hist = await asyncio.to_thread(memory.load_context, vid)
@@ -183,7 +184,6 @@ async def chat(req: Request):
     sessions.move_to_end(skey)
     while len(sessions) > MAX_SESSIONS:
         sessions.popitem(last=False)
-    assert skey.startswith(vid + ":"), "visitor/session key mismatch"
     asyncio.create_task(asyncio.to_thread(memory.event, vid, "agent" if agent_on else "chat"))
 
     async def gen():
