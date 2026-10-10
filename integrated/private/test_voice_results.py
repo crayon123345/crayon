@@ -1,5 +1,6 @@
 import pytest,types
 from contextlib import nullcontext
+from datetime import datetime,timezone
 import cr_voice_results as R
 import cr_voice_tickets as T
 HEADER='Bearer '+'a'*43
@@ -10,7 +11,7 @@ FINAL={'version':1,'lease_id':LEASE,'request_id':RID,'seq':2,'type':'done','stat
 def setup(monkeypatch):
  monkeypatch.setenv('CRAYON_VOICE_CANONICAL_ENABLED','on');monkeypatch.setenv('CRAYON_WEB_ORIGIN','https://crayon.example')
  monkeypatch.setattr(T,'adapter',lambda h,s:'adapterhash');monkeypatch.setattr(T,'live_session',lambda *a:None);monkeypatch.setattr(R.db,'_conn',lambda:types.SimpleNamespace(transaction=nullcontext));monkeypatch.setattr(R.A,'session',lambda h:{'user_id':17})
- row={'valid':True,'revoked':False,'user_id':17,'request_id':RID,'session_hash':R.A.digest('a'*43),'conversation_id':'c'*43,'origin':'https://crayon.example','last_seq':0,'recovery_events':[],'expires_at':'server-expiry','events':[],'state':'done'}
+ row={'valid':True,'revoked':False,'user_id':17,'request_id':RID,'session_hash':R.A.digest('a'*43),'conversation_id':'c'*43,'origin':'https://crayon.example','last_seq':0,'recovery_events':[],'expires_at':datetime(2026,10,10,tzinfo=timezone.utc),'events':[],'state':'done'}
  calls=[];state={'prior':None}
  def q(sql,p=(),fetch='all'):
   calls.append((sql,p))
@@ -67,7 +68,8 @@ def test_final_component_not_terminal(setup):
  assert not any('INSERT INTO voice_results' in sql or 'INSERT INTO messages' in sql for sql,p in calls)
 def test_recovery_reads_only_current_owner_session_exact_origin(setup):
  _,row,calls,_=setup
- R.recover(HEADER,'https://crayon.example',RID)
+ result=R.recover(HEADER,'https://crayon.example',RID)
+ assert result['expires_at']==1791590400.0 and isinstance(result['expires_at'],float)
  assert not any(sql.startswith(('INSERT','UPDATE','DELETE')) for sql,p in calls)
  assert any(p==(17,R.A.digest('a'*43),RID,'https://crayon.example') for sql,p in calls)
 def test_recovery_expiry_exact_denied(setup):
