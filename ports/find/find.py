@@ -252,12 +252,14 @@ def _gate_tokens(text):
 
 
 def _gate_sent_tokens(content):
-    # sentence boundary = sentence mark + whitespace (or newline); the
-    # decimal exception is ONLY digit.digit with no whitespace, so
-    # "1.5" stays whole while "enrolled 50. Patients were cured" and
-    # "Revenue was 15. Today is Monday" DO split
+    # sentence boundary = sentence mark + optional CLOSING quote or
+    # bracket + whitespace (or newline): 'Revenue was 15." Today...'
+    # and "...cured) Next..." DO split. The decimal exception is ONLY
+    # digit.digit with no whitespace ("1.5" stays whole). Documented
+    # edge: a sentence mark with NO following whitespace ("15.Today")
+    # is not a boundary - fail-closed, not chased (round-6 note).
     raw = (content or "").lower()
-    parts = re.split(r"[.!?;](?=\s)|[\r\n]+", raw)
+    parts = re.split(r"[.!?;]['\u2019\u201d\")\]]*(?=\s)|[\r\n]+", raw)
     return [_gate_tokens(p) for p in parts]
 
 
