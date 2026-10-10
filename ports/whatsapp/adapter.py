@@ -16,7 +16,10 @@ Hard rules encoded:
 """
 import time
 
-MAX_TEST_RECIPIENTS = 5
+# UI-observed dashboard limit for test numbers ("public test numbers" in
+# Meta's troubleshooting doc). NOT pinned in fetchable official docs; keep
+# configurable. Recipient-list BINDING itself is official (131030 docs).
+DEFAULT_MAX_TEST_RECIPIENTS = 5
 WINDOW_SECONDS = 24 * 3600
 
 # code -> (meaning, card-free next step)
@@ -62,10 +65,13 @@ class WhatsAppStagingAdapter:
     """
 
     def __init__(self, transport, phone_number_id, token,
-                 verified_recipients, clock=time.time):
+                 verified_recipients, clock=time.time,
+                 max_recipients=DEFAULT_MAX_TEST_RECIPIENTS):
         recips = set(verified_recipients)
-        if len(recips) > MAX_TEST_RECIPIENTS:
-            raise ValueError("test WABA allows at most 5 verified recipients")
+        if len(recips) > max_recipients:
+            raise ValueError(
+                f"test WABA recipient list exceeds the configured cap "
+                f"({max_recipients}; UI-observed default 5)")
         if not phone_number_id or not token:
             raise ValueError("phone_number_id and token required")
         self._t = transport
