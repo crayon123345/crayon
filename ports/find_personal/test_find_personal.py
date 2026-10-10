@@ -169,6 +169,19 @@ class RoundOneRegressionTests(unittest.TestCase):
         self.assertNotIn("u9", s.records)
         self.assertNotIn("u9", s.seq)
 
+    def test_unhashable_rid_rejects_cleanly(self):
+        # round-6 nit: non-str rid on a POPULATED owner must refuse
+        # with FindPersonalError, never raw TypeError
+        f = make()
+        rid = f.add("u1", "note", "the visa appointment moved", T0)
+        self.assertRaises(FindPersonalError, f.remove, "u1", [])
+        self.assertRaises(FindPersonalError, f.remove, "u1", {})
+        self.assertRaises(FindPersonalError, f.replace, "u1", [],
+                          "note", "text", T0)
+        self.assertRaises(FindPersonalError, f.replace, "u1", None,
+                          "note", "text", T0)
+        self.assertEqual(f.count("u1"), 1)  # record untouched
+
     def test_unhashable_owner_rejects_cleanly(self):
         # round-5 nit: non-str owner raises FindPersonalError on every
         # public method, never a raw TypeError
