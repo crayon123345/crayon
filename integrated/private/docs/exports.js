@@ -26,7 +26,7 @@
     // but PDF text is not selectable in that mode; Word/Markdown retain editable text.
     const unicode=ms.some(m=>/[^\x20-\x7e\n\r\t]/.test(m.text));let y=50,canvas,ctx;
     function fresh(){if(unicode){canvas=document.createElement('canvas');canvas.width=Math.ceil(width*2);canvas.height=Math.ceil(height*2);ctx=canvas.getContext('2d');ctx.scale(2,2);ctx.fillStyle='#fff';ctx.fillRect(0,0,width,height);ctx.fillStyle='#111';}y=50;}
-    function flush(){if(unicode)doc.addImage(canvas.toDataURL('image/png'),'PNG',0,0,width,height);}
+    function flush(){if(unicode)doc.addImage(canvas.toDataURL('image/jpeg',0.92),'JPEG',0,0,width,height);}
     function line(t,bold=false,size=10){if(y+size+5>height-40){flush();doc.addPage();fresh();}if(unicode){ctx.font=(bold?'bold ':'')+size+'px sans-serif';ctx.fillText(t,40,y);}else{doc.setFont('helvetica',bold?'bold':'normal');doc.setFontSize(size);doc.text(t,40,y);}y+=size+4;}
     fresh();line('Crayon chat',true,16);y+=10;
     for(const m of ms){line(m.role+':',true);for(const para of m.text.split('\n')){if(unicode){ctx.font='10px sans-serif';let text='';for(const word of para.match(/\S+\s*/g)||[]){if(ctx.measureText(text+word).width>W&&text){line(text.trimEnd());text='';ctx.font='10px sans-serif';}if(ctx.measureText(word).width>W){const chars=typeof Intl.Segmenter==='function'?[...new Intl.Segmenter(undefined,{granularity:'grapheme'}).segment(word)].map(x=>x.segment):Array.from(word);for(const ch of chars){if(ctx.measureText(text+ch).width>W&&text){line(text);text='';ctx.font='10px sans-serif';}text+=ch;}}else text+=word;}line(text||' ');}else{doc.setFont('helvetica','normal');doc.setFontSize(10);for(const l of doc.splitTextToSize(para||' ',W))line(l);}}y+=10;}
