@@ -65,6 +65,19 @@ no activation. The accepted runtime-contract.md is unchanged.
   replay provider work or effects; resolution only via the authorized
   browser read-only /voice/result within the original 300s TTL.
 
+## Pending joint-interface alignment
+
+Two adapter<->canonical interface points are EXPLICITLY parked pending
+their coordinated canonical + reference + adapter revision; the adapter
+stays strict and must NOT be unilaterally relaxed:
+
+1. lease_id echo: revalidate responses MUST echo lease_id, request_id
+   and expires_at (an omitted lease_id is non-conformant here).
+2. expires_at typing: this adapter requires a NUMERIC (finite)
+   expires_at; their canonical currently emits an ISO STRING. The type
+   will be settled in the same coordinated revision; until then a
+   string expires_at is rejected (bad_binding:expires_at), NOT coerced.
+
 ## Not here (activation gates, per docs/voice/implementation-status.md)
 
 Durable stores, canonical session validation, scoped credential rotation,
