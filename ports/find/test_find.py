@@ -181,6 +181,39 @@ class SupportGateTests(unittest.TestCase):
         self.assertTrue(reference_support(
             "python released version", "page content about python released version"))
 
+    def test_hedged_containment_refused(self):
+        # verbatim containment inside a hedging frame is NOT support
+        self.assertFalse(reference_support(
+            "the drug cures cancer",
+            "Claims that the drug cures cancer are false."))
+
+    def test_hedge_parity_match_supported(self):
+        self.assertTrue(reference_support(
+            "officials deny the rumor",
+            "officials deny the rumor in a statement today."))
+
+    def test_numeric_continuation_refused(self):
+        # the claim truncated a quantity expression mid-way
+        self.assertFalse(reference_support(
+            "revenue was 10 million",
+            "revenue was 10 million dollars lower than expected."))
+
+    def test_min_evidence_refused(self):
+        self.assertFalse(reference_support("yes", "yes it does not"))
+        self.assertFalse(reference_support("the", "the drug cures cancer."))
+        self.assertFalse(reference_support("", "some content here"))
+
+    def test_digit_separator_equivalence(self):
+        # digit-group separators unfold: 1,500 and 1.500 both read 1500
+        self.assertTrue(reference_support(
+            "price 1,500", "the price 1.500 was listed."))
+        self.assertFalse(reference_support(
+            "price 1,500", "the price 2,500 was listed."))
+
+    def test_quote_spanning_sentences_refused(self):
+        self.assertFalse(reference_support(
+            "alpha beta gamma", "alpha beta. gamma arrives."))
+
 
 class VerifyTests(unittest.TestCase):
     def _plan(self, f):
@@ -302,6 +335,26 @@ class VerifyTests(unittest.TestCase):
         self.assertNotEqual(canonical_url("http://a.example/x"),
                             canonical_url("https://a.example/x"))
 
+    def test_query_order_and_blank_flag_equivalence(self):
+        self.assertEqual(canonical_url("https://a.com/x?b=2&a=1"),
+                         canonical_url("https://a.com/x?a=1&b=2"))
+        self.assertEqual(canonical_url("https://a.com/x?id"),
+                         canonical_url("https://a.com/x?id="))
+
+    def test_host_trailing_dot_and_tilde_equivalence(self):
+        self.assertEqual(canonical_url("https://example.com./x"),
+                         canonical_url("https://example.com/x"))
+        self.assertEqual(canonical_url("https://a.com/a%7Eb"),
+                         canonical_url("https://a.com/a~b"))
+
+    def test_stated_equivalence_limits(self):
+        # interior duplicate slashes stay distinct
+        self.assertNotEqual(canonical_url("https://a.com/x//y"),
+                            canonical_url("https://a.com/x/y"))
+        # encoded reserved chars stay encoded
+        self.assertNotEqual(canonical_url("https://a.com/a%2Fb"),
+                            canonical_url("https://a.com/a/b"))
+
 
 class SessionTests(unittest.TestCase):
     def _seed(self, f):
@@ -335,6 +388,13 @@ class SessionTests(unittest.TestCase):
     def test_no_reference_none(self):
         f = make(); self._seed(f)
         self.assertIsNone(f.resolve_reference("u1", "what is the weather"))
+
+    def test_time_words_are_not_ordinals(self):
+        f = make(); self._seed(f)
+        self.assertIsNone(f.resolve_reference("u1", "what happened last week"))
+        self.assertIsNone(f.resolve_reference("u1", "news from last month"))
+        # a real ordinal reference still resolves
+        self.assertEqual(f.resolve_reference("u1", "open the last result")["index"], 2)
 
     def test_session_snapshot_mutation_safe(self):
         f = make(); self._seed(f)

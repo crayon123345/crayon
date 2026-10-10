@@ -24,7 +24,7 @@ ports/find/urlcanon.py (also imported by ports/find_track).
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (49/49 tests) but NOT wired into the
+Complete as a tested module (59/59 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. VERIFIED CITATIONS ONLY: a citation survives only when its URL is
@@ -43,7 +43,17 @@ running app. Named limits, exactly:
    verified across 200 rounds of all three). Paraphrase-level support
    is the production gate's job - wire checked_answer via support_fn;
    anything the default cannot positively quote-verify is dropped,
-   never verified. Genuine quotes still pass (probe: 2/2).
+   never verified. Genuine quotes still pass (probe: 4/4).
+   ROUND-3 HARDENING on top: the quote must be SENTENCE-BOUNDED, carry
+   >= 2 content tokens ("yes"/"the" can never verify, probe: 0/4), the
+   sentence's negation + hedge frame must exactly equal the claim's
+   ("the drug cures cancer" inside "Claims that the drug cures cancer
+   are false." refuses - probes: 0/32 framed cases, 0/400 fuzzed
+   wraps), the span may not end before a unit word ("revenue was 10
+   million" inside "revenue was 10 million dollars lower than
+   expected" refuses - probe: 0/5), and digit-group separators unfold
+   ("price 1,500" == "price 1.500", 3/3; "1,500" vs "2,500" refuses,
+   0/3).
 3. ATOMIC VERIFICATION: verified/dropped/sources/session are computed
    and validated BEFORE any commit; a source-cap violation refuses the
    whole batch leaving prior plan state and the session byte-identical
@@ -63,7 +73,12 @@ running app. Named limits, exactly:
    ports fold; www/fragments/tracking params/trailing slashes strip;
    IPv6 brackets are preserved (https://[::1]:8080/x stays valid);
    malformed ports raise the declared error, never a leaked ValueError
-   (probe: 200/200 recorded bad_url through verify). Redirect/canonical
+   (probe: 200/200 recorded bad_url through verify). ROUND-3:
+   order-insensitive query params, host trailing dots folded,
+   unreserved percent-encodings decoded ("%7E" == "~"), bare flags ==
+   empty-valued flags; STATED LIMITS - encoded reserved chars stay
+   encoded, interior duplicate slashes stay distinct (tested).
+   Redirect/canonical
    equivalence is the integration's to resolve before feeding urls.
 7. OWNER-STRICT SESSIONS: first..tenth/last follow-ups resolve only
    against the owner's own last verified sources; session reads return
