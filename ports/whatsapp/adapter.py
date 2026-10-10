@@ -61,56 +61,78 @@ MAX_FUTURE_SKEW_SECONDS = 300
 
 # Per-CODE failure classification, grounded in the official Cloud API
 # error-codes reference
-# (https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes):
-# codes whose official guidance is "try again later / wait and retry" are
-# RETRYABLE; codes whose guidance is do-not-retry / fix-the-cause-first
-# are DEFINITIVE. A 4xx response is always a definitive RESPONSE (the
-# message certainly did not send); the class says whether re-sending the
-# SAME content is sensible after backoff. Unlisted codes default to
-# DEFINITIVE (fail closed: no retry is ever suggested without support).
+# (https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes,
+# live-checked 2026-10-10). RULE: every code's behavior traces to a quoted
+# reference line; anything unsourceable is UNKNOWN - no retry permitted.
+# A 4xx response is always a definitive RESPONSE (the message certainly
+# did not send); the class governs whether ANY resend is permitted:
+# - retryable: the reference says try-again-later; EXPLICIT retry only
+#   (no automatic retry path exists), after any reference-stated wait.
+# - definitive: the reference says do-not-retry / fix-the-cause; retry=True
+#   is REFUSED (zero transport) - the same content is never resent.
+# - unknown: unlisted or out-of-messaging-scope codes; persisted as its
+#   OWN state (unknown_failure), never collapsed into "failed"; NO retry
+#   permitted, explicit or otherwise.
 RETRYABLE_CODES = frozenset({
-    80007,    # WABA rate limit: "Try again later or reduce..."
-    130429,   # throughput reached: "Try again later..."
-    131048,   # spam-restriction send limit: check quality, limits lift
-    131056,   # pair rate limit: "Wait and retry the operation"
-    131064,   # template-classification limit: "automatically lifted"
-    133016,   # registration attempt limit: "Try again once unblocked"
-    131000,   # unknown error: "Try again. If the error persists..."
+    80007,    # "Try again later or reduce the frequency or amount of API
+              #  queries the app is making."
+    130429,   # "Try again later or reduce the frequency with which the
+              #  app sends messages."
+    131056,   # "Wait and retry the operation, if you intend to send
+              #  messages to the same phone number."
+    131000,   # "Try again. If the error persists, open a Direct Support
+              #  ticket." (diagnostic EXPLICIT retry only, never automatic)
 })
+# Codes the reference allows only AFTER a stated wait: code -> seconds.
+RETRY_AFTER_SECONDS = {
+    131049: 24 * 3600,  # "...wait at least 24 hours before resending the
+                        #  template message. Doing so will only result in
+                        #  another error response..."
+}
 DEFINITIVE_CODES = frozenset({
     100,      # unsupported/misspelled parameters
-    130403,   # business blocked the user: "Do not retry"
+    130403,   # "Do not retry. Unblock the WhatsApp user to resume
+              #  sending messages to them."
     130472,   # marketing experiment exclusion
     131005,   # permission not granted
     131008,   # missing required parameter
     131009,   # invalid parameter value
     131021,   # sender == recipient
     131026,   # undeliverable (not a WhatsApp number etc.)
-    131030,   # recipient not in allowed test list
     131042,   # payment method error
     131045,   # phone number registration error
-    131047,   # outside 24h window: send a template instead
-    131049,   # ecosystem engagement limit: resend "will only result in
-              # another error"
-    131050,   # user opted out of marketing: "Do not retry"
+    131047,   # "Send the recipient a template message instead."
+    131050,   # "Do not retry sending messages to this user as they will
+              #  not be received."
     131051,   # unsupported message type
     132001,   # template does not exist in this language
 })
-# 141006 (business-level send block) and 141010 (business not verified)
-# do NOT appear in the current error-codes reference (live-checked) - the
-# reference gives no do-not-retry line for them, so they are UNKNOWN:
-# no retry permitted. Their card-free guidance below still applies.
+# NOT classified for messaging (treated as unknown-no-retry for sends):
+# - 141006 / 141010: absent from the current error-codes reference.
+# - 131048: reference line ("Check your quality status in the WhatsApp
+#   Manager...") carries NO retry instruction.
+# - 131064: "automatically lifted after the enforcement period" carries
+#   NO retry instruction.
+# - 131030: its quotable source is the CALLING troubleshooting doc -
+#   calling-scope, cannot classify MESSAGING behavior.
+# - 133016: registration/deregistration scope, not messaging.
 
 
 def failure_class(code):
     """'retryable' / 'definitive' / 'unknown' per the official error-codes
-    reference. Unlisted codes are UNKNOWN - no retry permitted (fail
-    closed with an honest label, not an unsupported 'definitive')."""
-    if code in RETRYABLE_CODES:
+    reference. Unlisted or out-of-scope codes are UNKNOWN: no retry
+    permitted (fail closed with an honest label)."""
+    if code in RETRYABLE_CODES or code in RETRY_AFTER_SECONDS:
         return "retryable"
     if code in DEFINITIVE_CODES:
         return "definitive"
     return "unknown"
+
+
+def retry_after_seconds(code):
+    """Reference-stated wait before an explicit retry, else 0."""
+    return RETRY_AFTER_SECONDS.get(code, 0)
+
 
 ERROR_MAP = {
     141006: ("business-level send block (generic payment-method label)",
@@ -276,14 +298,17 @@ class JsonOutboxStore:
         return self._mutate(
             lambda rows: [k for k in rows if k.startswith(prefix)])
 
-    def claim(self, key, record, claimant, allow_retry=False):
+    def claim(self, key, record, claimant, allow_retry=False, now=None):
         """Atomic claim. Content is compared BEFORE any mutation, on every
         path: same key + DIFFERENT content raises StoreConflict with the
         prior record untouched (never overwritten, never a second effect).
-        Returns "claimed_fresh" (no prior), "claimed_retry" (prior failed
-        AND allow_retry; attempts/history carried forward atomically),
-        "failed_blocked" (prior failed, no explicit retry - no mutation),
-        or "held" (same content already claimed/sent/unknown)."""
+        Returns "claimed_fresh"; "claimed_retry" (RETRYABLE-class failed
+        prior + explicit allow_retry + any reference-stated wait elapsed;
+        attempts/history carried forward atomically); "failed_blocked"
+        (retryable prior, no explicit retry); "definitive_blocked"
+        (definitive prior - the reference says do not resend);
+        "unknown_blocked" (unknown_failure prior - never resent); "wait_blocked"
+        (reference-stated wait not yet elapsed); or "held"."""
         def fn(rows):
             prior = rows.get(key)
             if prior is None:
@@ -291,11 +316,18 @@ class JsonOutboxStore:
                 return "claimed_fresh"
             if prior.get("request") != record.get("request"):
                 raise StoreConflict(key)  # compare first: ZERO mutation
+            if prior.get("state") == "unknown_failure":
+                return "unknown_blocked"  # never resent, even explicit
             if prior.get("state") == "failed":
-                if prior.get("failure_class") == "unknown":
-                    return "unknown_blocked"  # never resent, even explicit
+                fclass = prior.get("failure_class")
+                if fclass == "definitive":
+                    return "definitive_blocked"  # reference: do not resend
                 if not allow_retry:
                     return "failed_blocked"
+                wait = prior.get("retry_after_seconds", 0)
+                if wait and now is not None and \
+                        now < prior.get("finished_at", 0) + wait:
+                    return "wait_blocked"  # reference-stated wait not met
                 record["attempts"] = prior.get("attempts", 0) + 1
                 record["history"] = prior.get("history", []) + [{
                     "state": prior.get("state"),
@@ -373,7 +405,7 @@ class MemOutboxStore:
         with self._lk:
             return [k for k in self._rows if k.startswith(prefix)]
 
-    def claim(self, key, record, claimant, allow_retry=False):
+    def claim(self, key, record, claimant, allow_retry=False, now=None):
         with self._lk:
             prior = self._rows.get(key)
             if prior is None:
@@ -381,11 +413,18 @@ class MemOutboxStore:
                 return "claimed_fresh"
             if prior.get("request") != record.get("request"):
                 raise StoreConflict(key)  # compare first: ZERO mutation
+            if prior.get("state") == "unknown_failure":
+                return "unknown_blocked"  # never resent, even explicit
             if prior.get("state") == "failed":
-                if prior.get("failure_class") == "unknown":
-                    return "unknown_blocked"  # never resent, even explicit
+                fclass = prior.get("failure_class")
+                if fclass == "definitive":
+                    return "definitive_blocked"
                 if not allow_retry:
                     return "failed_blocked"
+                wait = prior.get("retry_after_seconds", 0)
+                if wait and now is not None and \
+                        now < prior.get("finished_at", 0) + wait:
+                    return "wait_blocked"
                 record["attempts"] = prior.get("attempts", 0) + 1
                 record["history"] = prior.get("history", []) + [{
                     "state": prior.get("state"),
@@ -705,7 +744,7 @@ class WhatsAppStagingAdapter:
         while time.time() < deadline:
             rec = self._outbox.get(key)
             if rec is not None and rec.get("state") in (
-                    "sent", "failed", "unknown"):
+                    "sent", "failed", "unknown", "unknown_failure"):
                 return rec
             time.sleep(0.005)
         return self._outbox.get(key) or {"state": "in_flight"}
@@ -722,7 +761,8 @@ class WhatsAppStagingAdapter:
                   "claimed_at": self._clock()}
         try:
             result = self._outbox.claim(key, record, self._instance,
-                                        allow_retry=retry)
+                                        allow_retry=retry,
+                                        now=self._clock())
         except StoreConflict:
             raise WhatsAppError(
                 "idempotency_conflict",
@@ -742,6 +782,19 @@ class WhatsAppStagingAdapter:
                 "this key's prior attempt failed; re-sending requires the "
                 "EXPLICIT retry flag (retry=True) so a resend is always a "
                 "deliberate act, with attempts/history preserved")
+        if result == "definitive_blocked":
+            raise WhatsAppError(
+                "definitive_failure_no_retry",
+                "this key's prior failure is DEFINITIVE per the official "
+                "error-codes reference (do-not-retry / fix-the-cause) - "
+                "the same content is NEVER resent; fix the cause and use "
+                "a new idempotency key for changed content")
+        if result == "wait_blocked":
+            raise WhatsAppError(
+                "retry_wait_not_elapsed",
+                "the official reference requires waiting before resending "
+                "this code (e.g. 131049: at least 24 hours) - the wait "
+                "has not elapsed; no resend")
         if result == "held":
             prior = self._outbox.get(key)
             if (prior.get("state") == "claimed"
@@ -810,8 +863,12 @@ class WhatsAppStagingAdapter:
             err = (data or {}).get("error", {})
             code = err.get("code", 0)
             fclass = failure_class(code)
-            record["state"] = "failed"
+            # Unknown-class failures persist as their OWN state
+            # (unknown_failure), never collapsed into "failed".
+            record["state"] = ("unknown_failure" if fclass == "unknown"
+                               else "failed")
             record["failure_class"] = fclass
+            record["retry_after_seconds"] = retry_after_seconds(code)
             record["last_error"] = {"code": code,
                                     "message": err.get("message")}
             record["finished_at"] = self._clock()

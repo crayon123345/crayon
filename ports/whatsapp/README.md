@@ -68,51 +68,53 @@ automation of any personal number, no paid routes.
   failed key requires retry=True - a deliberate act that increments
   attempts and preserves the full prior-attempt history atomically inside
   the claim.
-- PER-CODE FAILURE CLASSIFICATION: 4xx failures are classified by META
-  ERROR CODE (not by status class), grounded in the official Cloud API
-  error-codes reference
+- PER-CODE FAILURE CLASSIFICATION WITH ENFORCEMENT: 4xx failures are
+  classified by META ERROR CODE (not by status class) from the official
+  Cloud API error-codes reference
   (https://developers.facebook.com/documentation/business-messaging/whatsapp/support/error-codes,
-  live-checked 2026-10-10):
-  RETRYABLE - the reference's own line says try-again-later:
+  live-checked 2026-10-10). RULE: every code's behavior traces to a
+  quoted reference line; anything unsourceable is UNKNOWN - no retry
+  permitted. A 4xx is always a definitive RESPONSE (the message
+  certainly did not send); the class governs whether ANY resend is
+  permitted, and the claim path ENFORCES it (zero transport on refusal):
+  RETRYABLE (explicit retry=True only - there is NO automatic retry
+  path; 131000's retry is diagnostic-explicit, never automatic):
   "80007 ... Try again later or reduce the frequency or amount of API
-  queries the app is making."; "130429 ... Try again later or reduce the
-  frequency with which the app sends messages."; "131056 ... Wait and
-  retry the operation, if you intend to send messages to the same phone
-  number."; "131000 Message failed to send due to an unknown error. Try
-  again. If the error persists, open a Direct Support ticket." (also
-  131048/131064/133016, whose limits lift).
-  DEFINITIVE - the reference says do-not-retry or fix-the-cause:
-  "130403 ... Do not retry. Unblock the WhatsApp user to resume sending
-  messages to them."; "131050 ... Do not retry sending messages to this
-  user as they will not be received."; "131047 ... Send the recipient a
-  template message instead."; "131049 ... Doing so will only result in
-  another error response..." (plus parameter/permission/config codes:
-  100, 130472, 131005, 131008, 131009, 131021, 131026, 131030, 131042,
-  131045, 131051, 132001).
-  UNKNOWN - codes the reference does NOT clearly classify: NO RETRY
-  PERMITTED, not even an explicit one (unknown_failure_no_retry); the
-  failure is diagnosed from the actual Meta response before any resend.
-  141006 and 141010 are in this bucket: neither code appears in the
-  current error-codes reference (live-checked 2026-10-10), so the
-  reference supplies no do-not-retry line for them. The card-free
-  141006 guidance above comes from the Cloud API overview "Test
-  resources" section (quoted there), NOT from the error-codes reference.
-  The class is recorded on the outbox record and carried in the error
-  guidance.
-- Durable outbox with ATOMIC CLAIM and ATOMIC PUBLISH: exclusive flock on
-  a sidecar lock file around read-modify-write, write-temp-then-rename
-  with fsync(file)+fsync(dir), reload on every op. FAILS CLOSED
-  (OutboxCorrupt) on unparseable content AND on an existing-but-EMPTY
-  file - an empty store is a crash artifact, never a fresh start, so a
-  crash can never silently reset state into a blind resend. States:
-  claimed -> sent | failed | unknown. A LOST transport response OR a Meta
-  5xx is UNKNOWN (the request may have landed): never blind-retried,
-  resolution via receipts; only 4xx is definitively failed and explicitly
-  re-claimable. A "claimed" record left by ANOTHER adapter instance
-  (crash recovery) is treated as unknown - a new instance never
-  resurrects it into a resend (zero new effects, tested). Same-key
-  concurrent sends within one instance share the claim holder's terminal
-  outcome: exactly one effect, proven by threaded tests.
+  queries the app is making." / "130429 ... Try again later or reduce
+  the frequency with which the app sends messages." / "131056 ... Wait
+  and retry the operation, if you intend to send messages to the same
+  phone number." / "131000 Message failed to send due to an unknown
+  error. Try again. If the error persists, open a Direct Support
+  ticket." / 131049 retryable ONLY after the encoded 24h wait: "If you
+  do receive this error code and suspect it is due to the limit, wait
+  at least 24 hours before resending the template message. Doing so
+  will only result in another error response since the limit may be in
+  effect for differing periods of time." - retry=True inside the wait is
+  refused (retry_wait_not_elapsed, zero transport; enforced by test).
+  DEFINITIVE (retry=True REFUSED - definitive_failure_no_retry, zero
+  transport; the same content is never resent): "130403 ... Do not
+  retry. Unblock the WhatsApp user to resume sending messages to
+  them." / "131050 ... Do not retry sending messages to this user as
+  they will not be received." / "131047 ... Send the recipient a
+  template message instead." (plus parameter/permission/config codes
+  100, 130472, 131005, 131008, 131009, 131021, 131026, 131042, 131045,
+  131051, 132001).
+  UNKNOWN (unlisted or out-of-messaging-scope): persisted as its OWN
+  outbox state unknown_failure - never collapsed into "failed" - and NO
+  retry is permitted, explicit or otherwise (unknown_failure_no_retry,
+  zero transport; diagnose from the actual Meta response first). In
+  this bucket: 141006 and 141010 (absent from the current error-codes
+  reference, live-checked); 131048 (reference line "Check your quality
+  status in the WhatsApp Manager..." carries NO retry instruction);
+  131064 ("...automatically lifted after the enforcement period"
+  carries NO retry instruction); 131030 (its quotable source is the
+  CALLING troubleshooting doc - calling-scope, cannot classify
+  MESSAGING behavior); 133016 (registration/deregistration scope).
+  The class and any reference-stated wait are recorded on the outbox
+  record and carried in the error guidance. The card-free 141006
+  guidance above comes from the Cloud API overview "Test resources"
+  section (quoted there), NOT from the error-codes reference.
+
 - Inbound handling (synthetic): X-Hub-Signature-256 HMAC validation, then
   ALL-OR-NOTHING validation of the WHOLE entry set - resource binding
   (entry WABA id AND metadata phone_number_id) plus per-message shape and
@@ -155,7 +157,7 @@ Activation gates live with the canonical engine.
 
 ## Tests
 
-`pytest ports/whatsapp` - 70 synthetic tests, the review-fix repros
+`pytest ports/whatsapp` - 79 synthetic tests, the review-fix repros
 counting EFFECTS (transport calls), not just state: owner-verified
 recipient binding + cap, window logic, template vs free-form, 141006
 card-free guidance, 131000-as-generic-unknown, signature validation,
@@ -193,5 +195,8 @@ across a fresh instance on the same store file (receipt lookup by wamid,
 still no window). Classification-tightening repros: unknown-class
 (141006/141010/unlisted) failures refuse EVEN an explicit retry
 (unknown_failure_no_retry, zero further effects), and the parametrized
-per-code matrix now asserts retryable/definitive/unknown across 9
-codes.
+per-code matrix now asserts retryable/definitive/unknown across 15
+codes with state separation (unknown_failure is its own persisted
+state). Enforcement repros: 130403 and 131050 refuse retry=True with
+zero new effects; 131049's 24h wait is encoded on the record and
+enforced (refused at +1h, permitted at +24h1s, attempts=2).

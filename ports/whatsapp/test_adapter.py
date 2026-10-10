@@ -531,7 +531,7 @@ def test_5xx_is_unknown_never_blind_retried():
     assert len(m.calls) == 1        # exactly one effect, ever
 
 
-def test_4xx_is_definitive_response_and_explicitly_reclaimable():
+def test_4xx_definitive_failure_refuses_even_explicit_retry():
     m, a = make(fail={ME: 131047})
     with pytest.raises(WhatsAppError) as e:
         a.send_template(ME, "hello_world", idempotency_key="k-4xx")
@@ -539,9 +539,11 @@ def test_4xx_is_definitive_response_and_explicitly_reclaimable():
     rec = a.outbox_record("k-4xx")
     assert rec["state"] == "failed" and rec["failure_class"] == "definitive"
     m.fail.clear()
-    out = a.send_template(ME, "hello_world", idempotency_key="k-4xx",
-                          retry=True)
-    assert out.ok and len(m.calls) == 2   # two EXPLICIT attempts
+    with pytest.raises(WhatsAppError) as e2:
+        a.send_template(ME, "hello_world", idempotency_key="k-4xx",
+                        retry=True)
+    assert e2.value.code == "definitive_failure_no_retry"
+    assert len(m.calls) == 1        # NEVER resent: zero new effects
 
 
 # -- 5: replay dedupe + window state survive restart -------------------------
@@ -705,12 +707,18 @@ def test_failed_key_changed_content_conflict_no_overwrite_no_second_effect():
 # -- 3: per-code classification, not per-class -------------------------------
 
 @pytest.mark.parametrize("code,klass", [
+    (80007, "retryable"),      # "Try again later or reduce..."
     (130429, "retryable"),     # "Try again later" (official guidance)
     (131056, "retryable"),     # "Wait and retry the operation"
     (131000, "retryable"),     # "Try again. If the error persists..."
+    (131049, "retryable"),     # "wait at least 24 hours before resending"
     (131047, "definitive"),    # send a template instead
-    (131030, "definitive"),    # not in allowed list
     (131050, "definitive"),    # "Do not retry"
+    (130403, "definitive"),    # "Do not retry. Unblock the WhatsApp user"
+    (131030, "unknown"),       # calling-doc source: out of messaging scope
+    (133016, "unknown"),       # registration scope: out of messaging scope
+    (131048, "unknown"),       # no retry instruction in the reference
+    (131064, "unknown"),       # no retry instruction in the reference
     (139999, "unknown"),       # unlisted code: unknown, NO retry permitted
     (141006, "unknown"),       # absent from the current error-codes ref
     (141010, "unknown"),       # absent from the current error-codes ref
@@ -720,7 +728,9 @@ def test_failure_classified_per_meta_error_code(code, klass):
     with pytest.raises(WhatsAppError):
         a.send_template(ME, "hello_world", idempotency_key=f"k-{code}")
     rec = a.outbox_record(f"k-{code}")
-    assert rec["state"] == "failed"
+    # unknown persists as its OWN state, never collapsed into "failed"
+    assert rec["state"] == ("unknown_failure" if klass == "unknown"
+                            else "failed")
     assert rec["failure_class"] == klass
     assert len(m.calls) == 1
 
@@ -770,6 +780,7 @@ def test_unknown_class_failure_never_retried_even_explicitly():
     with pytest.raises(WhatsAppError) as e:
         a.send_template(ME, "hello_world", idempotency_key="k-unk")
     assert "UNKNOWN" in e.value.guidance
+    assert a.outbox_record("k-unk")["state"] == "unknown_failure"
     assert a.outbox_record("k-unk")["failure_class"] == "unknown"
     with pytest.raises(WhatsAppError) as e2:
         a.send_template(ME, "hello_world", idempotency_key="k-unk",
@@ -829,3 +840,45 @@ def test_window_never_inherited_across_resources_on_shared_store(tmp_path):
     bodyC, sigC = webhook([msg(mid="wam-resA", ts=1000)],
                           waba="other-waba", pnid="other-phone-id")
     assert len(aB.handle_inbound_webhook(bodyC, sigC)) == 1
+
+
+# -- classifier enforcement (their findings on 87afc1e) ----------------------
+
+@pytest.mark.parametrize("code", [130403, 131050])
+def test_documented_no_retry_codes_refuse_explicit_retry_zero_effects(code):
+    # Their behavioral repro: documented no-retry codes must NOT produce
+    # a second effect even with retry=True.
+    m, a = make(fail={ME: code})
+    with pytest.raises(WhatsAppError):
+        a.send_template(ME, "hello_world", idempotency_key=f"k-nr-{code}")
+    assert a.outbox_record(f"k-nr-{code}")["failure_class"] == "definitive"
+    m.fail.clear()
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world", idempotency_key=f"k-nr-{code}",
+                        retry=True)
+    assert e.value.code == "definitive_failure_no_retry"
+    assert len(m.calls) == 1        # exactly one effect, ever
+
+
+def test_131049_wait_24h_encoded_and_enforced():
+    now = [1000.0]
+    m, a = make(now=now, fail={ME: 131049})
+    with pytest.raises(WhatsAppError):
+        a.send_template(ME, "hello_world", idempotency_key="k-131049")
+    rec = a.outbox_record("k-131049")
+    assert rec["failure_class"] == "retryable"
+    assert rec["retry_after_seconds"] == 24 * 3600
+    m.fail.clear()
+    # inside the reference-stated wait: refused, zero new effects
+    now[0] = 1000.0 + 3600
+    with pytest.raises(WhatsAppError) as e:
+        a.send_template(ME, "hello_world", idempotency_key="k-131049",
+                        retry=True)
+    assert e.value.code == "retry_wait_not_elapsed"
+    assert len(m.calls) == 1
+    # after the wait: the explicit retry is permitted
+    now[0] = 1000.0 + 24 * 3600 + 1
+    out = a.send_template(ME, "hello_world", idempotency_key="k-131049",
+                          retry=True)
+    assert out.ok and len(m.calls) == 2
+    assert a.outbox_record("k-131049")["attempts"] == 2
