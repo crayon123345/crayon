@@ -150,6 +150,17 @@ class RoundOneRegressionTests(unittest.TestCase):
         self.assertRaises(FindPersonalError, f.find, "u1", "visa", T0, limit=1.5)
         self.assertRaises(FindPersonalError, f.find, "u1", "visa", T0, limit=True)
 
+    def test_reads_create_no_state(self):
+        # round-4 nit: find/replace/count on an unknown owner must not
+        # create an empty dict in the store
+        s = MemPersonalStore()
+        f = FindPersonal(s)
+        self.assertEqual(f.find("ghost", "visa", T0), [])
+        self.assertEqual(f.count("ghost"), 0)
+        self.assertRaises(NoRecord, f.replace, "ghost", "rec_t001",
+                          "note", "text", T0)
+        self.assertNotIn("ghost", s.records)
+
     def test_now_validated(self):
         f = make()
         f.add("u1", "note", "the visa appointment moved", T0)

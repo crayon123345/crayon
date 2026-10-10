@@ -203,12 +203,40 @@ class SupportGateTests(unittest.TestCase):
         self.assertFalse(reference_support("the", "the drug cures cancer."))
         self.assertFalse(reference_support("", "some content here"))
 
-    def test_digit_separator_equivalence(self):
-        # digit-group separators unfold: 1,500 and 1.500 both read 1500
-        self.assertTrue(reference_support(
+    def test_numeric_tokens_exact_separators(self):
+        # round-4: NO unfolding - separators are load-bearing
+        self.assertFalse(reference_support(
             "price 1,500", "the price 1.500 was listed."))
         self.assertFalse(reference_support(
+            "price 1.500", "the price 1,500 was listed."))
+        self.assertTrue(reference_support(
+            "price 1,500", "the price 1,500 was listed."))
+        self.assertFalse(reference_support(
             "price 1,500", "the price 2,500 was listed."))
+
+    def test_numeric_tokens_exact_sign(self):
+        self.assertFalse(reference_support(
+            "temperature was 5 degrees", "temperature was -5 degrees overnight."))
+        self.assertFalse(reference_support(
+            "temperature was -5 degrees", "temperature was 5 degrees today."))
+        self.assertTrue(reference_support(
+            "temperature was -5 degrees", "temperature was -5 degrees overnight."))
+
+    def test_numeric_tokens_exact_percent(self):
+        self.assertFalse(reference_support(
+            "the stock rose 5", "the stock rose 5% today."))
+        self.assertFalse(reference_support(
+            "the stock rose 5%", "the stock rose 5 today."))
+        self.assertTrue(reference_support(
+            "the stock rose 5%", "the stock rose 5% today."))
+
+    def test_numeric_tokens_exact_range_vs_decimal(self):
+        self.assertFalse(reference_support(
+            "rates rose 3.5 percent", "rates rose 3-5 percent last year."))
+        self.assertFalse(reference_support(
+            "rates rose 3-5 percent", "rates rose 3.5 percent last year."))
+        self.assertTrue(reference_support(
+            "rates rose 3-5 percent", "rates rose 3-5 percent last year."))
 
     def test_quote_spanning_sentences_refused(self):
         self.assertFalse(reference_support(
