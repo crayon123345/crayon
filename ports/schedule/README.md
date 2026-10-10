@@ -7,7 +7,7 @@ run history. Stands alone.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-This port is complete as a tested module (27/27 tests) but is NOT wired
+This port is complete as a tested module (30/30 tests) but is NOT wired
 into the running app. Named limits, exactly:
 
 1. NOT MOUNTED and NO DELIVERY: this module owns schedule STATE and due
@@ -25,8 +25,12 @@ into the running app. Named limits, exactly:
    compute in the owner's declared IANA timezone (zoneinfo). Names match
    case-insensitively and are stored/rendered in canonical IANA casing;
    invalid calendar dates in absolute commands refuse cleanly.
-   Completed (done) jobs are terminal: pause/resume/cancel refuse, and a
-   completed one-shot can never refire (500-attack probe). Default is
+   Completed (done) AND cancelled jobs are TERMINAL: pause/resume/cancel
+   refuse, a completed one-shot can never refire, and cancelled jobs
+   cannot be resurrected (500-attack + 200-round bypass probes). Any
+   non-live -> active transition passes the live cap, so
+   cancel->create->resume cannot exceed it; resuming a PAUSED job at
+   the cap is allowed (paused is already live - no false refusal). Default is
    UTC and the default is documented to the user in replies. An invalid
    timezone is refused with zero effects.
 5. DEDUPE: add_job with an active/paused job of the same normalized
@@ -55,7 +59,7 @@ into the running app. Named limits, exactly:
 - `quiet hours <start> to <end>` / `quiet hours off` (local hours)
 - `export my reminders` - JSON (crayon-schedule-v1) incl. run history
 
-## Acceptance criteria covered by tests (test_schedule.py, 27 tests)
+## Acceptance criteria covered by tests (test_schedule.py, 30 tests)
 
 - One-shot jobs fire exactly once then complete; interval jobs
   reschedule; no double-fires; paused/cancelled jobs never fire; snooze
