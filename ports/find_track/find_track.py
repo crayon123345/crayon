@@ -92,6 +92,11 @@ def _check_owner(owner):
         raise TrackError("owner required")
 
 
+def _check_tid(tid):
+    if not tid or not isinstance(tid, str):
+        raise TrackError("tid required")
+
+
 def canonical_url(url):
     try:
         return _shared_canonical_url(url, max_url=MAX_URL, error=TrackError)
@@ -133,6 +138,7 @@ class FindTrack(object):
         return self.store.tracks.get(owner) or {}
 
     def _track(self, owner, tid):
+        _check_tid(tid)
         t = self._tracks_read(owner).get(tid)
         if t is None:
             raise NoMatch("no such track")
@@ -159,6 +165,7 @@ class FindTrack(object):
 
     def remove(self, owner, tid):
         _check_owner(owner)
+        _check_tid(tid)
         tracks = self.store.tracks.get(owner)
         if not tracks or tid not in tracks:
             raise NoMatch("no such track")

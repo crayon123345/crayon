@@ -231,6 +231,17 @@ class DiffTests(unittest.TestCase):
         self.assertRaises(NoMatch, f.rebase, "ghost", "trk_t001", [item(1)], T0)
         self.assertNotIn("ghost", s.tracks)
 
+    def test_unhashable_tid_rejects_cleanly(self):
+        # round-6 nit: non-str tid must refuse with TrackError, never
+        # raw TypeError, on run/rebase/remove
+        f = make()
+        tid = f.add("u1", "t", T0)
+        self.assertRaises(TrackError, f.run, "u1", [], [], T0)
+        self.assertRaises(TrackError, f.run, "u1", {}, [], T0)
+        self.assertRaises(TrackError, f.rebase, "u1", [], [item(1)], T0)
+        self.assertRaises(TrackError, f.remove, "u1", [])
+        self.assertEqual(len(f.list("u1")), 1)  # track untouched
+
     def test_unhashable_owner_rejects_cleanly(self):
         f = make()
         self.assertRaises(TrackError, f.list, ["u"])

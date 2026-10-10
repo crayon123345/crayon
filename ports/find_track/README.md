@@ -20,7 +20,7 @@ genuinely fresh URL produces one).
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (35/35 tests) but NOT wired into the
+Complete as a tested module (36/36 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. DIFF FACTS ONLY: run() returns {"tid", "topic", "new": [...]} or
