@@ -5,7 +5,7 @@ Joint AI chatbot project by Uttiya Biswas and Pratham Prateek Mohanty.
 ## Repository layout
 
 - `crayon-web/` - Uttiya's Crayon-Web source (live at https://crayon-web.onrender.com)
-- `crayon-pratham/` - Pratham's source (import pending)
+- `crayon-pratham/` - Pratham's source (imported, full history)
 
 Root stays clean: this README and shared docs only. All app code lives in folders.
 
