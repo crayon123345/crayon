@@ -151,3 +151,6 @@ footer{padding:6px 18px calc(12px + env(safe-area-inset-bottom));background:line
 #exportmenu button:hover{background:#2a2730}
 /* Isolated Studio: fit review controls and composer on small screens. */
 @media(max-width:540px){#input{font-size:15px;min-width:0}#focus{width:62px}#form{gap:6px}.hright .ghost{padding:8px 10px}}
+
+/* Keep mobile text entry full width instead of sharing one line with toolbar. */
+@media(max-width:480px){#form{display:grid;grid-template-columns:38px 38px 64px minmax(0,1fr) 38px;border-radius:20px;align-items:center}#input{grid-column:1/-1;grid-row:1;box-sizing:border-box;width:100%;min-height:54px}#attach{grid-column:1;grid-row:2}#agentbtn{grid-column:2;grid-row:2}#focus{grid-column:3;grid-row:2;width:64px}#send{grid-column:5;grid-row:2}}

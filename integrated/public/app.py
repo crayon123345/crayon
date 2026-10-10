@@ -540,6 +540,8 @@ async def stock(req: Request, sym: str = ""):
 
 @app.get("/api/image")
 async def image(req: Request, prompt: str = ""):
+    if os.environ.get("CRAYON_INTEGRATED") == "on":
+        return JSONResponse({"error": "Image generation parked pending verified free provider."}, status_code=503)
     prompt = prompt.strip()[:400]
     if not prompt:
         return JSONResponse({"error": "empty prompt"}, status_code=400)
