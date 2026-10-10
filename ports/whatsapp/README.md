@@ -139,6 +139,13 @@ automation of any personal number, no paid routes.
   inbound only ever extends a window forward - it can never regress or
   close a newer open window (tested at T vs T-1h, and against clock
   skew).
+- RESOURCE-PARTITIONED STATE: all dedupe marks and windows are namespaced
+  by the exact resource (WABA id + phone number id). Two adapters sharing
+  ONE store file never inherit each other's windows or dedupe marks -
+  a window opened under resource A never authorizes a send under
+  resource B (tested: cross-resource in_window false, free-form refused
+  with zero transport, same message id delivered independently per
+  resource).
 
 ## Not here
 
@@ -148,7 +155,7 @@ Activation gates live with the canonical engine.
 
 ## Tests
 
-`pytest ports/whatsapp` - 69 synthetic tests, the review-fix repros
+`pytest ports/whatsapp` - 70 synthetic tests, the review-fix repros
 counting EFFECTS (transport calls), not just state: owner-verified
 recipient binding + cap, window logic, template vs free-form, 141006
 card-free guidance, 131000-as-generic-unknown, signature validation,

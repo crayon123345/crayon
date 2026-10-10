@@ -795,3 +795,37 @@ def test_status_receipts_durable_across_restart(tmp_path):
     assert a2.receipt("wamid.durable")["status"] == "read"
     assert len(a2.statuses) == 1
     assert not a2.in_window(ME)           # receipts still open nothing
+
+
+# -- cross-resource isolation: windows/dedupe never leak across resources ----
+
+def test_window_never_inherited_across_resources_on_shared_store(tmp_path):
+    # Their probe: two resources sharing ONE store file - a window opened
+    # under resource A must not apply to resource B.
+    path = str(tmp_path / "shared.json")
+    now = [1000.0]
+    storeA = JsonOutboxStore(path)
+    storeB = JsonOutboxStore(path)
+    mA, aA = make(now=now, store=storeA)
+    mB = FakeMeta()
+    aB = WhatsAppStagingAdapter(
+        mB, "other-phone-id", "t", [RecipientBinding(ME, "other-phone-id", True)],
+        clock=lambda: now[0], app_secret=SECRET, canonical_grant=grant_fn,
+        waba_id="other-waba", owner=OWNER, outbox_store=storeB)
+    body, sig = webhook([msg(mid="wam-resA", ts=1000)])  # resource A webhook
+    assert len(aA.handle_inbound_webhook(body, sig)) == 1
+    assert aA.in_window(ME) is True
+    assert aB.in_window(ME) is False          # NO inheritance
+    with pytest.raises(WhatsAppError) as e:
+        aB.send_text(ME, "hello")             # free-form refused under B
+    assert e.value.code == 131047
+    assert len(mB.calls) == 0                 # zero effects under B
+    # and B's own inbound opens ONLY B's window
+    bodyB, sigB = webhook([msg(mid="wam-resB", ts=1000)],
+                          waba="other-waba", pnid="other-phone-id")
+    assert len(aB.handle_inbound_webhook(bodyB, sigB)) == 1
+    assert aB.in_window(ME) is True and aA.in_window(ME) is True
+    # dedupe is per-resource too: the same id replayed to B is NOT dropped
+    bodyC, sigC = webhook([msg(mid="wam-resA", ts=1000)],
+                          waba="other-waba", pnid="other-phone-id")
+    assert len(aB.handle_inbound_webhook(bodyC, sigC)) == 1

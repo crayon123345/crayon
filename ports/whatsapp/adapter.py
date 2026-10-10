@@ -318,27 +318,30 @@ class JsonOutboxStore:
         self._mutate(fn)
 
     def apply_inbound(self, messages, statuses, now, window_senders,
-                      horizon):
+                      horizon, ns):
         """ONE atomic op for a whole webhook entry set: dedupe marks,
         monotonic window extends, durable receipts, and horizon pruning
-        all commit together or not at all. Returns the accepted
-        (non-duplicate) messages."""
+        all commit together or not at all. All state is namespaced by ns
+        (resource: WABA+phone id) - a window or dedupe mark under one
+        resource NEVER applies to another, even on a shared store file.
+        Returns the accepted (non-duplicate) messages."""
+        seen_p, win_p, rcpt_p = (f"seen:{ns}:", f"win:{ns}:", "rcpt:")
         def fn(rows):
             # prune dedupe + receipt horizon inside the same transaction
             for k in [k for k in rows
-                      if k.startswith(("seen:", "rcpt:"))
+                      if k.startswith((seen_p, rcpt_p))
                       and now - (rows[k] or {}).get("ts", 0) >= horizon]:
                 del rows[k]
             accepted = []
             for m in messages:
-                k = "seen:" + m["id"]
+                k = seen_p + m["id"]
                 if k in rows:
                     continue  # duplicate delivery: idempotent
                 rows[k] = {"ts": now}
                 sender = m.get("from", "")
                 if sender in window_senders:
                     ts = int(float(str(m["timestamp"])))
-                    wk = "win:" + sender
+                    wk = win_p + sender
                     prior = rows.get(wk)
                     if prior is None or ts > prior.get("ts", 0):
                         rows[wk] = {"ts": ts}  # monotonic: forward only
@@ -346,7 +349,7 @@ class JsonOutboxStore:
             for st in statuses:
                 sid = st.get("id")
                 if sid:
-                    rows["rcpt:" + sid] = {"ts": now, "status": st}
+                    rows[rcpt_p + sid] = {"ts": now, "status": st}
             return accepted
         return self._mutate(fn)
 
@@ -402,22 +405,23 @@ class MemOutboxStore:
             self._rows.pop(key, None)
 
     def apply_inbound(self, messages, statuses, now, window_senders,
-                      horizon):
+                      horizon, ns):
+        seen_p, win_p, rcpt_p = (f"seen:{ns}:", f"win:{ns}:", "rcpt:")
         with self._lk:
             for k in [k for k in self._rows
-                      if k.startswith(("seen:", "rcpt:"))
+                      if k.startswith((seen_p, rcpt_p))
                       and now - (self._rows[k] or {}).get("ts", 0) >= horizon]:
                 del self._rows[k]
             accepted = []
             for m in messages:
-                k = "seen:" + m["id"]
+                k = seen_p + m["id"]
                 if k in self._rows:
                     continue
                 self._rows[k] = {"ts": now}
                 sender = m.get("from", "")
                 if sender in window_senders:
                     ts = int(float(str(m["timestamp"])))
-                    wk = "win:" + sender
+                    wk = win_p + sender
                     prior = self._rows.get(wk)
                     if prior is None or ts > prior.get("ts", 0):
                         self._rows[wk] = {"ts": ts}
@@ -425,7 +429,7 @@ class MemOutboxStore:
             for st in statuses:
                 sid = st.get("id")
                 if sid:
-                    self._rows["rcpt:" + sid] = {"ts": now, "status": st}
+                    self._rows[rcpt_p + sid] = {"ts": now, "status": st}
             return accepted
 
     def receipt(self, wamid):
@@ -508,9 +512,16 @@ class WhatsAppStagingAdapter:
     def resource(self):
         return f"whatsapp:waba:{self._waba_id}:phone:{self._pnid}"
 
+    @property
+    def _ns(self):
+        """Store namespace for replay/window state: the exact resource.
+        Two adapters sharing one store file NEVER share windows or dedupe
+        marks across resources (cross-resource leak closed)."""
+        return f"{self._waba_id}:{self._pnid}"
+
     # -- durable replay/window state ---------------------------------------
     def _window_get(self, sender):
-        rec = self._outbox.get(f"win:{sender}")
+        rec = self._outbox.get(f"win:{self._ns}:{sender}")
         return rec.get("ts") if rec else None
 
     def _window_extend(self, sender, ts):
@@ -518,7 +529,7 @@ class WhatsAppStagingAdapter:
         inbound never regresses or closes a newer open window."""
         prior = self._window_get(sender)
         if prior is None or ts > prior:
-            self._outbox.put(f"win:{sender}", {"ts": ts})
+            self._outbox.put(f"win:{self._ns}:{sender}", {"ts": ts})
 
     # -- inbound ----------------------------------------------------------
     def handle_inbound_webhook(self, raw_body, signature_header):
@@ -575,7 +586,7 @@ class WhatsAppStagingAdapter:
                         or []]
         accepted = self._outbox.apply_inbound(
             all_msgs, all_statuses, now, set(self._bindings),
-            RETRY_HORIZON_SECONDS)
+            RETRY_HORIZON_SECONDS, self._ns)
         out = []
         for m in accepted:
             ts = int(float(str(m["timestamp"])))
