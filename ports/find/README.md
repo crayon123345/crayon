@@ -24,7 +24,7 @@ ports/find/urlcanon.py (also imported by ports/find_track).
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (59/59 tests) but NOT wired into the
+Complete as a tested module (62/62 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. VERIFIED CITATIONS ONLY: a citation survives only when its URL is
@@ -43,17 +43,21 @@ running app. Named limits, exactly:
    verified across 200 rounds of all three). Paraphrase-level support
    is the production gate's job - wire checked_answer via support_fn;
    anything the default cannot positively quote-verify is dropped,
-   never verified. Genuine quotes still pass (probe: 4/4).
-   ROUND-3 HARDENING on top: the quote must be SENTENCE-BOUNDED, carry
-   >= 2 content tokens ("yes"/"the" can never verify, probe: 0/4), the
-   sentence's negation + hedge frame must exactly equal the claim's
-   ("the drug cures cancer" inside "Claims that the drug cures cancer
-   are false." refuses - probes: 0/32 framed cases, 0/400 fuzzed
-   wraps), the span may not end before a unit word ("revenue was 10
-   million" inside "revenue was 10 million dollars lower than
-   expected" refuses - probe: 0/5), and digit-group separators unfold
-   ("price 1,500" == "price 1.500", 3/3; "1,500" vs "2,500" refuses,
-   0/3).
+   never verified. Genuine quotes still pass (probe: 5/5).
+   ROUND-3/4 HARDENING on top: the quote must be SENTENCE-BOUNDED,
+   carry >= 2 content tokens ("yes"/"the" can never verify, probe:
+   0/4), the sentence's negation + hedge frame must exactly equal the
+   claim's ("the drug cures cancer" inside "Claims that the drug cures
+   cancer are false." refuses - probes: 0/32 framed cases, 0/400
+   fuzzed wraps, doubt/dispute frames included 0/10), the span may not
+   end before a unit word ("revenue was 10 million" inside "revenue
+   was 10 million dollars lower than expected" refuses - probe: 0/5),
+   and NUMERIC TOKENS ARE EXACT (round-4: NO unfolding - sign, % and
+   separators are load-bearing: "1,500" != "1.500", "5" != "-5" !=
+   "5%", "3.5" != "3-5"; probes: 0/8 reviewer counterexamples, 0/300
+   mutated-numeric fuzz; exact matches verify 5/5). DOCUMENTED GAP:
+   framing beyond the hedge list is not caught - the default is not
+   general semantic proof; production wires support_fn.
 3. ATOMIC VERIFICATION: verified/dropped/sources/session are computed
    and validated BEFORE any commit; a source-cap violation refuses the
    whole batch leaving prior plan state and the session byte-identical

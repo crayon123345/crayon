@@ -28,12 +28,15 @@ Design invariants:
    supports the claim. Unfetchable or unsupported citations are DROPPED
    and recorded - never presented.
 2. FAIL-CLOSED QUOTE EVIDENCE: the reference gate supports a claim
-   only on verbatim, sentence-bounded quote evidence with digit-group
-   normalization, a minimum evidence length, negation/hedge parity and
-   a numeric-continuation guard - "the drug cures cancer" inside
-   "Claims that the drug cures cancer are false." and "revenue was 10
-   million" inside "revenue was 10 million dollars lower than expected"
-   both refuse. Paraphrase is the production gate's job (support_fn).
+   only on verbatim, sentence-bounded quote evidence with EXACT numeric
+   tokens (sign, %, and separators are load-bearing: "1,500" !=
+   "1.500", "5" != "-5" != "5%", "3.5" != "3-5"), a minimum evidence
+   length, negation/hedge parity and a numeric-continuation guard -
+   "the drug cures cancer" inside "Claims that the drug cures cancer
+   are false." and "revenue was 10 million" inside "revenue was 10
+   million dollars lower than expected" both refuse. Paraphrase and
+   general semantic proof (doubt/dispute/contradiction framing beyond
+   the hedge list) are the production gate's job (support_fn).
 3. UNKNOWN REFUSES WITHOUT RETRY: a fetch error drops that citation;
    the module never retries, never substitutes a different URL.
 4. ATOMIC VERIFICATION: all derived state (verified, dropped, sources
@@ -106,7 +109,9 @@ _HEDGE = frozenset(
     "claim claims claimed claiming allege alleges alleged allegedly "
     "rumor rumors rumored rumoured myth myths hoax false deny denies "
     "denied debunk debunks debunked supposedly purportedly purported "
-    "fake fabricated fabrication unfounded".split())
+    "fake fabricated fabrication unfounded doubt doubts doubted "
+    "doubtful dispute disputes disputed disputable contradict "
+    "contradicts contradicted contradictory".split())
 
 # apostrophe stems: normalization strips the apostrophe, so "doesn't"
 # reads as "doesn t" - match the stems
@@ -232,33 +237,34 @@ def _validate_subqueries(subs):
     return out
 
 
-def _unfold_numbers(text):
-    # digit-group separators unfold: 1,500 and 1.500 both read as 1500;
-    # "1.5" is not a 3-digit group and stays a decimal
-    prev = None
-    while prev != text:
-        prev = text
-        text = re.sub(r"(\d)[,.](\d{3})(?!\d)", r"\1\2", text)
-    return text
+# Numeric tokens are exact: sign, % and separator characters are
+# load-bearing, so "1,500" != "1.500", "5" != "-5" != "5%", "3.5" !=
+# "3-5". Anything else tokenizes as lowercase alphanumerics.
+_TOKEN = re.compile(r"-?\d+(?:[.,/\-]\d+)*%?|[a-z0-9]+")
 
 
-def _gate_norm(text):
-    return re.sub(r"\s+", " ",
-                  re.sub(r"[^a-z0-9 ]", " ",
-                         _unfold_numbers((text or "").lower()))).strip()
+def _gate_tokens(text):
+    return _TOKEN.findall((text or "").lower())
 
 
-def _gate_sentences(content):
-    return re.split(r"[.!?;\r\n]+", _unfold_numbers((content or "").lower()))
+def _gate_sent_tokens(content):
+    # sentence split that never breaks inside a numeric token: a
+    # sentence mark preceded by a digit is a decimal/separator, not a
+    # boundary ("1.500 was listed." splits only after "listed")
+    raw = (content or "").lower()
+    parts = re.split(r"(?<!\d)[.!?;](?=\s|$)|[\r\n]+", raw)
+    return [_gate_tokens(p) for p in parts]
 
 
 def reference_support(claim_text, content):
     """FAIL-CLOSED quote-evidence gate (stdlib, source-only default).
     A claim is supported ONLY on positive quote evidence surviving ALL
     guards:
-    - SENTENCE-BOUNDED: the full normalized claim appears verbatim
-      inside ONE content sentence (number separators unfolded:
-      "1,500" and "1.500" both read as 1500);
+    - SENTENCE-BOUNDED: the claim's exact token sequence appears
+      inside ONE content sentence;
+    - EXACT NUMERICS: numeric tokens compare exactly, sign, % and
+      separators included - "1,500" != "1.500", "5" != "-5" != "5%",
+      "3.5" != "3-5" (round-4: NO unfolding anywhere);
     - MINIMUM EVIDENCE: the claim carries >= MIN_EVIDENCE_TOKENS
       content tokens - "yes" or "the" can never verify;
     - NEGATION/HEDGE PARITY: the sentence's negation + hedge frame
@@ -267,32 +273,29 @@ def reference_support(claim_text, content):
     - NUMERIC CONTEXT: the claim span may not end right before a unit
       word - "revenue was 10 million" refuses inside "revenue was 10
       million dollars lower than expected".
-    Paraphrase, shared tokens, numeric coincidence and role reorderings
-    all refuse. Anything subtler is the production gate's job: wire it
-    via support_fn (checked_answer adapter); whatever the default
-    cannot positively quote-verify is DROPPED, never verified."""
-    claim = _gate_norm(claim_text)
+    Paraphrase, shared tokens and role reorderings all refuse; doubt/
+    dispute/contradiction framing beyond the hedge list is a DOCUMENTED
+    gap - the default is not general semantic proof. Anything subtler
+    is the production gate's job: wire it via support_fn
+    (checked_answer adapter); whatever the default cannot positively
+    quote-verify is DROPPED, never verified."""
+    claim = _gate_tokens(claim_text)
     if not claim or not isinstance(content, str) or not content.strip():
         return False
     if len(_tok(claim_text)) < MIN_EVIDENCE_TOKENS:
         return False
-    claim_words = claim.split()
-    claim_marks = set(claim_words) & (_NEG | _NEG_STEMS | _HEDGE)
-    pat = " " + claim + " "
-    for sent in _gate_sentences(content):
-        norm = _gate_norm(sent)
-        if not norm:
+    claim_marks = set(claim) & (_NEG | _NEG_STEMS | _HEDGE)
+    n = len(claim)
+    for words in _gate_sent_tokens(content):
+        if not words:
             continue
-        words = norm.split()
         if set(words) & (_NEG | _NEG_STEMS | _HEDGE) != claim_marks:
             continue
-        padded = " " + norm + " "
-        pos = padded.find(pat)
-        while pos >= 0:
-            end_w = padded[:pos].count(" ") + len(claim_words)
-            if end_w >= len(words) or words[end_w] not in _UNIT_CONT:
-                return True
-            pos = padded.find(pat, pos + 1)
+        for i in range(0, len(words) - n + 1):
+            if words[i:i + n] == claim:
+                end = i + n
+                if end >= len(words) or words[end] not in _UNIT_CONT:
+                    return True
     return False
 
 
