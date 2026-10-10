@@ -148,6 +148,52 @@ class RunTests(unittest.TestCase):
         self.assertEqual(a.list("u1"), b.list("u1"))
 
 
+class RoundOneRegressionTests(unittest.TestCase):
+    def test_remove_add_never_reuses_ids(self):
+        f = make()
+        t1 = f.add("u1", "one", T0)
+        t2 = f.add("u1", "two", T0)
+        f.remove("u1", t1)
+        t3 = f.add("u1", "three", T0)
+        self.assertNotIn(t3, (t1, t2))
+        self.assertEqual([x["tid"] for x in f.list("u1")], [t2, t3])
+
+    def test_injected_collision_refused_no_loss(self):
+        f = FindTrack(MemTrackStore(), id_factory=lambda p, s, n: "fixed")
+        f.add("u1", "first", T0)
+        self.assertRaises(TrackError, f.add, "u1", "second", T0)
+        self.assertEqual([x["topic"] for x in f.list("u1")], ["first"])
+
+    def test_caller_mutation_cannot_corrupt_card(self):
+        f = make()
+        tid = f.add("u1", "t", T0)
+        card = f.run("u1", tid, [item(1)], T0)
+        card["items"].clear()
+        card["state"] = "dismissed"
+        stored = f.card("u1", tid)
+        self.assertEqual(stored["state"], "open")
+        self.assertEqual(len(stored["items"]), 1)
+        stored["items"].clear()
+        self.assertEqual(len(f.card("u1", tid)["items"]), 1)
+
+    def test_items_carry_first_seen(self):
+        f = make()
+        tid = f.add("u1", "t", T0)
+        f.run("u1", tid, [item(1)], T0 + HOUR)
+        card = f.run("u1", tid, [item(1), item(2)], T0 + 2 * HOUR)
+        self.assertEqual(card["items"][0]["first_seen"], T0 + HOUR)
+        self.assertEqual(card["items"][1]["first_seen"], T0 + 2 * HOUR)
+
+    def test_scheme_port_are_identity(self):
+        f = make()
+        tid = f.add("u1", "t", T0)
+        f.run("u1", tid, [{"url": "http://a.example:8080/x"}], T0)
+        # same path on a different scheme+port is a NEW item, not a repeat
+        card = f.run("u1", tid, [{"url": "https://a.example:9090/x"}], T0 + HOUR)
+        self.assertIsNotNone(card)
+        self.assertEqual(len(card["items"]), 2)
+
+
 class OwnerStrictTests(unittest.TestCase):
     def test_second_owner_isolated(self):
         f = make()

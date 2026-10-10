@@ -34,8 +34,15 @@ Design invariants:
    owns scheduling, searching and rendering.
 """
 
+import os
 import re
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+import sys
+
+# Shared URL identity: the corrected canonicalizer lives in
+# ports/find/urlcanon.py (single source for both find ports).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "find"))
+from urlcanon import canonical_url as _shared_canonical_url, UrlCanonError
 
 MAX_TRACKS = 25
 MAX_TOPIC = 200
@@ -43,9 +50,6 @@ MAX_ITEMS = 10       # evidence items per card
 MAX_RUN_ITEMS = 50   # result-set size per run
 MAX_URL = 500
 MAX_TITLE = 200
-
-_TRACKING_PARAMS = re.compile(r'(?i)^(utm_|fbclid|gclid|mc_|ref$|ref_)')
-
 
 class TrackError(Exception):
     pass
@@ -64,17 +68,10 @@ class NoMatch(TrackError):
 
 
 def canonical_url(url):
-    if not isinstance(url, str) or not url or len(url) > MAX_URL:
-        raise TrackError("url missing or over %d chars" % MAX_URL)
-    p = urlparse(url.strip())
-    if p.scheme not in ("http", "https") or not p.hostname:
-        raise TrackError("url must be absolute http(s)")
-    host = p.hostname.lower()
-    if host.startswith("www."):
-        host = host[4:]
-    q = urlencode([(k, v) for k, v in parse_qsl(p.query)
-                   if not _TRACKING_PARAMS.match(k)])
-    return urlunparse(("https", host, p.path.rstrip("/"), "", q, ""))
+    try:
+        return _shared_canonical_url(url, max_url=MAX_URL, error=TrackError)
+    except UrlCanonError as e:
+        raise TrackError(str(e))
 
 
 class Track(object):
@@ -95,6 +92,7 @@ class Track(object):
 class MemTrackStore(object):
     def __init__(self):
         self.tracks = {}  # owner -> {tid: Track}
+        self.seq = {}     # owner -> monotonic id sequence (never reused)
 
 
 class FindTrack(object):
@@ -121,7 +119,11 @@ class FindTrack(object):
         tracks = self._tracks(owner)
         if len(tracks) >= MAX_TRACKS:
             raise TrackLimitReached("track cap %d reached" % MAX_TRACKS)
-        tid = self.id_factory("trk", len(tracks) + 1, now)
+        seq = self.store.seq[owner] = self.store.seq.get(owner, 0) + 1
+        tid = self.id_factory("trk", seq, now)
+        if tid in tracks:
+            self.store.seq[owner] -= 1  # nothing consumed on refusal
+            raise TrackError("track id collision: %s" % tid)
         tracks[tid] = Track(tid, owner, topic.strip(), now)
         return tid
 
@@ -167,13 +169,15 @@ class FindTrack(object):
         t.last_run_at = now
         if not new:
             return None
+        for it in new:
+            it["first_seen"] = now
         if t.card is None or t.card["state"] == "dismissed":
             t.card = {"state": "open", "items": list(new),
                       "updated_at": now, "raised_at": now}
         else:
             t.card["items"].extend(new)
             t.card["updated_at"] = now
-        return t.card
+        return self._card_snapshot(t.card)
 
     def dismiss(self, owner, tid, now):
         t = self._track(owner, tid)
@@ -182,9 +186,17 @@ class FindTrack(object):
         t.card["state"] = "dismissed"
         t.dismissed_at = now
 
+    @staticmethod
+    def _card_snapshot(card):
+        if card is None:
+            return None
+        snap = dict(card)
+        snap["items"] = [dict(it) for it in card["items"]]
+        return snap
+
     def card(self, owner, tid):
         t = self._track(owner, tid)
-        return dict(t.card) if t.card else None
+        return self._card_snapshot(t.card)
 
     def list(self, owner):
         return [{"tid": t.tid, "topic": t.topic, "created_at": t.created_at,
