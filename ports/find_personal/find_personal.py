@@ -60,6 +60,11 @@ def _check_owner(owner):
         raise FindPersonalError("owner required")
 
 
+def _check_rid(rid):
+    if not rid or not isinstance(rid, str):
+        raise FindPersonalError("rid required")
+
+
 def _tok(text):
     return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
             if w not in _STOP and len(w) > 1]
@@ -205,6 +210,7 @@ class FindPersonal(object):
         """Delete one record by id (source-forget propagation).
         Returns True when a record was removed, False when absent."""
         _check_owner(owner)
+        _check_rid(rid)
         recs = self.store.records.get(owner)
         if not recs or rid not in recs:
             return False
@@ -218,6 +224,7 @@ class FindPersonal(object):
         preserved untouched. Returns True. Raises NoRecord when rid is
         absent - use add() for new records."""
         _check_owner(owner)
+        _check_rid(rid)
         recs = self._records_read(owner)
         if rid not in recs:
             raise NoRecord("no such record")

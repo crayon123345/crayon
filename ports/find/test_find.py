@@ -259,6 +259,19 @@ class SupportGateTests(unittest.TestCase):
         self.assertFalse(reference_support(
             "revenue was 15 today", "Revenue was 15. Today is Monday."))
 
+    def test_splitter_closing_quotes_and_brackets(self):
+        # round-6: closing quote/bracket between the sentence mark and
+        # whitespace does NOT hide the boundary
+        for closer in ('"', "\u201D", "'", "]", ")"):
+            self.assertFalse(reference_support(
+                "revenue was 15 today",
+                "Revenue was 15.%s Today is Monday." % closer),
+                "closer %r" % closer)
+        # supported claim inside a quoted sentence still verifies
+        self.assertTrue(reference_support(
+            "the trial enrolled 50",
+            'The trial enrolled 50." Officials confirmed.'))
+
     def test_splitter_decimal_exception(self):
         # digit.digit with no whitespace is a decimal, not a boundary
         self.assertTrue(reference_support(
