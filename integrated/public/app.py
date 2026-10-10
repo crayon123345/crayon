@@ -13,6 +13,8 @@ import memory
 import telegram_bot
 import discord_bot
 import twilio_wa
+import d360_wa
+import voice
 
 BASE = Path(__file__).parent
 MAX_MSG = 9000
@@ -37,6 +39,11 @@ if os.environ.get('CRAYON_INTEGRATED')!='on':
 if os.environ.get('CRAYON_INTEGRATED')!='on':
     app.include_router(keystore.router)
 app.include_router(memory.router)
+# Raw standalone transport/voice adapters stay unavailable in integrated mode.
+if os.environ.get('CRAYON_INTEGRATED')!='on':
+    app.include_router(d360_wa.router)
+if os.environ.get('CRAYON_INTEGRATED')!='on':
+    app.include_router(voice.router)
 if os.environ.get('CRAYON_INTEGRATED')!='on':
     app.include_router(telegram_bot.router)
 if os.environ.get('CRAYON_INTEGRATED')!='on':
@@ -161,6 +168,10 @@ async def chat(req: Request):
         return JSONResponse({"error": "bad request"}, status_code=400)
     text = str(body.get("message", "")).strip()
     sid = str(body.get("session_id") or "")[:64] or uuid.uuid4().hex
+    # Call identity() ONCE and reuse the result: for an unsigned first-time visitor each call
+    # mints a NEW vid, so two calls would diverge (cache key vs retained vid/cookie).
+    vid, new_vid = memory.identity(req)
+    skey = (vid, sid)  # cache is per-visitor: a sid alone must never cross visitors
     if not text:
         return JSONResponse({"error": "empty message"}, status_code=400)
     if len(text) > MAX_MSG:
@@ -177,12 +188,11 @@ async def chat(req: Request):
     except Exception:
         mail_on = False
     agent_on = bool(body.get("agent"))
-    vid, new_vid = memory.identity(req)
     hist = sessions.get((vid, sid))
     if hist is None:
         hist = await asyncio.to_thread(memory.load_context, vid)
-    sessions[(vid, sid)] = hist
-    sessions.move_to_end((vid, sid))
+    sessions[skey] = hist
+    sessions.move_to_end(skey)
     while len(sessions) > MAX_SESSIONS:
         sessions.popitem(last=False)
     asyncio.create_task(asyncio.to_thread(memory.event, vid, "agent" if agent_on else "chat"))
@@ -303,6 +313,24 @@ async def search(req: Request):
         return {"results": hit[1]}
     try:
         fq = q
+        if focus == "deep":
+            from concurrent.futures import ThreadPoolExecutor
+            variants = [q, q + " in-depth analysis", q + " latest developments"]
+            with ThreadPoolExecutor(3) as ex:
+                parts = list(ex.map(_do_search, variants))
+            seen2, merged, anyok = set(), [], False
+            for res2, ok2 in parts:
+                anyok = anyok or ok2
+                for r2 in res2:
+                    if r2["url"] not in seen2:
+                        seen2.add(r2["url"])
+                        merged.append(r2)
+            res, ok = merged[:15], anyok
+            if ok and len(res) >= 3:
+                if len(_scache) > 500:
+                    _scache.clear()
+                _scache[q.lower()] = (now, res)
+            return {"results": res}
         if focus == "academic":
             fq = q + " (site:edu OR site:gov OR site:ac.in OR site:nature.com OR site:sciencedirect.com)"
         elif focus == "social":
