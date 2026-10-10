@@ -20,17 +20,21 @@ genuinely fresh URL produces one).
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (28/28 tests) but NOT wired into the
+Complete as a tested module (30/30 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. DIFF FACTS ONLY: run() returns {"tid", "topic", "new": [...]} or
    None. No cards, no dismissal, no reopening (module surface probe:
    no dismiss/card methods exist).
-   BASELINE IS EXPLICIT (round-3): a track's FIRST accepted run seeds
-   the known set without diffing and returns {"tid", "topic",
-   "baseline": True, "seeded": n, "new": []} - an initial result set
-   over MAX_DIFF_ITEMS is a baseline, never DiffLimitReached
-   (regression probe: 0/40 deadlocks over sizes 11..50).
+   BASELINE IS EXPLICIT (round-3/4): a track's FIRST NON-EMPTY
+   accepted run seeds the known set without diffing and returns
+   {"tid", "topic", "baseline": True, "seeded": n, "new": []} - an
+   initial result set over MAX_DIFF_ITEMS is a baseline, never
+   DiffLimitReached (regression probe: 0/40 deadlocks over sizes
+   11..50). An EMPTY run on an unseeded track is a no-op, never a
+   baseline (round-4: empty-seeding would deadlock the first real
+   result set at the diff cap; probe: 0/40 deadlocks after an empty
+   first run).
 2. EVIDENCE IS VISIBLE: every diff item carries canonical identity,
    original url, title and a per-item first_seen timestamp.
 3. DETERMINISTIC DIFFING, URL-DISCOVERY SCOPE: an item is its

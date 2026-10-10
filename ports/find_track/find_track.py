@@ -17,10 +17,13 @@ Design invariants:
    lifecycle. The no-nagging property is structural: a seen URL is in
    the known set forever, so a stale replay produces an EMPTY diff
    forever.
-   BASELINE IS EXPLICIT: a track's FIRST accepted run seeds the known
-   set without diffing - an initial result set of any size (up to
-   MAX_RUN_ITEMS / MAX_KNOWN_ITEMS) is a baseline, never a "diff" and
-   never blocked by MAX_DIFF_ITEMS (round-3: no first-run deadlock).
+   BASELINE IS EXPLICIT: a track's FIRST NON-EMPTY accepted run seeds
+   the known set without diffing - an initial result set of any size
+   (up to MAX_RUN_ITEMS / MAX_KNOWN_ITEMS) is a baseline, never a
+   "diff" and never blocked by MAX_DIFF_ITEMS (round-3: no first-run
+   deadlock). An EMPTY run on an unseeded track is a no-op, never a
+   baseline (round-4: empty-seeding would deadlock the first real
+   result set at the diff cap with no recovery path).
 2. EVIDENCE IS VISIBLE: every diff item carries its canonical identity,
    the original url, title and a per-item first_seen timestamp.
 3. DETERMINISTIC DIFFING: an item is its canonical url (scheme + port
@@ -153,12 +156,13 @@ class FindTrack(object):
         """Diff one result set against the track's known set. results:
         [{"url": str, "title": str?}]. Atomic: over-bounds input, any
         invalid item, or a diff over MAX_DIFF_ITEMS refuses the WHOLE
-        run with zero effects. The FIRST accepted run is a baseline:
-        it seeds the known set and returns {"tid", "baseline": True,
-        "seeded": n, "new": []} - MAX_DIFF_ITEMS never blocks a
-        baseline. Later runs return {"tid", "new": [...]} when new
-        items were found - plain diff facts for ports/patterns to
-        surface - else None."""
+        run with zero effects. The FIRST NON-EMPTY accepted run is a
+        baseline: it seeds the known set and returns {"tid",
+        "baseline": True, "seeded": n, "new": []} - MAX_DIFF_ITEMS
+        never blocks a baseline. An empty run on an unseeded track is
+        a no-op (returns None, stays unseeded). Later runs return
+        {"tid", "new": [...]} when new items were found - plain diff
+        facts for ports/patterns to surface - else None."""
         t = self._track(owner, tid)
         if not isinstance(results, (list, tuple)):
             raise TrackError("results must be a list")
@@ -183,9 +187,17 @@ class FindTrack(object):
             raise KnownLimitReached("known-set cap %d reached"
                                     % MAX_KNOWN_ITEMS)
         if not t.seeded:
-            # BASELINE: the first accepted run seeds the known set
-            # without diffing - a big initial result set is a baseline,
-            # never a diff and never blocked by MAX_DIFF_ITEMS
+            if not items:
+                # an EMPTY run is not a baseline: the track stays
+                # unseeded so its first NON-empty run becomes the
+                # baseline (round-4: empty-seeding would deadlock a
+                # later 11+ URL run at the diff cap with no recovery)
+                t.last_run_at = now
+                return None
+            # BASELINE: the first non-empty accepted run seeds the
+            # known set without diffing - a big initial result set is
+            # a baseline, never a diff and never blocked by
+            # MAX_DIFF_ITEMS
             t.known |= seen
             t.seeded = True
             t.last_run_at = now

@@ -166,6 +166,27 @@ class DiffTests(unittest.TestCase):
                               {"url": "https://[::1]:8080/x"}], T0)
         self.assertEqual(d["new"][0]["canonical"], "https://[::1]:8080/x")
 
+    def test_empty_first_run_is_no_baseline(self):
+        # round-4: an empty run on an unseeded track is a no-op - it
+        # must NOT seed, or the first real result set would deadlock
+        f = make()
+        tid = f.add("u1", "t", T0)
+        self.assertIsNone(f.run("u1", tid, [], T0 + HOUR))
+        self.assertFalse(f.list("u1")[0]["seeded"])
+        self.assertEqual(f.list("u1")[0]["known"], 0)
+        # the first NON-empty run still baselines, even over diff cap
+        d = f.run("u1", tid, [item(i) for i in range(MAX_DIFF_ITEMS + 1)],
+                  T0 + 2 * HOUR)
+        self.assertTrue(d["baseline"])
+        self.assertEqual(d["seeded"], MAX_DIFF_ITEMS + 1)
+
+    def test_empty_run_after_baseline_is_noop(self):
+        f = make()
+        tid = f.add("u1", "t", T0)
+        f.run("u1", tid, [item(1)], T0 + HOUR)  # baseline
+        self.assertIsNone(f.run("u1", tid, [], T0 + 2 * HOUR))
+        self.assertEqual(f.list("u1")[0]["known"], 1)
+
     def test_known_cap_unreachable_in_one_run(self):
         # the run cap (50) is strictly below the known cap (500), so a
         # single run can never breach the known cap - the run cap fires
