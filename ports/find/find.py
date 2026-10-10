@@ -27,11 +27,13 @@ Design invariants:
    fetched through the injected fetcher AND the fetched content
    supports the claim. Unfetchable or unsupported citations are DROPPED
    and recorded - never presented.
-2. SUPPORT IS MORE THAN SHARED TOKENS: the reference gate scores the
-   best sentence-window, requires the claim's numbers to appear in it,
-   and requires negation parity (claim negation words exactly match the
-   window's) - "drug cures cancer" against "drug does not cure cancer"
-   and "revenue 999 million" against "revenue 10 million" both refuse.
+2. FAIL-CLOSED QUOTE EVIDENCE: the reference gate supports a claim
+   only on verbatim, sentence-bounded quote evidence with digit-group
+   normalization, a minimum evidence length, negation/hedge parity and
+   a numeric-continuation guard - "the drug cures cancer" inside
+   "Claims that the drug cures cancer are false." and "revenue was 10
+   million" inside "revenue was 10 million dollars lower than expected"
+   both refuse. Paraphrase is the production gate's job (support_fn).
 3. UNKNOWN REFUSES WITHOUT RETRY: a fetch error drops that citation;
    the module never retries, never substitutes a different URL.
 4. ATOMIC VERIFICATION: all derived state (verified, dropped, sources
@@ -66,7 +68,7 @@ MAX_CLAIM_TEXT = 1000
 MAX_URL = 500
 MAX_SOURCES = 10
 MAX_PLANS_PER_OWNER = 50
-MIN_SUPPORT_OVERLAP = 0.34  # fraction of claim tokens in the best window
+MIN_EVIDENCE_TOKENS = 2  # a claim needs >= 2 content tokens to quote-verify
 DAY = 86400
 
 ORDINALS = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3,
@@ -86,7 +88,29 @@ _NEG = frozenset("not no never neither none dont doesn't don't isnt "
                  "fail fails failed hardly barely nor nobody nothing "
                  "nowhere".split())
 
-_NUM = re.compile(r"\d+(?:\.\d+)?")
+# A claim span ending immediately before one of these truncated a
+# quantity expression mid-way ("revenue was 10 million" cut out of
+# "revenue was 10 million dollars lower than expected").
+_UNIT_CONT = frozenset(
+    "dollar dollars euro euros pound pounds rupee rupees yen yuan "
+    "won ruble rubles peso pesos franc francs krona kroner percent "
+    "percentage cent cents million billion trillion thousand lakh "
+    "lakhs crore crores people users members employees workers votes "
+    "seats points units items copies ton tons tonne tonnes kg "
+    "kilogram kilograms km kilometer kilometers mile miles meter "
+    "meters metre metres feet foot inch inches hour hours minute "
+    "minutes second seconds day days week weeks month months year "
+    "years times fold".split())
+
+_HEDGE = frozenset(
+    "claim claims claimed claiming allege alleges alleged allegedly "
+    "rumor rumors rumored rumoured myth myths hoax false deny denies "
+    "denied debunk debunks debunked supposedly purportedly purported "
+    "fake fabricated fabrication unfounded".split())
+
+# apostrophe stems: normalization strips the apostrophe, so "doesn't"
+# reads as "doesn t" - match the stems
+_NEG_STEMS = frozenset("don doesn isn aren wasn weren won ain".split())
 
 
 class FindError(Exception):
@@ -208,28 +232,68 @@ def _validate_subqueries(subs):
     return out
 
 
-def _norm_words(text):
+def _unfold_numbers(text):
+    # digit-group separators unfold: 1,500 and 1.500 both read as 1500;
+    # "1.5" is not a 3-digit group and stays a decimal
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r"(\d)[,.](\d{3})(?!\d)", r"\1\2", text)
+    return text
+
+
+def _gate_norm(text):
     return re.sub(r"\s+", " ",
-                  re.sub(r"[^a-z0-9 ]", " ", (text or "").lower())).strip()
+                  re.sub(r"[^a-z0-9 ]", " ",
+                         _unfold_numbers((text or "").lower()))).strip()
+
+
+def _gate_sentences(content):
+    return re.split(r"[.!?;\r\n]+", _unfold_numbers((content or "").lower()))
 
 
 def reference_support(claim_text, content):
     """FAIL-CLOSED quote-evidence gate (stdlib, source-only default).
-    A claim is supported ONLY when its full normalized text appears
-    verbatim (case/punctuation-insensitive, whitespace-folded) in the
-    fetched content - positive quote evidence. Paraphrase, shared-token
-    similarity, numeric coincidence and role reorderings all refuse:
-    "drug cures cancer" vs "drug causes cancer", "revenue 999 million"
-    vs "revenue 10 million ... workforce 999 people", "Alice acquired
-    Beta" vs "Beta acquired Alice". Paraphrase-level support is the
-    production gate's job - wire it via support_fn (checked_answer
-    adapter); anything the default cannot positively quote-verify is
-    dropped, never verified."""
-    claim = _norm_words(claim_text)
-    body = _norm_words(content)
-    if not claim or not body:
+    A claim is supported ONLY on positive quote evidence surviving ALL
+    guards:
+    - SENTENCE-BOUNDED: the full normalized claim appears verbatim
+      inside ONE content sentence (number separators unfolded:
+      "1,500" and "1.500" both read as 1500);
+    - MINIMUM EVIDENCE: the claim carries >= MIN_EVIDENCE_TOKENS
+      content tokens - "yes" or "the" can never verify;
+    - NEGATION/HEDGE PARITY: the sentence's negation + hedge frame
+      exactly equals the claim's - "the drug cures cancer" inside
+      "Claims that the drug cures cancer are false." refuses;
+    - NUMERIC CONTEXT: the claim span may not end right before a unit
+      word - "revenue was 10 million" refuses inside "revenue was 10
+      million dollars lower than expected".
+    Paraphrase, shared tokens, numeric coincidence and role reorderings
+    all refuse. Anything subtler is the production gate's job: wire it
+    via support_fn (checked_answer adapter); whatever the default
+    cannot positively quote-verify is DROPPED, never verified."""
+    claim = _gate_norm(claim_text)
+    if not claim or not isinstance(content, str) or not content.strip():
         return False
-    return (" " + claim + " ") in (" " + body + " ")
+    if len(_tok(claim_text)) < MIN_EVIDENCE_TOKENS:
+        return False
+    claim_words = claim.split()
+    claim_marks = set(claim_words) & (_NEG | _NEG_STEMS | _HEDGE)
+    pat = " " + claim + " "
+    for sent in _gate_sentences(content):
+        norm = _gate_norm(sent)
+        if not norm:
+            continue
+        words = norm.split()
+        if set(words) & (_NEG | _NEG_STEMS | _HEDGE) != claim_marks:
+            continue
+        padded = " " + norm + " "
+        pos = padded.find(pat)
+        while pos >= 0:
+            end_w = padded[:pos].count(" ") + len(claim_words)
+            if end_w >= len(words) or words[end_w] not in _UNIT_CONT:
+                return True
+            pos = padded.find(pat, pos + 1)
+    return False
 
 
 class Plan(object):
@@ -384,7 +448,11 @@ class Find(object):
         if not isinstance(text, str):
             return None
         t = text.lower().strip()
-        m = re.search(r'\b(' + '|'.join(ORDINALS) + r')\b\s*(?:one|result|source|link)?\b', t)
+        m = re.search(r'\b(' + '|'.join(ORDINALS) + r')\b'
+                    r'(?!\s+(?:week|month|year|day|days|night|'
+                    r'tonight|time|monday|tuesday|wednesday|'
+                    r'thursday|friday|saturday|sunday)\b)'
+                    r'\s*(?:one|result|source|link)?\b', t)
         if not m:
             return None
         sources = self.store.sessions.get(owner) or []

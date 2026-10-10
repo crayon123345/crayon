@@ -9,7 +9,7 @@ queries with ranked, evidence-carrying matches. Stands alone.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (27/27 tests) but NOT wired into the
+Complete as a tested module (30/30 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. EVIDENCE IS VISIBLE: every match carries record id, snippet, kind
@@ -18,7 +18,8 @@ running app. Named limits, exactly:
    token-overlap over the record TEXT (min 0.20 of query tokens) with
    recency tie-break and stable id order; same input -> same order
    (determinism-tested). kind/source metadata never score as text: a
-   metadata-only hit sorts last with score 0.0, names its
+   metadata-only hit sorts last with a small deterministic score
+   strictly below MIN_SCORE (ranked, never outranking text), names its
    matched_fields (["kind"]/["source"]) and quotes NO snippet (probe:
    500/500 metadata-only hits correctly named, no fabricated text
    evidence). No model calls, no fuzzy inference.

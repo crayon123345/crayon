@@ -136,11 +136,18 @@ class FindPersonal(object):
 
     def find(self, owner, query, now, limit=MAX_RESULTS):
         """Rank records against the query. Returns evidence-carrying
-        matches, best first; empty list when nothing clears MIN_SCORE."""
+        matches, best first; empty list when nothing clears MIN_SCORE.
+        `now` is the injected clock (invariant 7), validated here so a
+        future recency weighting cannot receive a bogus one."""
+        if isinstance(now, bool) or not isinstance(now, (int, float)) \
+                or now != now or now in (float("inf"), float("-inf")):
+            raise FindPersonalError("now must be a finite number")
         if not isinstance(query, str) or not query.strip():
             raise FindPersonalError("query required")
         if len(query) > MAX_QUERY:
             raise FindPersonalError("query over %d chars" % MAX_QUERY)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise FindPersonalError("limit must be an int")
         if limit < 1 or limit > MAX_RESULTS:
             raise FindPersonalError("limit must be 1..%d" % MAX_RESULTS)
         terms = set(_tok(query))
@@ -158,20 +165,25 @@ class FindPersonal(object):
             if hit and score >= MIN_SCORE:
                 scored.append((score, rec.ts, rec.rid, rec, matched))
             elif matched:
-                # metadata-only hit: no text evidence, never outranks
-                meta_only.append((rec.ts, rec.rid, rec, matched))
+                # metadata-only hit: no text evidence - a small
+                # deterministic score strictly below MIN_SCORE, so it
+                # ranks but never outranks a text hit
+                meta_hit = len(terms & rec.meta_tokens["kind"]) + \
+                    len(terms & rec.meta_tokens["source"])
+                mscore = (meta_hit / float(len(terms))) * MIN_SCORE * 0.5
+                meta_only.append((mscore, rec.ts, rec.rid, rec, matched))
         # score desc, ts desc (recency tie-break), rid asc (stable)
         scored.sort(key=lambda s: (-s[0], -s[1], s[2]))
-        meta_only.sort(key=lambda s: (-s[0], s[1]))
+        meta_only.sort(key=lambda s: (-s[0], -s[1], s[2]))
         out = [{"rid": rec.rid, "kind": rec.kind, "source": rec.source,
                 "ts": rec.ts, "score": round(score, 4),
                 "matched_fields": matched,
                 "snippet": _snippet(rec.text, terms)}
                for score, _ts, _rid, rec, matched in scored]
         out += [{"rid": rec.rid, "kind": rec.kind, "source": rec.source,
-                 "ts": rec.ts, "score": 0.0, "matched_fields": matched,
-                 "snippet": None}
-                for _ts, _rid, rec, matched in meta_only]
+                 "ts": rec.ts, "score": round(mscore, 4),
+                 "matched_fields": matched, "snippet": None}
+                for mscore, _ts, _rid, rec, matched in meta_only]
         return out[:limit]
 
     def remove(self, owner, rid):
@@ -187,8 +199,8 @@ class FindPersonal(object):
         """ATOMIC edit (source-edit propagation): validate the new
         content fully BEFORE touching the old record; on success swap
         in place under the SAME rid; on any refusal the old record is
-        preserved untouched. Returns True. NoMatch when rid is absent -
-        use add() for new records."""
+        preserved untouched. Returns True. Raises NoRecord when rid is
+        absent - use add() for new records."""
         recs = self._records(owner)
         if rid not in recs:
             raise NoRecord("no such record")

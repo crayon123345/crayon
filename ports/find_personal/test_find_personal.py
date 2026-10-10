@@ -5,7 +5,7 @@ from find_personal import (FindPersonal, MemPersonalStore,
                            FindPersonalError, RecordLimitReached,
                            NoRecord,
                            MAX_RECORDS, MAX_KIND, MAX_TEXT, MAX_QUERY,
-                           MAX_RESULTS)
+                           MAX_RESULTS, MIN_SCORE)
 
 T0 = 1791633600  # 2026-10-10T12:00:00Z
 DAY = 86400
@@ -122,14 +122,40 @@ class RoundOneRegressionTests(unittest.TestCase):
         self.assertEqual(f.count("u1"), 1)
         self.assertEqual(f.find("u1", "first record", T0)[0]["rid"], "same")
 
-    def test_metadata_only_match_named_not_scored(self):
+    def test_metadata_only_match_ranked_below_text(self):
+        # round-3: metadata-only hits carry a small deterministic score
+        # strictly below MIN_SCORE - ranked, never outranking text hits
         f = make()
         f.add("u1", "note", "completely unrelated text", T0, source="visa")
         r = f.find("u1", "visa", T0)
         self.assertEqual(len(r), 1)
-        self.assertEqual(r[0]["score"], 0.0)
+        self.assertGreater(r[0]["score"], 0.0)
+        self.assertLess(r[0]["score"], MIN_SCORE)
         self.assertEqual(r[0]["matched_fields"], ["source"])
         self.assertIsNone(r[0]["snippet"])  # no text evidence to quote
+
+    def test_metadata_only_never_outranks_text(self):
+        f = make()
+        f.add("u1", "note", "completely unrelated text", T0, source="visa")
+        f.add("u1", "note", "the visa appointment moved", T0 + 1)
+        r = f.find("u1", "visa", T0)
+        self.assertEqual(r[0]["matched_fields"], ["text"])
+        self.assertEqual(r[1]["matched_fields"], ["source"])
+        self.assertGreater(r[0]["score"], r[1]["score"])
+
+    def test_non_int_limit_rejects(self):
+        f = make()
+        f.add("u1", "note", "the visa appointment moved", T0)
+        self.assertRaises(FindPersonalError, f.find, "u1", "visa", T0, limit="5")
+        self.assertRaises(FindPersonalError, f.find, "u1", "visa", T0, limit=1.5)
+        self.assertRaises(FindPersonalError, f.find, "u1", "visa", T0, limit=True)
+
+    def test_now_validated(self):
+        f = make()
+        f.add("u1", "note", "the visa appointment moved", T0)
+        self.assertRaises(FindPersonalError, f.find, "u1", "visa", None)
+        self.assertRaises(FindPersonalError, f.find, "u1", "visa", float("nan"))
+        self.assertRaises(FindPersonalError, f.find, "u1", "visa", "now")
 
     def test_text_match_names_fields_and_outranks_metadata(self):
         f = make()
