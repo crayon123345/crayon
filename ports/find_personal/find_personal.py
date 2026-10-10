@@ -103,7 +103,12 @@ class FindPersonal(object):
         self.id_factory = id_factory or (lambda p, s, n: "%s%d" % (p, s))
 
     def _records(self, owner):
+        # write path only (add) - creates the owner's dict
         return self.store.records.setdefault(owner, {})
+
+    def _records_read(self, owner):
+        # read path (find/replace/count) - never creates state
+        return self.store.records.get(owner) or {}
 
     def add(self, owner, kind, text, ts, source=""):
         """Feed one record. Overflow rejects; cap refuses zero-effects."""
@@ -155,7 +160,7 @@ class FindPersonal(object):
             return []
         scored = []
         meta_only = []
-        for rec in self._records(owner).values():
+        for rec in self._records_read(owner).values():
             hit = len(terms & rec.text_tokens)
             matched = [fld for fld in ("kind", "source")
                        if terms & rec.meta_tokens[fld]]
@@ -201,7 +206,7 @@ class FindPersonal(object):
         in place under the SAME rid; on any refusal the old record is
         preserved untouched. Returns True. Raises NoRecord when rid is
         absent - use add() for new records."""
-        recs = self._records(owner)
+        recs = self._records_read(owner)
         if rid not in recs:
             raise NoRecord("no such record")
         # full validation first - the old record survives any failure
@@ -233,4 +238,4 @@ class FindPersonal(object):
         return n
 
     def count(self, owner):
-        return len(self._records(owner))
+        return len(self._records_read(owner))

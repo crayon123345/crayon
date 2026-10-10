@@ -9,7 +9,7 @@ queries with ranked, evidence-carrying matches. Stands alone.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (30/30 tests) but NOT wired into the
+Complete as a tested module (31/31 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. EVIDENCE IS VISIBLE: every match carries record id, snippet, kind
