@@ -1,55 +1,65 @@
 """Synthetic acceptance tests for the voice adapter against a fake canonical
-implementing REV3 semantics (issue/redeem/revalidate/progress/final + ruling b).
-No network, no provider, no routes."""
-import sys, time, pathlib
+implementing REV3 semantics. No network, no provider, no routes."""
+import sys, threading, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import pytest
-from adapter import VoiceAdapter, Lease, AdapterError, CommitUnknown
+from adapter import (VoiceAdapter, AdapterError, CommitUnknown, CapExceeded,
+                     TransportTimeout, REVALIDATE_SECONDS)
+
+ORIGIN = "https://app.example"
 
 
 class FakeCanonical:
-    """Minimal canonical engine with REV3 behaviors."""
-    def __init__(self, clock=time.time):
+    """Minimal canonical engine with REV3 behaviors. Thread-safe."""
+    def __init__(self, clock=lambda: 1000.0):
         self.clock = clock
-        self.tickets = {}   # ticket -> dict(bound..., redeemed)
-        self.leases = {}    # lease_id -> dict(ticket, revoked, expires)
-        self.finals = {}    # (owner, request_id) -> payload digest
+        self.tickets = {}
+        self.leases = {}
+        self.finals = {}
         self.sessions_live = True
+        self.revalidate_active = True
+        self.timeout_on = set()      # paths that raise TransportTimeout AFTER acting
+        self.echo_mismatch = False
         self.n = 0
+        self._mu = threading.Lock()
 
-    def issue(self, origin="https://app.example", mode="transcribe", ttl=120):
-        self.n += 1
-        t = f"ticket{self.n}"
-        self.tickets[t] = {"origin": origin, "mode": mode,
-                           "expires": self.clock() + ttl, "redeemed": False}
-        return t
+    def issue(self, origin=ORIGIN, mode="transcribe", ttl=120):
+        with self._mu:
+            self.n += 1
+            t = f"ticket{self.n}"
+            self.tickets[t] = {"origin": origin, "mode": mode,
+                               "expires": self.clock() + ttl, "redeemed": False}
+            return t
 
     def revoke_lease(self, lease_id):
-        self.leases[lease_id]["revoked"] = True
+        with self._mu:
+            self.leases[lease_id]["revoked"] = True
 
     def __call__(self, method, path, headers, body):
         assert "ticket" not in path, "ticket must never travel in a URL"
         if not headers.get("Authorization", "").startswith("Bearer scoped-"):
             return 401, {"error_code": "unauthenticated"}
         if path == "/voice/internal/redeem":
-            b = self.tickets.get(body["ticket"])
-            if not b or b["redeemed"]:
-                return 409, {"error_code": "already_redeemed"}
-            if self.clock() >= b["expires"]:
-                return 410, {"error_code": "expired"}
-            if body["observed_origin"] != b["origin"] or body["mode"] != b["mode"]:
-                return 403, {"error_code": "origin"}
-            if not self.sessions_live:
-                return 401, {"error_code": "unauthenticated"}
-            b["redeemed"] = True
-            lid = f"lease{body['ticket']}"
-            self.leases[lid] = {"ticket": body["ticket"], "revoked": False,
-                                "expires": self.clock() + 600}
+            with self._mu:  # atomic claim: exactly one concurrent redeem wins
+                b = self.tickets.get(body["ticket"])
+                if not b or b["redeemed"]:
+                    return 409, {"error_code": "already_redeemed"}
+                if self.clock() >= b["expires"]:
+                    return 410, {"error_code": "expired"}
+                if (body["observed_origin"] != b["origin"]
+                        or body["mode"] != b["mode"]):
+                    return 403, {"error_code": "origin"}
+                if not self.sessions_live:
+                    return 401, {"error_code": "unauthenticated"}
+                b["redeemed"] = True
+                lid = f"lease{body['ticket']}"
+                self.leases[lid] = {"revoked": False,
+                                    "expires": self.clock() + 600}
+            origin = "https://other.example" if self.echo_mismatch else b["origin"]
             return 200, {"version": 1, "lease_id": lid,
                          "request_id": "req-" + body["ticket"],
                          "conversation_id": "conv1", "mode": b["mode"],
-                         "origin": b["origin"],
-                         "expires_at": self.clock() + 600,
+                         "origin": origin, "expires_at": self.clock() + 600,
                          "revalidate_seconds": 15,
                          "audio_limits": {"max_seconds": 600,
                                           "max_bytes": 20000000}}
@@ -59,36 +69,41 @@ class FakeCanonical:
         if path == "/voice/internal/revalidate":
             if not live:
                 return 410, {"error_code": "revoked"}
-            return 200, {"version": 1, "active": True,
+            if path in self.timeout_on:
+                raise TransportTimeout()
+            return 200, {"version": 1, "active": self.revalidate_active,
                          "request_id": "req", "expires_at": lease["expires"],
                          "next_check_seconds": 15}
-        # progress and final require liveness BEFORE anything else (ruling b)
+        # progress/final: liveness BEFORE duplicate detection (ruling b)
         if not live:
             return 410, {"error_code": "revoked"}
         if path == "/voice/internal/progress":
             return 200, {"accepted": True, "seq": body["seq"]}
         if path == "/voice/internal/final":
-            key = ("owner", body["request_id"])
             import json
+            key = ("owner", body["request_id"])
             digest = json.dumps(body, sort_keys=True)
-            if key in self.finals:
-                if self.finals[key] == digest:
-                    return 200, {"accepted": True, "duplicate": True}
-                return 409, {"error_code": "final_conflict"}
-            self.finals[key] = digest
+            with self._mu:
+                if key in self.finals:
+                    if self.finals[key] == digest:
+                        return 200, {"accepted": True, "duplicate": True}
+                    return 409, {"error_code": "final_conflict"}
+                self.finals[key] = digest  # commit happens here
+            if path in self.timeout_on:
+                raise TransportTimeout()  # commit landed, response lost
             return 201, {"accepted": True, "request_id": body["request_id"],
                          "seq": body["seq"]}
         return 404, {"error_code": "unknown"}
 
 
-def make(clock=time.time):
+def make(clock=lambda: 1000.0):
     c = FakeCanonical(clock)
-    return c, VoiceAdapter(c, "scoped-test-cred")
+    return c, VoiceAdapter(c, "scoped-test-cred", clock=clock)
 
 
 def test_redeem_then_final_happy_path():
     c, a = make()
-    lease = a.redeem(c.issue(), "https://app.example", "transcribe")
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
     assert a.revalidate(lease) is True
     a.progress(lease, "transcript_partial", "running", "hel")
     r = a.progress(lease, "transcript_final", "running", "hello")
@@ -97,22 +112,46 @@ def test_redeem_then_final_happy_path():
     assert out["accepted"]
 
 
-def test_second_redeem_same_ticket_rejected():
+def test_concurrent_redeem_exactly_one_wins():
     c, a = make()
     t = c.issue()
-    a.redeem(t, "https://app.example", "transcribe")
+    barrier = threading.Barrier(3)
+    results, errors = [], []
+
+    def race():
+        barrier.wait()
+        try:
+            results.append(a.redeem(t, ORIGIN, "transcribe"))
+        except AdapterError as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=race) for _ in range(2)]
+    [th.start() for th in threads]
+    barrier.wait()
+    [th.join() for th in threads]
+    assert len(results) == 1 and len(errors) == 1
+    assert errors[0].status == 409
+
+
+def test_sequential_second_redeem_rejected():
+    c, a = make()
+    t = c.issue()
+    a.redeem(t, ORIGIN, "transcribe")
     with pytest.raises(AdapterError) as e:
-        a.redeem(t, "https://app.example", "transcribe")
+        a.redeem(t, ORIGIN, "transcribe")
     assert e.value.status == 409
 
 
-def test_expired_ticket_rejected():
+def test_exact_expiry_boundary():
     now = [1000.0]
     c, a = make(clock=lambda: now[0])
-    t = c.issue(ttl=120)
-    now[0] += 121
+    t_ok = c.issue(ttl=120)
+    now[0] += 119.9
+    a.redeem(t_ok, ORIGIN, "transcribe")  # still valid just inside
+    t_edge = c.issue(ttl=120)
+    now[0] += 120.0  # exactly expires_at -> expired
     with pytest.raises(AdapterError) as e:
-        a.redeem(t, "https://app.example", "transcribe")
+        a.redeem(t_edge, ORIGIN, "transcribe")
     assert e.value.status == 410
 
 
@@ -123,72 +162,155 @@ def test_origin_mismatch_rejected():
     assert e.value.status == 403
 
 
+def test_null_and_non_https_origin_rejected_locally():
+    c, a = make()
+    t1, t2 = c.issue(), c.issue()
+    with pytest.raises(AdapterError):
+        a.redeem(t1, None, "transcribe")
+    with pytest.raises(AdapterError):
+        a.redeem(t2, "http://app.example", "transcribe")
+    # neither ticket was consumed (rejected before transport)
+    assert not c.tickets[t1]["redeemed"] and not c.tickets[t2]["redeemed"]
+
+
 def test_mode_mismatch_rejected():
     c, a = make()
     with pytest.raises(AdapterError):
-        a.redeem(c.issue(mode="speak"), "https://app.example", "live")
+        a.redeem(c.issue(mode="speak"), ORIGIN, "live")
+
+
+def test_redeem_binding_echo_validated():
+    c, a = make()
+    c.echo_mismatch = True
+    with pytest.raises(AdapterError) as e:
+        a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert "bad_binding" in e.value.code
 
 
 def test_revocation_closes_progress_and_final():
     c, a = make()
-    t = c.issue()
-    lease = a.redeem(t, "https://app.example", "transcribe")
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
     c.revoke_lease(lease.lease_id)
     with pytest.raises(AdapterError) as e:
         a.revalidate(lease)
     assert e.value.status == 410 and not lease.active
+    assert lease.closed_reason == "denied"
     with pytest.raises(AdapterError):
         a.progress(lease, "progress", "running")
 
 
 def test_session_revoke_denies_immediately_not_after_15s():
     c, a = make()
-    lease = a.redeem(c.issue(), "https://app.example", "transcribe")
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
     c.sessions_live = False
     with pytest.raises(AdapterError):
         a.revalidate(lease)
 
 
-def test_final_duplicate_while_live_acknowledged():
+def test_revalidate_timeout_fails_closed():
     c, a = make()
-    lease = a.redeem(c.issue(), "https://app.example", "transcribe")
-    body = dict(state="done", transcript_text="hi", answer_text="hello")
-    r1 = a.final(lease, **body)
-    assert r1["accepted"]
-    # exact replay while still live -> duplicate ack (canonical-side rule)
-    lease.final_sent = False
-    lease.seq -= 1
-    r2 = a.final(lease, **body)
-    assert r2.get("duplicate") is True
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    c.timeout_on.add("/voice/internal/revalidate")
+    with pytest.raises(AdapterError) as e:
+        a.revalidate(lease)
+    assert e.value.status == 503
+    assert not lease.active
+    assert lease.closed_reason == "validation_unavailable"
 
 
-def test_final_retry_after_revocation_is_commit_unknown_and_no_replay():
+def test_revalidate_active_false_closes():
     c, a = make()
-    lease = a.redeem(c.issue(), "https://app.example", "transcribe")
-    # canonical commits the final, then the lease is revoked before the
-    # response reaches the adapter; the adapter retry is denied 410.
-    key = ("owner", lease.request_id)
-    c.revoke_lease(lease.lease_id)
-    provider_calls = []
-    with pytest.raises(CommitUnknown):
-        a.final(lease, "done", transcript_text="hi")
-    # adapter must not replay provider work or effects
-    assert provider_calls == []
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    c.revalidate_active = False
+    with pytest.raises(AdapterError):
+        a.revalidate(lease)
     assert not lease.active
 
 
-def test_final_after_expiry_is_commit_unknown():
+def test_active_drive_loop_closes_on_revocation():
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    c.revoke_lease(lease.lease_id)
+    with pytest.raises(AdapterError):
+        a.drive_once(lease)
+    assert not lease.active
+
+
+def test_seconds_cap_enforced_incrementally():
     now = [1000.0]
     c, a = make(clock=lambda: now[0])
-    lease = a.redeem(c.issue(), "https://app.example", "transcribe")
-    now[0] += 601
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    now[0] += 599.9
+    a.progress(lease, "progress", "running")  # still inside
+    now[0] += 0.2  # past 600
+    with pytest.raises(CapExceeded) as e:
+        a.progress(lease, "progress", "running")
+    assert e.value.which == "seconds" and not lease.active
+
+
+def test_bytes_cap_enforced_incrementally():
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    a.note_audio_bytes(lease, 19999999)
+    with pytest.raises(CapExceeded) as e:
+        a.note_audio_bytes(lease, 1)
+    assert e.value.which == "bytes" and not lease.active
+    with pytest.raises(AdapterError):
+        a.progress(lease, "progress", "running")
+
+
+def test_terminal_guard_progress_after_final_rejected():
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    a.final(lease, "done", transcript_text="hi")
+    with pytest.raises(AdapterError) as e:
+        a.progress(lease, "progress", "running")
+    assert e.value.code == "terminal"
+
+
+def test_terminal_guard_conflicting_second_final_rejected():
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    a.final(lease, "done", transcript_text="hi")
+    with pytest.raises(AdapterError) as e:
+        a.final(lease, "done", transcript_text="DIFFERENT")
+    assert e.value.status == 409
+
+
+def test_identical_final_retry_while_live_is_duplicate():
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    r1 = a.final(lease, "done", transcript_text="hi", answer_text="hello")
+    assert r1["accepted"]
+    r2 = a.final(lease, "done", transcript_text="hi", answer_text="hello")
+    assert r2.get("duplicate") is True
+
+
+def test_real_lost_commit_is_commit_unknown_no_replay():
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    c.timeout_on.add("/voice/internal/final")  # commit lands, response lost
     with pytest.raises(CommitUnknown):
         a.final(lease, "done", transcript_text="hi")
+    # canonical DID commit; adapter closed and must not replay
+    assert ("owner", lease.request_id) in c.finals
+    assert not lease.active and lease.closed_reason == "commit_unknown"
+    with pytest.raises(AdapterError):
+        a.final(lease, "done", transcript_text="hi")  # closed, no replay
+
+
+def test_final_denied_after_revocation_is_commit_unknown():
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    c.revoke_lease(lease.lease_id)
+    with pytest.raises(CommitUnknown):
+        a.final(lease, "done", transcript_text="hi")
+    assert not lease.active
 
 
 def test_seq_is_monotonic():
     c, a = make()
-    lease = a.redeem(c.issue(), "https://app.example", "transcribe")
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
     a.progress(lease, "progress", "running")
     a.progress(lease, "progress", "running")
     assert lease.seq == 2
@@ -196,7 +318,7 @@ def test_seq_is_monotonic():
 
 def test_provider_guard_fails_closed():
     c, a = make()
-    lease = a.redeem(c.issue(), "https://app.example", "transcribe")
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
     c.revoke_lease(lease.lease_id)
     with pytest.raises(AdapterError):
         a.provider_connect_guard(lease)
@@ -209,19 +331,25 @@ def test_ticket_never_in_url():
         seen.append(path)
         return c(method, path, headers, body)
     a = VoiceAdapter(spy, "scoped-x")
-    a.redeem(c.issue(), "https://app.example", "transcribe")
+    a.redeem(c.issue(), ORIGIN, "transcribe")
     assert all("ticket" not in p for p in seen)
 
 
 def test_bad_progress_type_rejected_locally():
     c, a = make()
-    lease = a.redeem(c.issue(), "https://app.example", "transcribe")
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
     with pytest.raises(AdapterError):
         a.progress(lease, "bogus", "running")
 
 
 def test_final_state_enum_enforced():
     c, a = make()
-    lease = a.redeem(c.issue(), "https://app.example", "transcribe")
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
     with pytest.raises(AdapterError):
         a.final(lease, "running")
+
+
+def test_revalidate_seconds_matches_contract():
+    c, a = make()
+    lease = a.redeem(c.issue(), ORIGIN, "transcribe")
+    assert lease.revalidate_seconds == REVALIDATE_SECONDS == 15

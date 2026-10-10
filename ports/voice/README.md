@@ -8,13 +8,25 @@ no activation. The accepted runtime-contract.md is unchanged.
 
 - Fail closed: no provider work before a successful redeem
   (`provider_connect_guard` = revalidate immediately before connect).
-- Revalidate every 15s while active; close on 410/unavailable. No grace.
+- ACTIVE revalidation cadence: `run_turn`/`drive_once` revalidate every
+  `revalidate_seconds` (15, contract-pinned and asserted) while active; ANY
+  denial, `active:false`, or a timed-out/unavailable validation closes the
+  lease. No grace fallback.
+- Incremental caps: elapsed time from redeem and audio bytes
+  (`note_audio_bytes`) are tracked per lease; first breach of the
+  600s / 20MB caps ends the turn (CapExceeded, lease closed).
 - Ticket only in the redeem request body, never in a URL (test-enforced).
-- Monotonic seq per request; component events vs one terminal /final envelope.
-- Ruling (b): /final denied after lease/session expiry or revocation means
-  commit status UNKNOWN - stop, report unknown, never replay provider work or
-  effects; resolution only via the authorized browser read-only /voice/result
-  within the original 300s TTL.
+- Local binding validation: observed_origin must be a non-null https://
+  origin; canonical redeem responses must carry the required fields and
+  echo the bound mode/origin; `active:false` on revalidate closes.
+- Monotonic seq per request; component events vs one terminal /final.
+- Terminal guard: after a final, only an IDENTICAL final retry while the
+  lease is live passes (canonical duplicate path); post-final progress and
+  conflicting finals are rejected locally.
+- Ruling (b): a lost /final transport response or a liveness denial
+  (401/403/410) means commit status UNKNOWN - close, report unknown, never
+  replay provider work or effects; resolution only via the authorized
+  browser read-only /voice/result within the original 300s TTL.
 
 ## Not here (activation gates, per docs/voice/implementation-status.md)
 
@@ -24,6 +36,10 @@ revocation push, erasure, real browser/device/codec/provider roundtrips.
 
 ## Tests
 
-`pytest ports/voice` - 14 synthetic tests incl. redeem race, exact expiry,
-origin/mode mismatch, immediate session revoke, final duplicate-while-live,
-commit-unknown after expiry/revocation, ticket-never-in-URL.
+`pytest ports/voice` - 26 synthetic tests, including a genuine threaded
+redeem race (barrier-synchronized, exactly one winner), a real lost-commit
+(canonical commits, response transport dies -> CommitUnknown + close + no
+replay), exact 120s expiry boundary, incremental 600s/20MB cap enforcement,
+terminal-guard duplicate/conflict, revalidate-timeout fail-closed,
+active:false binding close, non-HTTPS/null-origin local rejection, and the
+15s cadence contract pin.
