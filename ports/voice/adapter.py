@@ -6,26 +6,36 @@ obligations of the accepted contract:
 
 - No provider work before a successful redeem (fail closed).
 - ACTIVE revalidation: a drive loop revalidates immediately before provider
-  connect and every revalidate_seconds (15) while active; ANY denial or an
-  unavailable/timed-out validation closes the lease. No grace fallback.
+  connect and every revalidate_seconds (15) of WALL-CLOCK time while active,
+  including while turn work is blocking; ANY denial or an
+  unavailable/timed-out/failed validation closes the lease. No grace
+  fallback. Ordinary transport failures (builtin TimeoutError/OSError) fail
+  closed exactly like an explicit TransportTimeout.
 - Caps enforced INCREMENTALLY: elapsed time from redeem and audio bytes are
   tracked per lease; the first cap breach ends the turn (lease closed).
+  Negative byte increments are rejected; server-provided caps are CLAMPED
+  to the contract bounds (600s / 20MB) - a server can only tighten them.
 - Redeem ticket travels in the request BODY only (never in a URL).
-- Local binding validation: observed_origin must be a non-null https://
-  origin; canonical redeem/revalidate responses must echo the bound
-  mode/origin and carry the required fields, and active:false is a close.
+- Local binding validation: observed_origin must parse as a strict https
+  origin (no empty host, credentials, path, query or fragment) AND be on
+  the explicit allowlist; canonical redeem responses must echo the bound
+  mode/origin and carry the required fields; revalidate responses must
+  echo the lease's lease_id, request_id and expires_at; active:false is a
+  close.
 - seq is monotonic per request.
 - Terminal guard: after a final, only an IDENTICAL final retry while the
   lease is still live is valid (canonical duplicate path); any other
   progress/final is rejected locally.
-- Ruling (b): a /final attempt whose transport response is lost (timeout)
-  or that is denied after lease/session expiry or revocation (401/403/410)
-  means commit status UNKNOWN: the adapter closes, reports unknown, and
-  never replays provider work or effects. Resolution is only via the
-  authorized browser read-only /voice/result within the original 300s TTL.
+- Ruling (b): a /final attempt whose transport response is lost (timeout
+  or ordinary transport failure) or that is denied after lease/session
+  expiry or revocation (401/403/410) means commit status UNKNOWN: the
+  adapter closes, reports unknown, and never replays provider work or
+  effects. Resolution is only via the authorized browser read-only
+  /voice/result within the original 300s TTL.
 """
 import threading
 import time
+from urllib.parse import urlsplit
 
 PROGRESS_TYPES = {"accepted", "progress", "transcript_partial", "transcript_final",
                   "answer_partial", "answer_final", "review_required", "artifact",
@@ -35,10 +45,22 @@ REVALIDATE_SECONDS = 15
 RECOVERY_TTL_SECONDS = 300
 REQUIRED_REDEEM_FIELDS = ("lease_id", "request_id", "conversation_id",
                           "mode", "origin", "expires_at", "audio_limits")
+# Contract bounds: server-provided caps may only tighten these, never widen.
+CONTRACT_MAX_SECONDS = 600
+CONTRACT_MAX_BYTES = 20000000
+# Adapter-side origin allowlist (exact origins only). Deployments override.
+DEFAULT_ALLOWED_ORIGINS = frozenset({
+    "https://crayon-web.onrender.com",
+    "https://itsppm76.github.io",
+})
 
 
 class TransportTimeout(Exception):
     """The canonical did not answer; the request may or may not have landed."""
+
+
+# Any of these mean "no usable response": fail closed everywhere.
+TRANSPORT_FAILURES = (TransportTimeout, TimeoutError, OSError)
 
 
 class AdapterError(Exception):
@@ -66,7 +88,15 @@ class Lease:
         self.mode = body["mode"]
         self.origin = body["origin"]
         self.expires_at = body["expires_at"]
-        self.audio_limits = body["audio_limits"]
+        lim = body.get("audio_limits") or {}
+        # Clamp server-provided caps to the contract bounds: the server may
+        # tighten but never widen beyond 600s / 20MB.
+        self.audio_limits = {
+            "max_seconds": min(lim.get("max_seconds", CONTRACT_MAX_SECONDS),
+                               CONTRACT_MAX_SECONDS),
+            "max_bytes": min(lim.get("max_bytes", CONTRACT_MAX_BYTES),
+                             CONTRACT_MAX_BYTES),
+        }
         self.revalidate_seconds = body.get("revalidate_seconds", REVALIDATE_SECONDS)
         self.redeemed_at = clock()
         self.bytes_used = 0
@@ -79,12 +109,15 @@ class Lease:
 class VoiceAdapter:
     """One adapter instance per deployment; one Lease per redeemed ticket."""
 
-    def __init__(self, transport, credential, clock=time.time):
+    def __init__(self, transport, credential, clock=time.time,
+                 allowed_origins=DEFAULT_ALLOWED_ORIGINS):
         """transport(method, path, headers, body) -> (status, dict);
-        may raise TransportTimeout when no response arrives."""
+        may raise TransportTimeout/TimeoutError/OSError when no response
+        arrives. allowed_origins: exact https origins redeem may bind to."""
         self._t = transport
         self._cred = credential
         self._clock = clock
+        self._allowed = frozenset(allowed_origins)
         self._lock = threading.Lock()
 
     # -- transport ------------------------------------------------------
@@ -96,11 +129,22 @@ class VoiceAdapter:
         return data or {}
 
     # -- redeem ----------------------------------------------------------
-    @staticmethod
-    def _check_origin(observed_origin):
-        if (not isinstance(observed_origin, str)
-                or not observed_origin.startswith("https://")):
+    def _check_origin(self, observed_origin):
+        """Strict origin parse: https scheme, non-empty host, no
+        credentials, no path/query/fragment, and on the exact allowlist."""
+        if not isinstance(observed_origin, str):
             raise AdapterError("bad_origin", 400)
+        try:
+            p = urlsplit(observed_origin)
+        except ValueError:
+            raise AdapterError("bad_origin", 400) from None
+        if (p.scheme != "https" or not p.hostname
+                or p.username is not None or p.password is not None
+                or p.path not in ("", "/") or p.query or p.fragment):
+            raise AdapterError("bad_origin", 400)
+        normalized = f"https://{p.hostname}" + (f":{p.port}" if p.port else "")
+        if normalized not in self._allowed:
+            raise AdapterError("bad_origin:not_allowlisted", 400)
 
     def redeem(self, ticket, observed_origin, mode):
         """Redeem a ticket taken from the FIRST websocket frame only.
@@ -120,62 +164,93 @@ class VoiceAdapter:
 
     # -- caps ------------------------------------------------------------
     def _check_caps(self, lease):
-        lim = lease.audio_limits or {}
-        max_seconds = lim.get("max_seconds", 600)
-        max_bytes = lim.get("max_bytes", 20000000)
-        if self._clock() - lease.redeemed_at >= max_seconds:
+        lim = lease.audio_limits
+        if self._clock() - lease.redeemed_at >= lim["max_seconds"]:
             self._close(lease, "cap:seconds")
             raise CapExceeded("seconds")
-        if lease.bytes_used >= max_bytes:
+        if lease.bytes_used >= lim["max_bytes"]:
             self._close(lease, "cap:bytes")
             raise CapExceeded("bytes")
 
     def note_audio_bytes(self, lease, n):
-        """Incrementally account audio bytes; first cap breach ends the turn."""
+        """Incrementally account audio bytes; first cap breach ends the turn.
+        Negative or non-numeric increments are rejected, never applied."""
         with self._lock:
             self._require_active(lease)
-            lease.bytes_used += int(n)
+            try:
+                n = int(n)
+            except (TypeError, ValueError):
+                raise AdapterError("bad_increment", 400) from None
+            if n < 0:
+                raise AdapterError("bad_increment", 400)
+            lease.bytes_used += n
             self._check_caps(lease)
 
     # -- revalidate --------------------------------------------------------
     def revalidate(self, lease):
-        """Check before provider connect and every 15s. ANY denial,
-        non-active response, or unavailable/timed-out validation closes."""
+        """Check before provider connect and every 15s wall-clock. ANY
+        denial, non-active response, binding mismatch, or
+        unavailable/timed-out/failed validation closes the lease."""
         try:
             data = self._call("/voice/internal/revalidate",
                               {"version": 1, "lease_id": lease.lease_id})
-        except TransportTimeout as e:
+        except TRANSPORT_FAILURES as e:
             self._close(lease, "validation_unavailable")
             raise AdapterError("validation_unavailable", 503) from e
         except AdapterError:
             self._close(lease, "denied")
             raise
+        # Full response binding: the canonical must answer about THIS lease.
+        if (data.get("lease_id", lease.lease_id) != lease.lease_id
+                or data.get("request_id") != lease.request_id
+                or data.get("expires_at") != lease.expires_at):
+            self._close(lease, "bad_binding")
+            raise AdapterError("bad_binding:revalidate", 502)
         if data.get("active") is not True:
             self._close(lease, "inactive")
             raise AdapterError("inactive", 410)
         return True
 
     def drive_once(self, lease):
-        """One active-cadence step: caps check + revalidate. The embedding
-        runtime calls this every lease.revalidate_seconds while the turn is
-        active (see run_turn); any exception here means the lease closed."""
+        """One active-cadence step: caps check + revalidate. Any exception
+        here means the lease closed."""
         with self._lock:
             self._require_active(lease)
             self._check_caps(lease)
         return self.revalidate(lease)
 
     def run_turn(self, lease, work, sleep=time.sleep):
-        """Active cadence loop: runs `work(lease)` while revalidating every
-        revalidate_seconds; closes on any denial/timeout/cap breach.
-        `work` is called between checks and must be interruptible by the
-        caller (synthetic staging: typically a step function returning True
-        when finished)."""
-        while lease.active:
-            self.drive_once(lease)
-            if work(lease):
-                return True
-            sleep(lease.revalidate_seconds)
-        return False
+        """Active cadence loop with WALL-CLOCK cadence: work(lease) runs ONCE
+        on a worker thread and may block; the calling thread keeps
+        revalidating every lease.revalidate_seconds of wall-clock time
+        regardless of how long work blocks. The first failed check closes
+        the lease and raises; the worker's next adapter call then fails on
+        the closed lease. Returns work's result; re-raises work errors."""
+        outcome = {}
+
+        def runner():
+            try:
+                outcome["value"] = work(lease)
+            except BaseException as e:  # propagate after the loop exits
+                outcome["error"] = e
+            finally:
+                outcome["finished"] = True
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        next_check = self._clock()
+        while True:
+            now = self._clock()
+            if now >= next_check:
+                self.drive_once(lease)  # raises -> lease closed -> propagate
+                next_check = now + lease.revalidate_seconds
+            if outcome.get("finished"):
+                break
+            sleep(min(max(next_check - self._clock(), 0.0), 0.05) or 0.001)
+        t.join(timeout=5)
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome.get("value", False)
 
     # -- progress/final ----------------------------------------------------
     def progress(self, lease, type_, state, text=None):
@@ -193,6 +268,9 @@ class VoiceAdapter:
                 body["text"] = text
             try:
                 return self._call("/voice/internal/progress", body)
+            except TRANSPORT_FAILURES as e:
+                self._close(lease, "transport_failure")
+                raise AdapterError("transport_failure", 503) from e
             except AdapterError:
                 self._close(lease, "denied")
                 raise
@@ -200,8 +278,9 @@ class VoiceAdapter:
     def final(self, lease, state, transcript_text=None, answer_text=None,
               error_code=None):
         """One terminal commit. Identical retry while live: allowed
-        (canonical duplicate path). Lost response or liveness denial:
-        CommitUnknown + close, never replay."""
+        (canonical duplicate path). Lost response (timeout OR ordinary
+        transport failure) or liveness denial: CommitUnknown + close,
+        never replay."""
         with self._lock:
             self._require_active(lease)
             if state not in FINAL_STATES:
@@ -228,7 +307,7 @@ class VoiceAdapter:
                 lease.final_payload = body
             try:
                 return self._call("/voice/internal/final", body)
-            except TransportTimeout as e:
+            except TRANSPORT_FAILURES as e:
                 # The commit may have landed; status is UNKNOWN. No replay.
                 self._close(lease, "commit_unknown")
                 raise CommitUnknown(

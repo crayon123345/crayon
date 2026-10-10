@@ -8,17 +8,27 @@ no activation. The accepted runtime-contract.md is unchanged.
 
 - Fail closed: no provider work before a successful redeem
   (`provider_connect_guard` = revalidate immediately before connect).
-- ACTIVE revalidation cadence: `run_turn`/`drive_once` revalidate every
-  `revalidate_seconds` (15, contract-pinned and asserted) while active; ANY
-  denial, `active:false`, or a timed-out/unavailable validation closes the
-  lease. No grace fallback.
+- ACTIVE revalidation cadence: `run_turn` revalidates every
+  `revalidate_seconds` (15, contract-pinned and asserted) of WALL-CLOCK
+  time while active - turn work runs on a worker thread, so blocking work
+  cannot stretch the cadence; ANY denial, `active:false`, binding mismatch,
+  or an unavailable validation closes the lease. No grace fallback.
+  Ordinary transport failures (builtin `TimeoutError`/`OSError`) fail
+  closed exactly like an explicit `TransportTimeout`, on every path.
 - Incremental caps: elapsed time from redeem and audio bytes
   (`note_audio_bytes`) are tracked per lease; first breach of the
-  600s / 20MB caps ends the turn (CapExceeded, lease closed).
+  600s / 20MB caps ends the turn (CapExceeded, lease closed). Negative or
+  non-numeric byte increments are rejected (never applied). Server-provided
+  caps are CLAMPED to the contract bounds - a server may tighten the
+  600s / 20MB limits but never widen them.
 - Ticket only in the redeem request body, never in a URL (test-enforced).
-- Local binding validation: observed_origin must be a non-null https://
-  origin; canonical redeem responses must carry the required fields and
-  echo the bound mode/origin; `active:false` on revalidate closes.
+- Local binding validation: observed_origin must parse as a strict https
+  origin (non-empty host; no credentials, path, query or fragment) AND be
+  on the adapter's exact-origin allowlist (`allowed_origins`, defaulting to
+  the two deployment origins); canonical redeem responses must carry the
+  required fields and echo the bound mode/origin; revalidate responses must
+  echo the lease's own lease_id, request_id and expires_at (a mismatch
+  closes the lease as `bad_binding`); `active:false` on revalidate closes.
 - Monotonic seq per request; component events vs one terminal /final.
 - Terminal guard: after a final, only an IDENTICAL final retry while the
   lease is live passes (canonical duplicate path); post-final progress and
@@ -36,10 +46,16 @@ revocation push, erasure, real browser/device/codec/provider roundtrips.
 
 ## Tests
 
-`pytest ports/voice` - 26 synthetic tests, including a genuine threaded
+`pytest ports/voice` - 37 synthetic tests, including a genuine threaded
 redeem race (barrier-synchronized, exactly one winner), a real lost-commit
 (canonical commits, response transport dies -> CommitUnknown + close + no
 replay), exact 120s expiry boundary, incremental 600s/20MB cap enforcement,
 terminal-guard duplicate/conflict, revalidate-timeout fail-closed,
 active:false binding close, non-HTTPS/null-origin local rejection, and the
-15s cadence contract pin.
+15s cadence contract pin. REV4 rework regression coverage: builtin
+TimeoutError/OSError fail-closed on revalidate/progress/final, strict
+origin parsing (empty host, credentials, path, query, fragment, look-alike
+host) plus allowlist rejection, revalidate request_id/expires_at binding,
+wall-clock cadence under genuinely blocking work (threaded, 15s gap
+asserted) and denial-during-blocking-work close, negative byte-increment
+rejection, and server-cap clamping to contract bounds.
