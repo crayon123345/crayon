@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+config/google_client_secret.json
+*.session
+credentials.json
