@@ -13,14 +13,15 @@ SECRET = "synthetic-app-secret"
 
 
 class FakeMeta:
-    def __init__(self, fail=None, delay=0, fail5=None):
+    def __init__(self, fail=None, delay=0, fail5=None, pnid=PNID):
+        self.pnid = pnid
         self.calls = []
         self.fail = fail or {}
         self.fail5 = fail5 or {}
         self.delay = delay
         self._lk = threading.Lock()
     def __call__(self, method, path, headers, body):
-        assert path.startswith("/v23.0/test-phone-id/")
+        assert path.startswith(f"/v23.0/{self.pnid}/")
         assert "ticket" not in path
         if self.delay:
             time.sleep(self.delay)
@@ -497,7 +498,7 @@ def test_crash_recovery_pending_claim_never_resent(tmp_path):
                  "recipient_type": "individual", "to": ME, "type": "template",
                  "template": {"name": "hello_world",
                               "language": {"code": "en_US"}}}
-    store.claim("send:k-crash",
+    store.claim("send:owner:test:test-waba-id:test-phone-id:k-crash",
                 {"state": "claimed",
                  "request": {"to": ME, "type": "template", "body": full_body},
                  "grant_id": "g", "claimant": "dead-instance",
@@ -882,3 +883,113 @@ def test_131049_wait_24h_encoded_and_enforced():
                           retry=True)
     assert out.ok and len(m.calls) == 2
     assert a.outbox_record("k-131049")["attempts"] == 2
+
+
+# -- full owner+resource partitioning (their findings on 87afc1e) -----------
+
+def _other_resource_adapter(store, now, owner=OWNER):
+    resource = "whatsapp:waba:other-waba:phone:other-phone-id"
+    def grant_b(req):
+        return {"grant_id": "grant-1", "allowed": True,
+                "idempotency_key": req.idempotency_key, "to": req.to,
+                "owner": owner, "resource": resource,
+                "action": req.action,
+                "content_sha256": req.content_sha256,
+                "expires_at": 9_999_999_999.0}
+    mB = FakeMeta()
+    aB = WhatsAppStagingAdapter(
+        mB, "other-phone-id", "t",
+        [RecipientBinding(ME, "other-phone-id", True)],
+        clock=lambda: now[0], app_secret=SECRET, canonical_grant=grant_b,
+        waba_id="other-waba", owner=owner, outbox_store=store)
+    mB.pnid = "other-phone-id"
+    return mB, aB
+
+
+def test_outbox_success_never_leaks_across_resources(tmp_path):
+    # Their repro: a stale send-SUCCESS under resource A must NOT return
+    # A's wamid to resource B with duplicate=True and zero B transport.
+    path = str(tmp_path / "shared.json")
+    now = [1000.0]
+    mA, aA = make(now=now, store=JsonOutboxStore(path))
+    outA = aA.send_template(ME, "hello_world", idempotency_key="k-shared")
+    assert outA.wamid == "wamid.test" and len(mA.calls) == 1
+    mB, aB = _other_resource_adapter(JsonOutboxStore(path), now)
+    outB = aB.send_template(ME, "hello_world", idempotency_key="k-shared")
+    assert len(mB.calls) == 1                  # B performs its OWN send
+    recB = aB.outbox_record("k-shared")
+    assert recB["state"] == "sent"
+    assert recB["response"]["wamid"] == "wamid.test"  # B's own transport
+    # A's record is untouched and still A-scoped
+    assert aA.outbox_record("k-shared")["claimant"] != recB["claimant"]
+
+
+def test_receipts_never_visible_across_resources(tmp_path):
+    # Their repro: A's receipt must be invisible to B.
+    path = str(tmp_path / "shared.json")
+    now = [1000.0]
+    mA, aA = make(now=now, store=JsonOutboxStore(path))
+    payload = {"entry": [{"id": WABA, "changes": [{"value": {
+        "metadata": {"phone_number_id": PNID},
+        "statuses": [{"id": "wamid.onlyA", "status": "read",
+                      "timestamp": "1000", "recipient_id": ME}]}}]}]}
+    body = json.dumps(payload).encode()
+    sig = "sha256=" + hmac.new(SECRET.encode(), body,
+                               hashlib.sha256).hexdigest()
+    aA.handle_inbound_webhook(body, sig)
+    assert aA.receipt("wamid.onlyA")["status"] == "read"
+    mB, aB = _other_resource_adapter(JsonOutboxStore(path), now)
+    assert aB.receipt("wamid.onlyA") is None   # cross-resource invisible
+    assert len(aB.statuses) == 0
+
+
+def test_window_never_shared_across_owners(tmp_path):
+    # Their repro: same resource, DIFFERENT owner - the window must not
+    # be usable cross-owner.
+    path = str(tmp_path / "shared.json")
+    now = [1000.0]
+    mX, aX = make(now=now, store=JsonOutboxStore(path))   # owner:test
+    body, sig = webhook([msg(mid="wam-ownX", ts=1000)])
+    assert len(aX.handle_inbound_webhook(body, sig)) == 1
+    assert aX.in_window(ME) is True
+    mY = FakeMeta()
+    def grant_y(req):
+        return {"grant_id": "grant-1", "allowed": True,
+                "idempotency_key": req.idempotency_key, "to": req.to,
+                "owner": "owner:someone-else", "resource": RESOURCE,
+                "action": req.action,
+                "content_sha256": req.content_sha256,
+                "expires_at": 9_999_999_999.0}
+    aY = WhatsAppStagingAdapter(
+        mY, PNID, "t", [RecipientBinding(ME, PNID, True)],
+        clock=lambda: now[0], app_secret=SECRET, canonical_grant=grant_y,
+        waba_id=WABA, owner="owner:someone-else",
+        outbox_store=JsonOutboxStore(path))
+    assert aY.in_window(ME) is False           # no cross-owner window
+    with pytest.raises(WhatsAppError) as e:
+        aY.send_text(ME, "hello")
+    assert e.value.code == 131047
+    assert len(mY.calls) == 0                  # zero effects
+
+
+def test_receipt_binds_the_exact_send_key(tmp_path):
+    # wamid binding: a webhook receipt for a wamid this adapter sent is
+    # stamped with the exact send record key it belongs to.
+    path = str(tmp_path / "shared.json")
+    now = [1000.0]
+    mA, aA = make(now=now, store=JsonOutboxStore(path))
+    out = aA.send_template(ME, "hello_world", idempotency_key="k-bind")
+    payload = {"entry": [{"id": WABA, "changes": [{"value": {
+        "metadata": {"phone_number_id": PNID},
+        "statuses": [{"id": out.wamid, "status": "delivered",
+                      "timestamp": "1001", "recipient_id": ME}]}}]}]}
+    body = json.dumps(payload).encode()
+    sig = "sha256=" + hmac.new(SECRET.encode(), body,
+                               hashlib.sha256).hexdigest()
+    aA.handle_inbound_webhook(body, sig)
+    store = JsonOutboxStore(path)
+    rec = store.receipt(f"{aA._ns}:{out.wamid}")
+    assert rec["status"]["status"] == "delivered"
+    assert rec["send_key"] == f"send:{aA._ns}:k-bind"
+    # the outbox record itself binds the exact wamid of ITS send
+    assert aA.outbox_record("k-bind")["receipt"]["wamid"] == out.wamid

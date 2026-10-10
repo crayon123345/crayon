@@ -115,6 +115,23 @@ automation of any personal number, no paid routes.
   guidance above comes from the Cloud API overview "Test resources"
   section (quoted there), NOT from the error-codes reference.
 
+- FULL OWNER+RESOURCE PARTITIONING OF ALL STATE: every piece of
+  adapter state on the store is namespaced by owner+resource
+  (owner:waba:phone): outbox send records (send:<ns>:<key>), dedupe
+  marks (seen:<ns>:), session windows (win:<ns>:<sender>) and receipts
+  (rcpt:<ns>:<wamid>). On a shared store file: a send-SUCCESS under
+  resource A is invisible to resource B (B performs its OWN send -
+  effect-counting test), A's receipts are invisible to B (receipt()
+  returns None, statuses empty), and a window under owner X is closed
+  for owner Y even on the SAME resource (send refused 131047, zero
+  effects). WAMID BINDING: the outbox record binds the exact wamid its
+  own transport call returned (receipt.wamid on the record; duplicate
+  and conflict paths return that record verbatim), and a webhook
+  receipt whose wamid matches a local send is stamped with that send's
+  exact store key (send_key on the rcpt row) - a later duplicate check
+  can never return a mismatched receipt. Tracked binaries: none -
+  __pycache__/*.pyc removed from the branch and .gitignore covers them.
+
 - Inbound handling (synthetic): X-Hub-Signature-256 HMAC validation, then
   ALL-OR-NOTHING validation of the WHOLE entry set - resource binding
   (entry WABA id AND metadata phone_number_id) plus per-message shape and
@@ -157,7 +174,7 @@ Activation gates live with the canonical engine.
 
 ## Tests
 
-`pytest ports/whatsapp` - 79 synthetic tests, the review-fix repros
+`pytest ports/whatsapp` - 83 synthetic tests, the review-fix repros
 counting EFFECTS (transport calls), not just state: owner-verified
 recipient binding + cap, window logic, template vs free-form, 141006
 card-free guidance, 131000-as-generic-unknown, signature validation,

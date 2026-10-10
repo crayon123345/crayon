@@ -357,7 +357,8 @@ class JsonOutboxStore:
         (resource: WABA+phone id) - a window or dedupe mark under one
         resource NEVER applies to another, even on a shared store file.
         Returns the accepted (non-duplicate) messages."""
-        seen_p, win_p, rcpt_p = (f"seen:{ns}:", f"win:{ns}:", "rcpt:")
+        seen_p, win_p, rcpt_p = (f"seen:{ns}:", f"win:{ns}:",
+                                 f"rcpt:{ns}:")
         def fn(rows):
             # prune dedupe + receipt horizon inside the same transaction
             for k in [k for k in rows
@@ -381,7 +382,13 @@ class JsonOutboxStore:
             for st in statuses:
                 sid = st.get("id")
                 if sid:
-                    rows[rcpt_p + sid] = {"ts": now, "status": st}
+                    send_key = next(
+                        (k for k in rows
+                         if k.startswith(f"send:{ns}:")
+                         and (rows[k] or {}).get("receipt", {})
+                         .get("wamid") == sid), None)
+                    rows[rcpt_p + sid] = {
+                        "ts": now, "status": st, "send_key": send_key}
             return accepted
         return self._mutate(fn)
 
@@ -445,7 +452,8 @@ class MemOutboxStore:
 
     def apply_inbound(self, messages, statuses, now, window_senders,
                       horizon, ns):
-        seen_p, win_p, rcpt_p = (f"seen:{ns}:", f"win:{ns}:", "rcpt:")
+        seen_p, win_p, rcpt_p = (f"seen:{ns}:", f"win:{ns}:",
+                                 f"rcpt:{ns}:")
         with self._lk:
             for k in [k for k in self._rows
                       if k.startswith((seen_p, rcpt_p))
@@ -468,7 +476,13 @@ class MemOutboxStore:
             for st in statuses:
                 sid = st.get("id")
                 if sid:
-                    self._rows[rcpt_p + sid] = {"ts": now, "status": st}
+                    send_key = next(
+                        (k for k in self._rows
+                         if k.startswith(f"send:{ns}:")
+                         and (self._rows[k] or {}).get("receipt", {})
+                         .get("wamid") == sid), None)
+                    self._rows[rcpt_p + sid] = {
+                        "ts": now, "status": st, "send_key": send_key}
             return accepted
 
     def receipt(self, wamid):
@@ -538,13 +552,17 @@ class WhatsAppStagingAdapter:
         the adapter only persists raw status receipts keyed by wamid and
         exposes them; matching receipts to outbox records and resolving
         'unknown' sends is the canonical engine's job at activation."""
+        pre = f"rcpt:{self._ns}:"
+        # store.receipt() re-applies the "rcpt:" prefix, so strip only that
         return [self._outbox.receipt(k[5:])["status"]
-                for k in self._outbox.keys_with_prefix("rcpt:")
+                for k in self._outbox.keys_with_prefix(pre)
                 if self._outbox.receipt(k[5:])]
 
     def receipt(self, wamid):
-        """Durable receipt lookup by Meta message id (wamid)."""
-        rec = self._outbox.receipt(wamid)
+        """Durable receipt lookup by Meta message id (wamid), scoped to
+        THIS owner+resource: a wamid recorded under another resource is
+        invisible here (a wamid from A means nothing to B's outbox)."""
+        rec = self._outbox.receipt(f"{self._ns}:{wamid}")
         return rec.get("status") if rec else None
 
     @property
@@ -553,10 +571,13 @@ class WhatsAppStagingAdapter:
 
     @property
     def _ns(self):
-        """Store namespace for replay/window state: the exact resource.
-        Two adapters sharing one store file NEVER share windows or dedupe
-        marks across resources (cross-resource leak closed)."""
-        return f"{self._waba_id}:{self._pnid}"
+        """Store namespace for ALL adapter state (outbox sends, dedupe
+        marks, windows, receipts): owner + the exact resource. Two
+        adapters sharing one store file NEVER share sends, windows,
+        dedupe marks or receipts across resources OR owners - a stale
+        success under resource A is invisible to resource B, and a
+        window under owner X is closed for owner Y."""
+        return f"{self._owner}:{self._waba_id}:{self._pnid}"
 
     # -- durable replay/window state ---------------------------------------
     def _window_get(self, sender):
@@ -751,7 +772,7 @@ class WhatsAppStagingAdapter:
 
     def _dispatch(self, req, retry=False):
         grant = self._grant(req)  # every refusal lands before the store
-        key = "send:" + req.idempotency_key
+        key = f"send:{self._ns}:" + req.idempotency_key
         record = {"state": "claimed",
                   "request": {"to": req.to, "type": req.type,
                               "body": req.body},
@@ -899,7 +920,7 @@ class WhatsAppStagingAdapter:
                                  grant_id=grant.get("grant_id"))
 
     def outbox_record(self, idempotency_key):
-        return self._outbox.get("send:" + idempotency_key)
+        return self._outbox.get(f"send:{self._ns}:" + idempotency_key)
 
     def _require_bound(self, recipient):
         if recipient not in self._bindings:
