@@ -1,58 +1,77 @@
 # /ports/find - find core: planned queries, verified citations, sources panel
 
-Find-feature upgrade. User research on AI search products (ChatGPT
-search, Perplexity, Gemini) shows the loudest complaints are: wrong or
-invented citations, single-search shallowness, missing source dates,
-and answers that forget the previous question. This module owns the
-DECISIONS around a web find; searching and fetching are
+Find-feature upgrade, port 1 of 3. User research on AI search products
+(ChatGPT search, Perplexity, Gemini) shows the loudest complaints are
+wrong or invented citations, single-search shallowness, missing source
+dates, and answers that forget the previous question. This module owns
+the DECISIONS around a web find; searching and fetching are
 integration-injected callables - it never touches the network.
+
+## REUSE BOUNDARY (not a parallel stack)
+
+The running app already owns: research/comparison fanout
+(cr_web.research), the production fetched-page claim/citation gate
+(cr_citations.checked_answer), dated news search (cr_web.news), and
+conversation context (cr_memory). This module adds ONLY what those do
+not have: a validated planning API, RECORDED citation drops, the
+canonical sources panel, explicit owner-local recency windows, and
+ordinal follow-up references. The citation support check is injectable
+(`support_fn`); production wiring must use the existing checked_answer
+gate - the shipped `reference_support` is a hardened stdlib reference
+for source-only testing. No searching, fetching, news handling or
+conversation memory lives here. URL identity comes from the shared
+ports/find/urlcanon.py (also imported by ports/find_track).
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (28/28 tests) but NOT wired into the
+Complete as a tested module (44/44 tests) but NOT wired into the
 running app. Named limits, exactly:
 
 1. VERIFIED CITATIONS ONLY: a citation survives only when its URL is
-   fetched through the injected fetcher AND the fetched content
-   supports the claim (token-overlap >= 0.34 of claim tokens).
-   Unfetchable or unsupported citations are DROPPED and recorded with
-   their reason - never presented. (Probe: 1000/1000 fabricated
-   citations dropped, zero presented.)
-2. UNKNOWN REFUSES WITHOUT RETRY: a fetch error drops that citation
-   (probe: 20/20 dropped, exactly 20 fetch calls - no retries) and the
-   module never substitutes a different URL.
-3. DETERMINISTIC PLANNING: the fallback decomposer is pure
-   (compare/X-and-Y splitting, dedup, cap 4). An injected planner's
-   output is validated - over 4 subqueries, empty entries, or
-   over-length entries REFUSE the whole plan with zero effects.
-4. RECENCY IS EXPLICIT: today/yesterday/this week/this month/
-   latest/in <year> resolve to concrete [after, before) windows
-   against the injected clock, carried on the plan so the integration
-   can bound its search.
-5. OWNER-STRICT SESSIONS: follow-up references (first..tenth, last)
-   resolve only against the owner's own last verified sources. Probe:
-   u1 byte-identical after 200 u2 operations (150 cap-refusals); u2
-   sees no session.
-6. CAPS REFUSE, NEVER EVICT: MAX_PLANS_PER_OWNER = 50, MAX_CLAIMS = 20
-   per batch, MAX_SOURCES = 10 per panel - overflow raises with zero
-   effects (over-cap claim batches leave the plan untouched; tested).
-7. OVERFLOW REJECTS, NEVER TRUNCATES: query (500), subquery (500),
-   claim text (1000), url (500) over bound raise; truncation could
-   alias distinct requests. Exactly-max boundary accepted (tested).
-8. URL DEDUP IS CANONICAL: lowercase scheme+host, www stripped,
-   fragments and tracking params (utm_*, gclid, fbclid, ...) removed,
-   trailing slashes folded - two citations of one page show once.
-9. READ-ONLY, NOT MOUNTED: no action paths. The integration runs
-   searches/fetches and renders; this module owns state and decisions.
+   fetched AND the content supports the claim. Drops are recorded with
+   reason (bad_url / fetch_failed / empty_content / unsupported /
+   support_error) - never presented, never retried, never substituted.
+   Probes: 1000/1000 fabricated disjoint-token citations dropped; 500/
+   500 contradiction + numeric near-miss citations dropped.
+2. SUPPORT IS MORE THAN SHARED TOKENS: the reference gate scores the
+   best sentence-window, requires every numeric token in the claim in
+   that window, and requires exact negation parity - "drug cures
+   cancer" vs "drug does not cure cancer" and "999 million" vs
+   "10 million" both refuse (tested both directions).
+3. ATOMIC VERIFICATION: verified/dropped/sources/session are computed
+   and validated BEFORE any commit; a source-cap violation refuses the
+   whole batch leaving prior plan state and the session byte-identical
+   (regression-tested; probe: 200/200 refused, identical every time).
+4. DETERMINISTIC PLANNING: fallback decomposer REFUSES questions that
+   decompose past 4 subqueries (no silent subject drops - "alpha;
+   beta; gamma; delta; epsilon" refuses, tested); injected planner
+   output validated identically.
+5. RECENCY IS EXPLICIT + OWNER-LOCAL: today/yesterday are owner-local
+   days via injected tz offset (UTC default); this/last week are ISO
+   Monday weeks; this/last month are calendar months; past week/month
+   are rolling 7/30 days; latest/recent/news is rolling 7 days. Each
+   distinct, boundary-tested.
+6. URL IDENTITY PRESERVES SCHEME + PORT: http://a.example:8080/x and
+   https://a.example:9090/x are DIFFERENT resources (tested); default
+   ports fold; www/fragments/tracking params/trailing slashes strip.
+   Redirect/canonical equivalence is the integration's to resolve
+   before feeding urls.
+7. OWNER-STRICT SESSIONS: first..tenth/last follow-ups resolve only
+   against the owner's own last verified sources; session reads return
+   deep snapshots (caller mutation cannot corrupt state, tested).
+8. CAPS REFUSE, NEVER EVICT; OVERFLOW REJECTS, NEVER TRUNCATES:
+   plans 50/owner, claims 20/batch, sources 10/panel; query 500,
+   subquery 500, claim 1000, url 500; exactly-max accepted.
+9. READ-ONLY, NOT MOUNTED: no action paths, no network.
 
-## Integration surface (for the /integrated wiring)
+## Integration surface
 
-- `plan(owner, query, now, decompose_fn=None)` -> Plan(subqueries, window)
-- `verify(owner, pid, claims, fetch_fn, now)` -> {verified, dropped, sources}
-- `resolve_reference(owner, text)` -> {"index", "source"} | None
-- `sources(owner, pid)` / `session(owner)` / `export(owner)`
+- `plan(owner, query, now, decompose_fn=None, tz_offset_minutes=0)`
+- `verify(owner, pid, claims, fetch_fn, now, support_fn=None)` -
+  production: support_fn = checked_answer-backed gate
+- `resolve_reference(owner, text)`, `sources(owner, pid)`,
+  `session(owner)`, `export(owner)`
 
-The integration owns: running the subqueries against its search
-providers, fetching pages, rendering verified answers with their
-sources panel (titles, URLs, published dates), and any follow-up
-grammar. Claims it cannot fetch MUST NOT be rendered as cited.
+The integration owns: running subqueries (cr_web.search/research),
+fetching pages, rendering verified answers with the sources panel, and
+follow-up grammar. Claims it cannot fetch MUST NOT render as cited.
