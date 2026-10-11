@@ -4,9 +4,11 @@ Status: MODEL ONLY, UNWIRED. Every construct in
 ports/memory/envelope.py is synthetic and non-authoritative; every
 production entry point is a fail-closed stub. Basis: PR-4 contract v6
 + peer DRAFT-READY verdict and controlling clarification (2026-10-11),
-plan v1 (PR-4 entry), seam prep v4.1 sec 7/9, contract v6, owner
-decisions record v1, PR-1/2/3 merged
-(main 1af1f78bcd97da0e7851311fb4551ad1f7df1c17).
+plus the peer first-pass review blockers 1-8 and final-verdict
+additions (scope order, current session/issuer, keyring uniqueness,
+explicit key boundary), all folded into this document. Plan v1 (PR-4
+entry), seam prep v4.1 sec 7/9, contract v6, owner decisions record
+v1, PR-1/2/3 merged (main 1af1f78bcd97da0e7851311fb4551ad1f7df1c17).
 
 Controlling paths (all NEW, no existing edits):
 - ports/memory/envelope.py
@@ -66,7 +68,14 @@ of scope), issuer (WEB SessionRef = 64-hex session hash, or TELEGRAM
 TelegramIssuer = bot_id positive int / chat_id signed BIGINT /
 update_id nonnegative int - never an invented session hash),
 operation_id (32 lower hex / 16 bytes), operation_class +
-required_scopes (PR-3 enums verbatim, <=7 scopes), audience
+required_scopes (PR-3 enums verbatim, <=7 scopes; the constructor
+normalizes to a UNIQUE SORTED canonical tuple - presentation order is
+never intent, set semantics only; required_scopes must EQUAL the PR-3
+derived set for the operation class, group action, and surface, with
+omission and widening both refused; PR-3 group rules apply verbatim:
+GROUP_WRITE requires a GROUP surface, and group-source
+WRITE/EXTRACT/GROUP_WRITE bind a concrete GROUP-kind audience with a
+non-None id, never inferred), audience
 (ModelOnlyAudience: kind {PRIVATE, GROUP, EXTERNAL}, id nonblank safe
 synthetic str <=128 UTF-8 bytes; id None ONLY where the operation
 permits - MODEL default: GROUP requires an id; NOT an enum of actual
@@ -81,15 +90,24 @@ restarted).
 
 Transport fields: nonce (independently generated 32 lower hex / 16
 bytes; injectable synthetic generator), format_version (==1), key_id
-(<=64 safe ASCII). Transport fields are EXCLUDED from idempotency
-ONLY - they remain authenticated and verified (outer routing must
-match the authenticated inner payload; mismatch refuses TAMPERED).
+(<=64 safe printable ASCII, never arbitrary Unicode). Transport
+fields are EXCLUDED from idempotency ONLY - they remain authenticated
+and verified (outer routing must match the authenticated inner
+payload; mismatch refuses TAMPERED).
+
+All hex fields are EXACT lowercase [0-9a-f] of the declared length:
+signs, 0x prefixes, whitespace, and separators refuse (MALFORMED).
+All safe strings reject lone surrogates and other unencodable input
+TYPED (MALFORMED) - no raw UnicodeEncodeError escapes.
 
 Canonical serialization: canonical JSON, UTF-8, sorted keys, compact
 separators; no floats, no NaN, no duplicate keys, no unknown fields;
 exact bytes-to-hex mapping. Strict decoding refuses unknown/missing/
 extra fields, enum drift, coercion (bool is not int; '1' is not 1),
-and duplicate keys - all MALFORMED.
+and duplicate keys - all MALFORMED. CANONICAL-FORM CHECK: the
+authenticated plaintext must BE byte-identical to the canonical
+re-serialization of the strictly parsed payload - pretty-printed or
+otherwise non-canonical authenticated JSON refuses (MALFORMED).
 
 ## 4. Caller context
 
@@ -97,14 +115,18 @@ ModelOnlyCallerContext = the ORIGINAL full binding (for equality)
 PLUS a separate coherent CURRENT snapshot for staleness:
 current_uid, current_lifetime, current_capture_epoch,
 current_grant_generation, current_policy_revision,
-current_decision_revision, current_consent_generation. Current times
-NEVER replace the original capture/expiry. verify_model compares
-EVERY projection field for equality, then every current-snapshot
-field for staleness; any mismatch is STALE (uid recreation,
-wipe/recreate, session revocation, grant/policy/decision/consent
-revision bumps). Envelope verification is INDEPENDENT of PR-3
-authorization; the future locked-store final check (PR-5) is still
-required and is not claimed here.
+current_decision_revision, current_consent_generation, AND a typed
+current_issuer (SessionRef | TelegramIssuer) with an explicit
+current_issuer_valid flag. Current times NEVER replace the original
+capture/expiry. verify_model compares EVERY projection field for
+equality, then every current-snapshot field for staleness; any
+mismatch is STALE (uid recreation, wipe/recreate,
+grant/policy/decision/consent revision bumps). A REVOKED
+(current_issuer_valid=False) or REPLACED (issuer mismatch) session/
+issuer is STALE even with uid/lifetime/revisions unchanged - the
+original is compared, never refreshed. Envelope verification is
+INDEPENDENT of PR-3 authorization; the future locked-store final
+check (PR-5) is still required and is not claimed here.
 
 ## 5. seal/verify order of checks
 
@@ -135,12 +157,24 @@ memory_markers is NOT implicitly a runtime nonce registry):
   operation_marker_ref; resolution_deadline.
 - model_used_nonces: PK (uid, lifetime, nonce); operation_id;
   commitment.
+- model_markers: PK marker_ref; uid, lifetime, operation_id,
+  commitment, owner_token, fence, outcome_ref (the FULL binding
+  evidence tuple).
+
+Every row read from the registry is shape-, exact-type-, and
+closed-state-validated at the boundary; corrupt rows refuse TYPED
+(MALFORMED). Raw sqlite operational failures propagate DISTINCTLY,
+unwrapped.
 
 Semantics:
 - claim_model: ONE atomic insert/read + nonce-validation transaction
-  across BOTH tables. Fresh claim -> ACQUIRED with fence=1 and a
-  fresh independently-random owner_token (16-byte hex). Fences are
-  NEVER reassigned or reused; there is NO lease rollover.
+  across BOTH tables. The clock is read INSIDE the acquired
+  transaction, immediately before the claim decision, and EVERY clock
+  read is validated (exact non-bool int within signed BIGINT); the
+  same rule holds in record_outcome_model before the
+  state/effect-marker decision. Fresh claim -> ACQUIRED with fence=1
+  and a fresh independently-random owner_token (16-byte hex). Fences
+  are NEVER reassigned or reused; there is NO lease rollover.
 - Same-operation reseal atomically REGISTERS the new nonce under the
   same operation - NEVER another claim. A nonce crossing to another
   operation REFUSES (REPLAY). CHANGED projection under the same
@@ -155,20 +189,26 @@ Semantics:
   the outcome land in the SAME disposable transaction - NEVER
   execute-after-expiry-then-mark. A CLAIMED row observed after expiry
   becomes a blocked EXPIRED tombstone (the tombstone write COMMITS
-  before the refusal). Duplicate/late records with the SAME known
-  outcome are idempotent; a CHANGED outcome refuses (REPLAY);
+  before the refusal). Duplicate/late records are compared against
+  the FULL immutable outcome (outcome_ref AND operation_marker_ref):
+  the SAME known outcome is idempotent; ANY change refuses (REPLAY);
   outcomes are never overwritten. Stale owner/fence refuses (REPLAY).
 - mark_uncertain_model: LOCAL receipt ONLY - a timeout CANNOT assert
   a durable UNKNOWN write; this method writes NOTHING.
 - resolve_unknown_model: resolves ONLY from ModelOnlyEffectEvidence
-  matching scope + binding commitment + owner_token + fence AND a
-  durable synthetic marker readback from the adapter. A caller flag
-  alone NEVER commits. INCONCLUSIVE or missing marker stays
-  UNKNOWN/BLOCKED - no blind retry, no fake not-written certainty, no
-  retry grant. LATE confirmed-marker evidence CAN resolve UNKNOWN
-  after expiry (accounting for an already-occurring effect) but NEVER
-  grants fresh execution. EXPIRED tombstones never reopen. UNKNOWN
-  never auto-expires to NEW.
+  whose OWN owner_token/fence match the claim's (method arguments
+  alone are insufficient) AND whose scope + binding commitment match,
+  AND a durable synthetic marker readback from the adapter that
+  carries the FULL binding: scope (uid, lifetime, operation_id),
+  canonical commitment, owner_token, fence, marker ref, and the FULL
+  outcome ref. Global marker/outcome existence is NEVER sufficient; a
+  caller CONFIRMED with an unrelated marker NEVER commits.
+  INCONCLUSIVE or missing/mismatched marker stays UNKNOWN/BLOCKED -
+  no blind retry, no fake not-written certainty, no retry grant. LATE
+  confirmed-marker evidence CAN resolve UNKNOWN after expiry
+  (accounting for an already-occurring effect) but NEVER grants fresh
+  execution. EXPIRED tombstones never reopen. UNKNOWN never
+  auto-expires to NEW.
 - readback_model: typed ModelOnlyRegistryRecord ONLY
   (status/scope/state/expiry/resolution_deadline/outcome) - never
   commitment, raw token, owner secret, or fingerprint.
@@ -207,16 +247,32 @@ Semantics:
 
 SyntheticKey {algorithm: FERNET, format: 1, key_id, not_before,
 decrypt_until, public fixture material}. Key lookup is EXPLICIT
-retained-key only. Format version and key_id are bound in the OUTER
-routing AND the authenticated inner payload; mismatch refuses. The
-envelope key is DISTINCT from the PR-2 marker key and the PR-9
-content key - three purposes, three keys; no reuse is implied.
-Decrypt keys are retained only until max envelope expiry +
-RESOLUTION_WINDOW. No runtime env loading (production_load refuses);
-the future real key route is OPEN, vault-only, the implementing
-side's decision; NO credential action in this PR. Fernet's actual
-metadata/size/age behavior is checked against library docs during
-implementation review - no "opaque everything" claim.
+retained-key only, and the keyring requires a UNIQUE key_id mapping -
+duplicate ids refuse at construction. The decrypt_until boundary is
+EXPLICIT and INCLUSIVE: the key is usable at now == decrypt_until and
+UNAVAILABLE from decrypt_until + 1; there is no implicit grace
+period. Format version and key_id are bound in the OUTER routing AND
+the authenticated inner payload; mismatch refuses. The envelope key
+is DISTINCT from the PR-2 marker key and the PR-9 content key - three
+purposes, three keys; no reuse is implied. Decrypt keys are retained
+only until max envelope expiry + RESOLUTION_WINDOW. No runtime env
+loading (production_load refuses); the future real key route is OPEN,
+vault-only, the implementing side's decision; NO credential action in
+this PR. Fernet's actual metadata/size/age behavior is checked
+against library docs during implementation review - no "opaque
+everything" claim.
+
+FERNET NOTES (review-verified): the Fernet token's timestamp is
+PLAINTEXT-VISIBLE in the token; Fernet.decrypt is called WITHOUT a
+ttl, so the token's own age is ignored - freshness derives ONLY from
+the checked AUTHENTICATED capture_time/expiry inside the payload,
+never from token metadata. InvalidToken covers malformed, signature,
+and ttl failures; there is no trial-all fallback. Dependency
+environment: the repo declares cryptography>=42,<47
+(crayon-pratham/requirements.txt); the peer's reviewer reran this
+slice's tests on disposable 46.0.7 (in-range) and our side ran them
+on 50.0.1 - the model uses only the stable Fernet API; conformance is
+asserted in the DECLARED environment, not on 50.0.1 alone.
 
 Fixed refusal codes (closed taxonomy, safe, no echo): MALFORMED,
 TAMPERED, STALE, EXPIRED, REPLAY, IN_PROGRESS, UNKNOWN,

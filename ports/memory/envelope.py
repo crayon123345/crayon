@@ -145,25 +145,37 @@ def _req_enum(value, enum_cls):
 
 
 def _req_hex(value, length):
+    # EXACT lowercase [0-9a-f] only: signs, 0x prefixes, whitespace, and
+    # separators all refuse
     if type(value) is not str or len(value) != length:
         raise EnvelopeError(EnvelopeCode.MALFORMED)
-    if value != value.lower():
-        raise EnvelopeError(EnvelopeCode.MALFORMED)
-    try:
-        int(value, 16)
-    except ValueError:
-        raise EnvelopeError(EnvelopeCode.MALFORMED)
+    for ch in value:
+        if ch not in "0123456789abcdef":
+            raise EnvelopeError(EnvelopeCode.MALFORMED)
     return value
 
 
 def _req_safe_str(value, max_bytes):
     if type(value) is not str or not value or value != value.strip():
         raise EnvelopeError(EnvelopeCode.MALFORMED)
-    raw = value.encode("utf-8")
+    try:
+        raw = value.encode("utf-8")
+    except UnicodeEncodeError:
+        # lone surrogates and other unencodable input refuse TYPED
+        raise EnvelopeError(EnvelopeCode.MALFORMED)
     if len(raw) > max_bytes:
         raise EnvelopeError(EnvelopeCode.MALFORMED)
     for ch in value:
         if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise EnvelopeError(EnvelopeCode.MALFORMED)
+    return value
+
+
+def _req_ascii_id(value, max_chars):
+    # key_id: safe printable ASCII ONLY - never arbitrary Unicode
+    _req_safe_str(value, max_chars)
+    for ch in value:
+        if ord(ch) > 0x7E:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
     return value
 
@@ -292,6 +304,38 @@ class ModelOnlyAudience:
 
 
 # ---------------------------------------------------------------------------
+# Scope derivation (PR-3 rules mirrored: exact derived set, group source)
+# ---------------------------------------------------------------------------
+
+_BASE_SCOPES = {
+    cap.OperationClass.READ: frozenset({cap.Scope.MEMORY_READ}),
+    cap.OperationClass.WRITE: frozenset({cap.Scope.MEMORY_WRITE}),
+    cap.OperationClass.ERASE: frozenset({cap.Scope.MEMORY_ERASE}),
+    cap.OperationClass.EXTRACT: frozenset({cap.Scope.MEMORY_EXTRACT}),
+    cap.OperationClass.SHARE: frozenset({cap.Scope.DATA_SHARE}),
+    cap.OperationClass.SENSITIVE: frozenset({cap.Scope.MEMORY_SENSITIVE}),
+}
+
+
+def _derive_required_scopes(operation_class, group_action, surface):
+    cls = operation_class
+    if cls is cap.OperationClass.GROUP_WRITE:
+        scopes = {cap.Scope.MEMORY_GROUP_WRITE}
+        if group_action is cap.GroupAction.WRITE:
+            scopes.add(cap.Scope.MEMORY_WRITE)
+        else:
+            scopes.add(cap.Scope.MEMORY_EXTRACT)
+    else:
+        scopes = set(_BASE_SCOPES[cls])
+    if surface is cap.Surface.GROUP and cls in (
+            cap.OperationClass.WRITE, cap.OperationClass.EXTRACT):
+        # group-SOURCE private write/extract additionally needs
+        # group_write; data.share NEVER implies memory.group_write
+        scopes.add(cap.Scope.MEMORY_GROUP_WRITE)
+    return frozenset(scopes)
+
+
+# ---------------------------------------------------------------------------
 # IntentBinding projection (EXACT; transport fields excluded)
 # ---------------------------------------------------------------------------
 
@@ -353,6 +397,9 @@ class ModelOnlyRequestBinding:
             _req_enum(scope, cap.Scope)
         if len(set(scopes)) != len(scopes):
             raise EnvelopeError(EnvelopeCode.MALFORMED)
+        # canonical UNIQUE SORTED tuple: order of presentation is never
+        # intent - set semantics, one canonical form for equality
+        scopes = tuple(sorted(scopes, key=lambda sc: sc.value))
         object.__setattr__(self, "required_scopes", scopes)
         if type(self.audience) is not ModelOnlyAudience:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
@@ -385,6 +432,26 @@ class ModelOnlyRequestBinding:
                 raise EnvelopeError(EnvelopeCode.MALFORMED)
         elif self.extraction_intent is not cap.ExtractionIntent.NOT_APPLICABLE:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
+        # PR-3 scope derivation, reused verbatim: required_scopes must
+        # EQUAL the derived set (omission and widening both refuse)
+        derived = _derive_required_scopes(
+            self.operation_class, self.group_action, self.surface)
+        if frozenset(self.required_scopes) != derived:
+            raise EnvelopeError(EnvelopeCode.MALFORMED)
+        # PR-3 group rules, reused verbatim: GROUP_WRITE names a
+        # group-SOURCE operation and requires a concrete group source;
+        # group-source writes/extracts must bind the concrete group
+        # audience (kind GROUP with a non-None id) - never inferred
+        if (self.operation_class is cap.OperationClass.GROUP_WRITE
+                and self.surface is not cap.Surface.GROUP):
+            raise EnvelopeError(EnvelopeCode.MALFORMED)
+        if (self.surface is cap.Surface.GROUP
+                and self.operation_class in (
+                    cap.OperationClass.WRITE, cap.OperationClass.EXTRACT,
+                    cap.OperationClass.GROUP_WRITE)):
+            if (self.audience.kind is not AudienceKind.GROUP
+                    or self.audience.id is None):
+                raise EnvelopeError(EnvelopeCode.MALFORMED)
         _req_int(self.capture_time, 0)
         _req_int(self.expiry, 0)
         # Immutable submitted expiry: expiry == capture_time + MAX_AGE,
@@ -503,7 +570,7 @@ class ModelOnlyCapturedPayload:
         _req_int(self.format_version, 1)
         if self.format_version != FORMAT_VERSION:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
-        _req_safe_str(self.key_id, KEY_ID_MAX_CHARS)
+        _req_ascii_id(self.key_id, KEY_ID_MAX_CHARS)
 
     def to_dict(self) -> dict:
         out = self.binding.projection_dict()
@@ -543,7 +610,7 @@ class ModelOnlyEnvelope:
 
     def __post_init__(self):
         _req_int(self.format_version, 1)
-        _req_safe_str(self.key_id, KEY_ID_MAX_CHARS)
+        _req_ascii_id(self.key_id, KEY_ID_MAX_CHARS)
         if type(self.token) is not bytes:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
 
@@ -571,8 +638,12 @@ class ModelOnlyVerifiedCapture:
 @dataclass(frozen=True)
 class ModelOnlyCallerContext:
     """ONE coherent synthetic snapshot: the ORIGINAL full binding for
-    equality PLUS a separate CURRENT identity/epoch/revision snapshot for
-    staleness. Current times NEVER replace the original capture/expiry."""
+    equality PLUS a separate CURRENT identity/issuer/epoch/revision
+    snapshot for staleness. Current times NEVER replace the original
+    capture/expiry. The current issuer/session is typed and EXPLICITLY
+    validity-flagged: a revoked or replaced session/issuer is STALE even
+    with uid/lifetime/revisions unchanged - the original is compared,
+    never refreshed."""
     original_binding: ModelOnlyRequestBinding
     current_uid: int
     current_lifetime: int
@@ -581,6 +652,8 @@ class ModelOnlyCallerContext:
     current_policy_revision: int
     current_decision_revision: int
     current_consent_generation: int
+    current_issuer: object  # SessionRef | TelegramIssuer (exact types)
+    current_issuer_valid: bool
 
     def __post_init__(self):
         if type(self.original_binding) is not ModelOnlyRequestBinding:
@@ -592,6 +665,9 @@ class ModelOnlyCallerContext:
         _req_int(self.current_policy_revision, 0)
         _req_int(self.current_decision_revision, 0)
         _req_int(self.current_consent_generation, 0)
+        if type(self.current_issuer) not in (SessionRef, TelegramIssuer):
+            raise EnvelopeError(EnvelopeCode.MALFORMED)
+        _req_bool(self.current_issuer_valid)
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +691,7 @@ class SyntheticKey:
         _req_int(self.format_version, 1)
         if self.format_version != FORMAT_VERSION:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
-        _req_safe_str(self.key_id, KEY_ID_MAX_CHARS)
+        _req_ascii_id(self.key_id, KEY_ID_MAX_CHARS)
         _req_int(self.not_before, 0)
         _req_int(self.decrypt_until, 0)
         if self.decrypt_until <= self.not_before:
@@ -624,24 +700,32 @@ class SyntheticKey:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
 
     def usable_at(self, now: int) -> bool:
+        # EXPLICIT boundary: decrypt_until is INCLUSIVE - the key is
+        # usable at now == decrypt_until and UNAVAILABLE from
+        # decrypt_until + 1. There is no implicit grace period.
         return self.not_before <= now <= self.decrypt_until
 
 
 @dataclass(frozen=True)
 class SyntheticKeyRing:
     """Explicit retained-key lookup ONLY: no trial-all, no fallback, no
-    refresh, no re-encryption TTL extension."""
+    refresh, no re-encryption TTL extension. key_id mapping is UNIQUE -
+    duplicate ids refuse at construction."""
     keys: Tuple[SyntheticKey, ...]
 
     def __post_init__(self):
         if type(self.keys) is not tuple:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
+        seen = set()
         for key in self.keys:
             if type(key) is not SyntheticKey:
                 raise EnvelopeError(EnvelopeCode.MALFORMED)
+            if key.key_id in seen:
+                raise EnvelopeError(EnvelopeCode.MALFORMED)
+            seen.add(key.key_id)
 
     def lookup(self, key_id: str, now: int) -> SyntheticKey:
-        _req_safe_str(key_id, KEY_ID_MAX_CHARS)
+        _req_ascii_id(key_id, KEY_ID_MAX_CHARS)
         _req_int(now, 0)
         for key in self.keys:
             if key.key_id == key_id:
@@ -678,6 +762,12 @@ def _req_clock(clock) -> ModelOnlyClock:
     return clock
 
 
+def _clock_now(clock) -> int:
+    # EVERY clock read is validated (exact non-bool int within BIGINT);
+    # a good first read never validates a bad later one
+    return _req_int(clock.now(), 0)
+
+
 # ---------------------------------------------------------------------------
 # seal_model / verify_model (VERIFY NEVER CLAIMS)
 # ---------------------------------------------------------------------------
@@ -691,7 +781,7 @@ def seal_model(payload: ModelOnlyCapturedPayload, key: SyntheticKey,
     if type(key) is not SyntheticKey:
         raise EnvelopeError(EnvelopeCode.MALFORMED)
     clock = _req_clock(clock)
-    now = clock.now()
+    now = _clock_now(clock)
     if key.algorithm is not Algorithm.FERNET or not key.usable_at(now):
         raise EnvelopeError(EnvelopeCode.KEY_UNAVAILABLE)
     if payload.key_id != key.key_id:
@@ -724,7 +814,7 @@ def verify_model(envelope: ModelOnlyEnvelope, keyring: SyntheticKeyRing,
     if type(current_context) is not ModelOnlyCallerContext:
         raise EnvelopeError(EnvelopeCode.MALFORMED)
     clock = _req_clock(clock)
-    now = clock.now()
+    now = _clock_now(clock)
     # outer bound BEFORE decrypt
     if len(envelope.token) > OUTER_TOKEN_MAX_BYTES:
         raise EnvelopeError(EnvelopeCode.MALFORMED)
@@ -742,6 +832,11 @@ def verify_model(envelope: ModelOnlyEnvelope, keyring: SyntheticKeyRing,
     if len(plaintext) > PLAINTEXT_MAX_BYTES:
         raise EnvelopeError(EnvelopeCode.MALFORMED)
     payload = ModelOnlyCapturedPayload.from_dict(_strict_loads(plaintext))
+    # canonical-form check: the authenticated plaintext must BE the
+    # canonical serialization of the strictly parsed payload - pretty
+    # printing, reserialized drift, or reordered keys refuse
+    if _canon(payload.to_dict()) != plaintext:
+        raise EnvelopeError(EnvelopeCode.MALFORMED)
     # format/key bound in outer routing AND authenticated inner payload
     if (envelope.format_version != payload.format_version
             or envelope.key_id != payload.key_id):
@@ -767,6 +862,12 @@ def verify_model(envelope: ModelOnlyEnvelope, keyring: SyntheticKeyRing,
             != current_context.current_decision_revision
             or binding.consent_generation
             != current_context.current_consent_generation):
+        raise EnvelopeError(EnvelopeCode.STALE)
+    # current issuer/session: revoked or replaced is STALE even with
+    # uid/lifetime/revisions unchanged
+    if not current_context.current_issuer_valid:
+        raise EnvelopeError(EnvelopeCode.STALE)
+    if binding.issuer != current_context.current_issuer:
         raise EnvelopeError(EnvelopeCode.STALE)
     return ModelOnlyVerifiedCapture(status=cap.ModelStatus.MODEL_ONLY,
                                     payload=payload, binding=payload.binding)
@@ -920,6 +1021,28 @@ class ModelOnlyEffectEvidence:
 # Synthetic registry adapter (disposable sqlite; NOT production DDL)
 # ---------------------------------------------------------------------------
 
+def _validate_operation_row(row):
+    # corrupt registry rows refuse TYPED (MALFORMED); raw sqlite
+    # operational failures propagate DISTINCTLY, unwrapped
+    if type(row) is not tuple or len(row) != 9:
+        raise EnvelopeError(EnvelopeCode.MALFORMED)
+    _req_hex(row[0], FINGERPRINT_HEX_LEN)          # commitment
+    _req_int(row[1], 0)                            # capture_time
+    _req_int(row[2], 0)                            # expiry
+    if type(row[3]) is not str or row[3] not in {
+            state.value for state in RegistryState}:
+        raise EnvelopeError(EnvelopeCode.MALFORMED)
+    _req_hex(row[4], OWNER_TOKEN_HEX_LEN)          # owner_token
+    _req_int(row[5], 1)                            # fence
+    if row[6] is not None:
+        _req_safe_str(row[6], REF_MAX_BYTES)       # outcome_ref
+    if row[7] is not None:
+        _req_safe_str(row[7], REF_MAX_BYTES)       # operation_marker_ref
+    if (row[6] is None) != (row[7] is None):
+        raise EnvelopeError(EnvelopeCode.MALFORMED)
+    _req_int(row[8], 0)                            # resolution_deadline
+
+
 class SyntheticRegistryAdapter:
     """Disposable sqlite adapter. Owns BOTH tables plus the durable marker
     table. A synthetic local choice - PR-2's memory_markers is NOT
@@ -946,7 +1069,10 @@ class SyntheticRegistryAdapter:
             " PRIMARY KEY (uid, lifetime, nonce))")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS model_markers ("
-            "marker_ref TEXT PRIMARY KEY, outcome_ref TEXT NOT NULL)")
+            "marker_ref TEXT PRIMARY KEY, uid BIGINT NOT NULL,"
+            " lifetime BIGINT NOT NULL, operation_id TEXT NOT NULL,"
+            " commitment TEXT NOT NULL, owner_token TEXT NOT NULL,"
+            " fence BIGINT NOT NULL, outcome_ref TEXT NOT NULL)")
         self._db.commit()
 
     def transaction(self):
@@ -959,13 +1085,22 @@ class SyntheticRegistryAdapter:
             " FROM model_operations WHERE uid=? AND lifetime=?"
             " AND operation_id=?",
             (scope.uid, scope.lifetime, scope.operation_id)).fetchone()
+        if row is not None:
+            _validate_operation_row(row)
         return row
 
     def get_nonce(self, uid: int, lifetime: int, nonce: str):
-        return self._db.execute(
+        row = self._db.execute(
             "SELECT operation_id, commitment FROM model_used_nonces"
             " WHERE uid=? AND lifetime=? AND nonce=?",
             (uid, lifetime, nonce)).fetchone()
+        if row is not None:
+            if (type(row) is not tuple or len(row) != 2
+                    or type(row[0]) is not str or type(row[1]) is not str):
+                raise EnvelopeError(EnvelopeCode.MALFORMED)
+            _req_hex(row[0], OPERATION_ID_HEX_LEN)
+            _req_hex(row[1], FINGERPRINT_HEX_LEN)
+        return row
 
     def insert_operation(self, scope, commitment, capture_time, expiry,
                          state, owner_token, fence, resolution_deadline):
@@ -999,15 +1134,36 @@ class SyntheticRegistryAdapter:
             " AND operation_id=?",
             (state.value, scope.uid, scope.lifetime, scope.operation_id))
 
-    def put_marker(self, marker_ref: str, outcome_ref: str):
+    def put_marker(self, scope: ModelOnlyOperationScope, commitment: str,
+                   owner_token: str, fence: int,
+                   outcome: ModelOnlyOutcome):
+        # the durable marker carries the FULL binding: scope, canonical
+        # commitment, owner, fence, marker ref, and outcome ref - global
+        # marker/outcome existence is NEVER sufficient evidence
         self._db.execute(
-            "INSERT INTO model_markers (marker_ref, outcome_ref)"
-            " VALUES (?,?)", (marker_ref, outcome_ref))
+            "INSERT INTO model_markers (marker_ref, uid, lifetime,"
+            " operation_id, commitment, owner_token, fence, outcome_ref)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (outcome.operation_marker_ref, scope.uid, scope.lifetime,
+             scope.operation_id, commitment, owner_token, fence,
+             outcome.outcome_ref))
 
-    def marker_exists(self, marker_ref: str) -> bool:
-        return self._db.execute(
-            "SELECT 1 FROM model_markers WHERE marker_ref=?",
-            (marker_ref,)).fetchone() is not None
+    def get_marker(self, marker_ref: str):
+        row = self._db.execute(
+            "SELECT uid, lifetime, operation_id, commitment, owner_token,"
+            " fence, outcome_ref FROM model_markers WHERE marker_ref=?",
+            (marker_ref,)).fetchone()
+        if row is not None:
+            if type(row) is not tuple or len(row) != 7:
+                raise EnvelopeError(EnvelopeCode.MALFORMED)
+            _req_int(row[0], 0)
+            _req_int(row[1], 1)
+            _req_hex(row[2], OPERATION_ID_HEX_LEN)
+            _req_hex(row[3], FINGERPRINT_HEX_LEN)
+            _req_hex(row[4], OWNER_TOKEN_HEX_LEN)
+            _req_int(row[5], 1)
+            _req_safe_str(row[6], REF_MAX_BYTES)
+        return row
 
 
 class _Transaction:
@@ -1073,16 +1229,18 @@ class ModelOnlyRegistryModel:
         scope = ModelOnlyOperationScope(
             uid=binding.uid, lifetime=binding.lifetime,
             operation_id=binding.operation_id)
-        now = self._clock.now()
-        # MANDATORY time recheck after verification, on ORIGINAL times
-        if binding.capture_time > now:
-            raise EnvelopeError(EnvelopeCode.MALFORMED)
-        if now >= binding.expiry:
-            raise EnvelopeError(EnvelopeCode.EXPIRED)
         commitment = binding.commitment()
         resolution_deadline = _checked_add(binding.expiry,
                                            RESOLUTION_WINDOW_SECONDS)
         with self._adapter.transaction():
+            # MANDATORY time recheck INSIDE the acquired transaction,
+            # immediately before the claim decision, on ORIGINAL times,
+            # with the injected clock validated per read
+            now = _clock_now(self._clock)
+            if binding.capture_time > now:
+                raise EnvelopeError(EnvelopeCode.MALFORMED)
+            if now >= binding.expiry:
+                raise EnvelopeError(EnvelopeCode.EXPIRED)
             nonce_row = self._adapter.get_nonce(binding.uid,
                                                 binding.lifetime,
                                                 payload.nonce)
@@ -1147,9 +1305,11 @@ class ModelOnlyRegistryModel:
         self._check_scope_owner_fence(scope, owner_token, fence)
         if type(outcome) is not ModelOnlyOutcome:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
-        now = self._clock.now()
         expired_tombstoned = False
         with self._adapter.transaction():
+            # clock read INSIDE the acquired transaction, immediately
+            # before the state/effect-marker decision, validated per read
+            now = _clock_now(self._clock)
             row = self._require_row(scope)
             state = RegistryState(row[3])
             if state is RegistryState.CLAIMED and now >= row[2]:
@@ -1158,11 +1318,13 @@ class ModelOnlyRegistryModel:
                 self._adapter.set_state(scope, RegistryState.EXPIRED)
                 expired_tombstoned = True
             elif state is RegistryState.CLAIMED:
-                self._adapter.put_marker(outcome.operation_marker_ref,
-                                         outcome.outcome_ref)
+                self._adapter.put_marker(scope, row[0], owner_token, fence,
+                                         outcome)
                 self._adapter.set_committed(scope, outcome)
             elif state is RegistryState.COMMITTED:
-                if row[6] != outcome.outcome_ref:
+                # FULL immutable outcome comparison: ANY change refuses
+                if (row[6] != outcome.outcome_ref
+                        or row[7] != outcome.operation_marker_ref):
                     raise EnvelopeError(EnvelopeCode.REPLAY)
                 # same known outcome: idempotent, never overwrite
             elif state is RegistryState.UNKNOWN:
@@ -1215,14 +1377,33 @@ class ModelOnlyRegistryModel:
             if evidence.binding.commitment() != row[0]:
                 raise EnvelopeError(EnvelopeCode.REPLAY)
             if state is RegistryState.COMMITTED:
+                # FULL immutable outcome/evidence comparison
                 if (evidence.effect_state is EffectState.CONFIRMED_COMMITTED
-                        and row[6] == evidence.outcome.outcome_ref):
+                        and row[6] == evidence.outcome.outcome_ref
+                        and row[7] == evidence.operation_marker_ref):
                     return _row_to_record(scope, row)
                 raise EnvelopeError(EnvelopeCode.REPLAY)
+            # the EVIDENCE's owner/fence must match the claim's - not only
+            # the method arguments
+            if (evidence.owner_token != row[4]
+                    or evidence.fence != row[5]):
+                raise EnvelopeError(EnvelopeCode.REPLAY)
             if evidence.effect_state is EffectState.CONFIRMED_COMMITTED:
-                if not self._adapter.marker_exists(
-                        evidence.operation_marker_ref):
-                    # missing marker stays BLOCKED
+                marker = self._adapter.get_marker(
+                    evidence.operation_marker_ref)
+                bound = (
+                    marker is not None
+                    and marker[0] == scope.uid
+                    and marker[1] == scope.lifetime
+                    and marker[2] == scope.operation_id
+                    and marker[3] == row[0]
+                    and marker[4] == row[4]
+                    and marker[5] == row[5]
+                    and marker[6] == evidence.outcome.outcome_ref
+                )
+                if not bound:
+                    # missing/UNRELATED marker stays BLOCKED: caller
+                    # CONFIRMED + a foreign marker NEVER commits
                     self._adapter.set_state(scope, RegistryState.UNKNOWN)
                     row = self._adapter.get_operation(scope)
                     return _row_to_record(scope, row)

@@ -107,6 +107,8 @@ def make_context(binding, **over):
         current_policy_revision=binding.policy_revision,
         current_decision_revision=binding.decision_revision,
         current_consent_generation=binding.consent_generation,
+        current_issuer=binding.issuer,
+        current_issuer_valid=True,
     )
     fields.update(over)
     return env.ModelOnlyCallerContext(**fields)
@@ -533,9 +535,18 @@ class RegistryTests(unittest.TestCase):
         again = registry.record_outcome_model(
             claim.scope, claim.owner_token, claim.fence, outcome)
         self.assertEqual(again, record)
-        # marker + outcome landed in the same transaction
-        self.assertTrue(registry._adapter.marker_exists(
-            outcome.operation_marker_ref))
+        # marker + outcome landed in the same transaction, carrying the
+        # FULL binding (scope, commitment, owner, fence, outcome)
+        binding = make_web_binding()
+        marker = registry._adapter.get_marker(outcome.operation_marker_ref)
+        self.assertIsNotNone(marker)
+        self.assertEqual(marker[0], UID)
+        self.assertEqual(marker[1], 1)
+        self.assertEqual(marker[2], HEX32_A)
+        self.assertEqual(marker[3], binding.commitment())
+        self.assertEqual(marker[4], claim.owner_token)
+        self.assertEqual(marker[5], claim.fence)
+        self.assertEqual(marker[6], outcome.outcome_ref)
 
     def test_changed_outcome_refuses_never_overwrite(self):
         registry, _adapter, _clock = make_registry()
@@ -623,8 +634,9 @@ class RegistryTests(unittest.TestCase):
         # crash AFTER effect commit: marker durable, outcome write lost
         outcome = make_outcome()
         with registry._adapter.transaction():
-            registry._adapter.put_marker(outcome.operation_marker_ref,
-                                         outcome.outcome_ref)
+            registry._adapter.put_marker(
+                claim.scope, binding.commitment(), claim.owner_token,
+                claim.fence, outcome)
         registry.resolve_unknown_model(
             claim.scope, claim.owner_token, claim.fence,
             make_evidence(claim.scope, binding, claim.owner_token,
@@ -702,6 +714,309 @@ class RegistryTests(unittest.TestCase):
                 status=cap.ModelStatus.MODEL_ONLY,
                 claim_state=env.ClaimState.ACQUIRED, scope=scope,
                 fence=1, owner_token="d" * 32, outcome=make_outcome())
+
+
+class BlockerFixTests(unittest.TestCase):
+    """Peer first-pass blockers 1-8 (2026-10-11): evidence/marker full
+    binding, full outcome comparison, canonical form, strict hex, PR-3
+    scope/group derivation, typed row/UTF-8 boundaries, in-transaction
+    clock reads."""
+
+    def test_foreign_marker_never_commits(self):
+        registry, adapter, _clock = make_registry()
+        binding = make_web_binding()
+        claim = registry.claim_model(
+            verified(make_payload(binding)), "worker-1")
+        registry.resolve_unknown_model(
+            claim.scope, claim.owner_token, claim.fence,
+            make_evidence(claim.scope, binding, claim.owner_token,
+                          claim.fence,
+                          effect_state=env.EffectState.INCONCLUSIVE))
+        # a marker for a DIFFERENT scope/outcome exists durably
+        other_scope = env.ModelOnlyOperationScope(
+            uid=UID + 9, lifetime=1, operation_id=HEX32_C)
+        with adapter.transaction():
+            adapter.put_marker(other_scope, HEX64_B, "e" * 32, 1,
+                               make_outcome(ref="real-other-outcome",
+                                            marker="foreign-marker"))
+        fake = make_evidence(
+            claim.scope, binding, claim.owner_token, claim.fence,
+            outcome=make_outcome(ref="real-other-outcome",
+                                 marker="foreign-marker"))
+        record = registry.resolve_unknown_model(
+            claim.scope, claim.owner_token, claim.fence, fake)
+        self.assertIs(record.state, env.RegistryState.UNKNOWN)
+
+    def test_evidence_owner_fence_must_match_claim(self):
+        registry, _adapter, _clock = make_registry()
+        binding = make_web_binding()
+        claim = registry.claim_model(
+            verified(make_payload(binding)), "worker-1")
+        outcome = make_outcome()
+        with registry._adapter.transaction():
+            registry._adapter.put_marker(
+                claim.scope, binding.commitment(), claim.owner_token,
+                claim.fence, outcome)
+        fake = make_evidence(claim.scope, binding, "f" * 32, 99,
+                             outcome=outcome)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.resolve_unknown_model(
+                claim.scope, claim.owner_token, claim.fence, fake)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.REPLAY)
+
+    def test_duplicate_record_changed_marker_refuses(self):
+        registry, _adapter, _clock = make_registry()
+        claim = registry.claim_model(verified(), "worker-1")
+        registry.record_outcome_model(claim.scope, claim.owner_token,
+                                      claim.fence, make_outcome())
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.record_outcome_model(
+                claim.scope, claim.owner_token, claim.fence,
+                make_outcome(marker="marker-ref-2"))
+        self.assertIs(cm.exception.code, env.EnvelopeCode.REPLAY)
+
+    def test_pretty_json_refused_despite_valid_authentication(self):
+        import json as _json
+        payload = make_payload()
+        key = make_key()
+        clock = env.SyntheticClock(NOW)
+        pretty = _json.dumps(payload.to_dict(), indent=2,
+                             sort_keys=True).encode("utf-8")
+        token = Fernet(key.material).encrypt(pretty)
+        envelope = env.ModelOnlyEnvelope(format_version=1, key_id="key-a",
+                                         token=token)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            env.verify_model(envelope, env.SyntheticKeyRing(keys=(key,)),
+                             make_context(payload.binding), clock)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+
+    def test_hex_signs_prefixes_whitespace_refuse(self):
+        with self.assertRaises(env.EnvelopeError):
+            make_payload(make_web_binding(), nonce="+1" + "b" * 30)
+        with self.assertRaises(env.EnvelopeError):
+            make_payload(make_web_binding(), nonce="0x" + "b" * 30)
+        with self.assertRaises(env.EnvelopeError):
+            make_payload(make_web_binding(), nonce="b" * 31 + " ")
+        with self.assertRaises(env.EnvelopeError):
+            make_web_binding(operation_id="0x" + "a" * 30)
+        with self.assertRaises(env.EnvelopeError):
+            make_web_binding(content_fingerprint="ABCD" + "1" * 60)
+
+    def test_pr3_derived_scope_set_enforced(self):
+        # WRITE with only memory.read refuses
+        with self.assertRaises(env.EnvelopeError) as cm:
+            make_web_binding(required_scopes=(cap.Scope.MEMORY_READ,))
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+        # widened scope set refuses
+        with self.assertRaises(env.EnvelopeError):
+            make_web_binding(required_scopes=(cap.Scope.MEMORY_WRITE,
+                                              cap.Scope.MEMORY_ERASE))
+        # a sealed payload with a drifted scope set cannot verify
+        import json as _json
+        payload = make_payload()
+        forged = payload.to_dict()
+        forged["required_scopes"] = ["memory.read"]
+        key = make_key()
+        clock = env.SyntheticClock(NOW)
+        token = Fernet(key.material).encrypt(
+            _json.dumps(forged, sort_keys=True,
+                        separators=(",", ":")).encode("utf-8"))
+        envelope = env.ModelOnlyEnvelope(format_version=1, key_id="key-a",
+                                         token=token)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            env.verify_model(envelope, env.SyntheticKeyRing(keys=(key,)),
+                             make_context(payload.binding), clock)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+
+    def test_pr3_group_rules_enforced(self):
+        # PRIVATE GROUP_WRITE with coherent action/scopes still refuses
+        with self.assertRaises(env.EnvelopeError) as cm:
+            make_web_binding(
+                operation_class=cap.OperationClass.GROUP_WRITE,
+                required_scopes=(cap.Scope.MEMORY_GROUP_WRITE,
+                                 cap.Scope.MEMORY_WRITE),
+                group_action=cap.GroupAction.WRITE)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+        # GROUP surface + GROUP_WRITE + concrete group audience: coherent
+        group = make_web_binding(
+            surface=cap.Surface.GROUP,
+            operation_class=cap.OperationClass.GROUP_WRITE,
+            required_scopes=(cap.Scope.MEMORY_GROUP_WRITE,
+                             cap.Scope.MEMORY_WRITE),
+            group_action=cap.GroupAction.WRITE,
+            audience=env.ModelOnlyAudience(kind=env.AudienceKind.GROUP,
+                                           id="synthetic-group-1"))
+        self.assertEqual(group.audience.id, "synthetic-group-1")
+        # GROUP surface write without a concrete group audience refuses
+        with self.assertRaises(env.EnvelopeError):
+            make_web_binding(
+                surface=cap.Surface.GROUP,
+                required_scopes=(cap.Scope.MEMORY_WRITE,
+                                 cap.Scope.MEMORY_GROUP_WRITE))
+        # GROUP surface write with a PRIVATE audience kind refuses
+        with self.assertRaises(env.EnvelopeError):
+            make_web_binding(
+                surface=cap.Surface.GROUP,
+                required_scopes=(cap.Scope.MEMORY_WRITE,
+                                 cap.Scope.MEMORY_GROUP_WRITE),
+                audience=env.ModelOnlyAudience(
+                    kind=env.AudienceKind.PRIVATE, id="not-a-group"))
+
+    def test_corrupt_registry_rows_refuse_typed(self):
+        registry, adapter, _clock = make_registry()
+        claim = registry.claim_model(verified(), "worker-1")
+        adapter._db.execute(
+            "UPDATE model_operations SET state='BOGUS' WHERE uid=?",
+            (UID,))
+        adapter._db.commit()
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.readback_model(claim.scope)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+        adapter._db.execute(
+            "UPDATE model_operations SET state='CLAIMED',"
+            " owner_token='not-hex' WHERE uid=?", (UID,))
+        adapter._db.commit()
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.claim_model(verified(), "worker-2")
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+
+    def test_surrogate_and_unicode_refuse_typed(self):
+        with self.assertRaises(env.EnvelopeError) as cm:
+            make_outcome(ref="bad\ud800ref")
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+        with self.assertRaises(env.EnvelopeError):
+            make_web_binding(information_ref="bad\ud800ref")
+        with self.assertRaises(env.EnvelopeError):
+            make_key(key_id="key-\u00e9")
+
+    def test_clock_read_inside_transaction_lock_delay(self):
+        class TickClock(env.ModelOnlyClock):
+            def __init__(self, values):
+                self._values = list(values)
+
+            def now(self):
+                return self._values.pop(0) if self._values else NOW
+
+        payload = make_payload()
+        key = make_key()
+        ring = env.SyntheticKeyRing(keys=(key,))
+        envelope = env.seal_model(payload, key, env.SyntheticClock(NOW))
+        # verify at expiry-1 succeeds
+        good = env.verify_model(
+            envelope, ring, make_context(payload.binding),
+            env.SyntheticClock(NOW + env.MAX_AGE_SECONDS - 1))
+        # the claim's in-transaction read lands AT expiry: refused
+        tick = TickClock([NOW, NOW + env.MAX_AGE_SECONDS])
+        registry = env.ModelOnlyRegistryModel(
+            env.SyntheticRegistryAdapter(sqlite3.connect(":memory:")),
+            tick)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.claim_model(good, "worker-1")
+        self.assertIs(cm.exception.code, env.EnvelopeCode.EXPIRED)
+
+    def test_bad_later_clock_reads_refuse(self):
+        class TickClock(env.ModelOnlyClock):
+            def __init__(self, values):
+                self._values = list(values)
+
+            def now(self):
+                return self._values.pop(0) if self._values else NOW
+
+        for bad in (True, 1.5, -1, env.BIGINT_MAX + 1):
+            tick = TickClock([NOW, bad])
+            registry = env.ModelOnlyRegistryModel(
+                env.SyntheticRegistryAdapter(sqlite3.connect(":memory:")),
+                tick)
+            with self.assertRaises(env.EnvelopeError, msg=bad) as cm:
+                registry.claim_model(verified(), "worker-1")
+            self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED,
+                          msg=bad)
+
+
+class FinalAdditionTests(unittest.TestCase):
+    """Peer final-verdict additions: canonical scope order, current
+    issuer/session staleness, unique keyring ids, explicit key boundary."""
+
+    def test_scope_order_normalization_all_permutations(self):
+        import itertools
+        scopes = (cap.Scope.MEMORY_GROUP_WRITE, cap.Scope.MEMORY_WRITE)
+        bindings = []
+        for perm in itertools.permutations(scopes):
+            bindings.append(make_web_binding(
+                surface=cap.Surface.GROUP,
+                operation_class=cap.OperationClass.GROUP_WRITE,
+                group_action=cap.GroupAction.WRITE,
+                required_scopes=perm,
+                audience=env.ModelOnlyAudience(
+                    kind=env.AudienceKind.GROUP, id="synthetic-group-1")))
+        bindings.append(make_web_binding(
+            surface=cap.Surface.GROUP,
+            operation_class=cap.OperationClass.GROUP_WRITE,
+            group_action=cap.GroupAction.WRITE,
+            required_scopes=frozenset(scopes),
+            audience=env.ModelOnlyAudience(
+                kind=env.AudienceKind.GROUP, id="synthetic-group-1")))
+        first = bindings[0]
+        for other in bindings[1:]:
+            self.assertEqual(first, other)
+            self.assertEqual(first.commitment(), other.commitment())
+        # a transport-only reseal from a reversed-order construction still
+        # verifies against the original context
+        payload = make_payload(first)
+        key = make_key()
+        clock = env.SyntheticClock(NOW)
+        envelope = env.seal_model(payload, key, clock)
+        result = env.verify_model(
+            envelope, env.SyntheticKeyRing(keys=(key,)),
+            make_context(bindings[1]), clock)
+        self.assertEqual(result.binding, first)
+
+    def test_current_session_revocation_is_stale(self):
+        payload = make_payload()
+        key = make_key()
+        clock = env.SyntheticClock(NOW)
+        envelope = env.seal_model(payload, key, clock)
+        ring = env.SyntheticKeyRing(keys=(key,))
+        # revoked issuer: everything else unchanged
+        with self.assertRaises(env.EnvelopeError) as cm:
+            env.verify_model(
+                envelope, ring,
+                make_context(payload.binding, current_issuer_valid=False),
+                clock)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.STALE)
+        # replaced session: same uid/lifetime/revisions, new session hash
+        with self.assertRaises(env.EnvelopeError) as cm:
+            env.verify_model(
+                envelope, ring,
+                make_context(payload.binding,
+                             current_issuer=env.SessionRef(
+                                 session_token_hash=HEX64_B)),
+                clock)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.STALE)
+
+    def test_keyring_duplicate_ids_refuse(self):
+        with self.assertRaises(env.EnvelopeError) as cm:
+            env.SyntheticKeyRing(keys=(make_key("key-a"),
+                                       make_key("key-a")))
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+
+    def test_decrypt_until_boundary_explicit(self):
+        boundary = NOW + 500
+        key = make_key(decrypt_until=boundary)
+        self.assertTrue(key.usable_at(boundary))       # INCLUSIVE
+        self.assertFalse(key.usable_at(boundary + 1))  # unavailable after
+        # verify works AT the boundary and refuses AFTER it
+        payload = make_payload()
+        clock = env.SyntheticClock(NOW)
+        envelope = env.seal_model(payload, key, clock)
+        ring = env.SyntheticKeyRing(keys=(key,))
+        ok = env.verify_model(envelope, ring, make_context(payload.binding),
+                              env.SyntheticClock(boundary))
+        self.assertEqual(ok.payload, payload)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            env.verify_model(envelope, ring, make_context(payload.binding),
+                             env.SyntheticClock(boundary + 1))
+        self.assertIs(cm.exception.code, env.EnvelopeCode.KEY_UNAVAILABLE)
 
 
 class ProvenanceAndStubTests(unittest.TestCase):
