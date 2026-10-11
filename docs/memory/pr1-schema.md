@@ -18,10 +18,14 @@ CREATE TABLE owner_counters(
 - Non-content. One row per owner. SURVIVES erasure of the owner's
   users/facts/history rows: wipe/delete paths must NOT delete this row
   (that is what makes stale epochs fail terminally as RESURRECTED).
-- Allocated ONLY by ports/owner_counters.py::allocate_next_epoch inside
+- Allocated ONLY by ports/memory/owner_counters.py::allocate_next_epoch inside
   the caller's locked transaction. First allocation returns 1.
 - users.memory_epoch is only ever SET to an allocated value, never
-  incremented in place and never reset by row recreation.
+  incremented in place and never reset by row recreation. COMMITTED
+  generations are never reused; provisional (uncommitted) allocations
+  are never published - they roll back with the caller's transaction
+  and are simply allocated again later (the seam's envelope/capture
+  integration, a later PR, proves that boundary).
 
 ## owner_grants - explicit owner grants (v4.1 sec 3)
 
@@ -33,7 +37,7 @@ CREATE TABLE owner_grants(
   expires_at          BIGINT,               -- NULL = no expiry
   per_op_expiry_optin BOOLEAN NOT NULL DEFAULT FALSE,
   PRIMARY KEY (user_id, scope),
-  CHECK (scope <> ''),
+  CHECK (length(btrim(scope)) > 0),
   CHECK (granted_at >= 0),
   CHECK (expires_at IS NULL OR expires_at >= 0)
 );

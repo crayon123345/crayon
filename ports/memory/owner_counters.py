@@ -58,13 +58,23 @@ def allocate_next_epoch(db, uid: int) -> int:
     """Allocate and return the owner's next monotone epoch value.
 
     First allocation for an owner returns 1; every later allocation
-    returns a strictly larger value. Values are never reused for the
-    same owner, across account creation, erasure, opt-out purge, and
-    merge events alike, because all of them allocate from this one
-    source. Caller MUST hold the owner advisory lock inside an open
+    returns a strictly larger value. COMMITTED generations are never
+    reused for the same owner, across account creation, erasure,
+    opt-out purge, and merge events alike, because all of them
+    allocate from this one source. A PROVISIONAL (uncommitted)
+    allocation that rolls back with its caller's transaction is never
+    published - it is simply allocated again later; the seam's
+    envelope/capture integration (later PR) proves that boundary.
+    Caller MUST hold the owner advisory lock inside an open
     transaction (v4.1 sec 4).
     """
     row = db.q(ALLOCATE_SQL, (_require_owner_uid(uid),), "one")
-    if row is None or "next_epoch" not in row:
+    if row is None:
         raise CounterError("epoch allocation returned no row for owner")
-    return _require_epoch_value(row["next_epoch"])
+    if not hasattr(row, "__getitem__") or isinstance(row, (str, bytes)):
+        raise CounterError("malformed allocation row: %r" % (row,))
+    try:
+        value = row["next_epoch"]
+    except (KeyError, TypeError):
+        raise CounterError("allocation row missing next_epoch")
+    return _require_epoch_value(value)

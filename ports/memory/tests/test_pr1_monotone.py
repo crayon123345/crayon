@@ -62,14 +62,19 @@ class SqliteShimDB:
 
 
 SCHEMA = (
+    # mirrors docs/memory/pr1-schema.md incl. its CHECK constraints
+    # (sqlite dialect: trim() for Postgres btrim())
     "CREATE TABLE owner_counters(user_id INTEGER PRIMARY KEY,"
-    " next_epoch INTEGER NOT NULL)",
+    " next_epoch INTEGER NOT NULL CHECK (next_epoch >= 1))",
     "CREATE TABLE owner_grants(user_id INTEGER NOT NULL,"
     " scope TEXT NOT NULL, granted_at INTEGER NOT NULL,"
     " expires_at INTEGER, per_op_expiry_optin INTEGER NOT NULL DEFAULT 0,"
-    " PRIMARY KEY (user_id, scope))",
+    " PRIMARY KEY (user_id, scope),"
+    " CHECK (length(trim(scope)) > 0),"
+    " CHECK (granted_at >= 0),"
+    " CHECK (expires_at IS NULL OR expires_at >= 0))",
     "CREATE TABLE grant_generations(user_id INTEGER PRIMARY KEY,"
-    " generation INTEGER NOT NULL)",
+    " generation INTEGER NOT NULL CHECK (generation >= 0))",
     # stand-in for the app's content table, to prove counter survival
     "CREATE TABLE users(user_id INTEGER PRIMARY KEY,"
     " memory_epoch INTEGER NOT NULL DEFAULT 0)",
@@ -289,9 +294,15 @@ class TestMalformedRowsFailClosed(unittest.TestCase):
             grants.get_grants(self.db, 5)
 
     def test_empty_scope_rejected(self):
-        self._insert_grant(scope="")
+        # mirrored CHECK blocks INSERT; python layer proven via FakeDB
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_grant(scope="")
+        class FakeDB:
+            def q(self, sql, params=(), mode="all"):
+                return [{"scope": "", "granted_at": 1000,
+                         "expires_at": None, "per_op_expiry_optin": 0}]
         with self.assertRaises(grants.GrantError):
-            grants.get_grants(self.db, 5)
+            grants.get_grants(FakeDB(), 5)
 
     def test_non_int_timestamps_rejected(self):
         # sqlite column affinity converts '1000' to int on INSERT, so a
@@ -306,6 +317,36 @@ class TestMalformedRowsFailClosed(unittest.TestCase):
         with self.assertRaises(grants.GrantError):
             grants.get_grants(self.db, 5)
 
+    def test_whitespace_only_scope_rejected(self):
+        # mirrored CHECK blocks INSERT; python layer proven via FakeDB
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_grant(scope="   ")
+        class FakeDB:
+            def q(self, sql, params=(), mode="all"):
+                return [{"scope": "   ", "granted_at": 1000,
+                         "expires_at": None, "per_op_expiry_optin": 0}]
+        with self.assertRaises(grants.GrantError):
+            grants.get_grants(FakeDB(), 5)
+
+    def test_constraint_blocks_whitespace_and_bad_rows(self):
+        # the mirrored CHECK constraints must refuse these at the SQL
+        # layer itself (defense below the python validators)
+        for bad_sql, params in (
+            ("INSERT INTO owner_grants(user_id,scope,granted_at,"
+             "expires_at,per_op_expiry_optin) VALUES (?,?,?,?,?)",
+             (5, "   ", 1000, None, 0)),
+            ("INSERT INTO owner_grants(user_id,scope,granted_at,"
+             "expires_at,per_op_expiry_optin) VALUES (?,?,?,?,?)",
+             (5, "memory.write", -1, None, 0)),
+            ("INSERT INTO owner_counters(user_id,next_epoch)"
+             " VALUES (?,?)", (5, 0)),
+            ("INSERT INTO grant_generations(user_id,generation)"
+             " VALUES (?,?)", (5, -1)),
+        ):
+            with self.assertRaises(sqlite3.IntegrityError,
+                                   msg=str(params)):
+                self.db.q(bad_sql, params, "none")
+
     def test_valid_zero_one_flags_accepted(self):
         self._insert_grant(uid=5, flag=0)
         self._insert_grant(uid=6, flag=1)
@@ -313,6 +354,44 @@ class TestMalformedRowsFailClosed(unittest.TestCase):
                          .per_op_expiry_optin)
         self.assertTrue(grants.get_grants(self.db, 6)[0]
                         .per_op_expiry_optin)
+
+
+class TestMalformedShapes(unittest.TestCase):
+    """Item 2 (round 2): malformed readback SHAPES must raise
+    GrantError/CounterError - never a raw KeyError/TypeError. A fake
+    q() returns the wrong shapes directly; no DB involved."""
+
+    class FakeDB:
+        def __init__(self, result):
+            self.result = result
+
+        def q(self, sql, params=(), mode="all"):
+            return self.result
+
+    def _assert_module_error(self, result, fn, err):
+        with self.assertRaises(err, msg=repr(result)):
+            fn(self.FakeDB(result), 5)
+
+    def test_get_grants_shape(self):
+        for bad in ([{}], [{"scope": "memory.write"}], [1], ["x"]):
+            self._assert_module_error(bad, grants.get_grants,
+                                      grants.GrantError)
+
+    def test_get_generation_shape(self):
+        for bad in ({}, 1, "x", {"other": 1}):
+            self._assert_module_error(bad, grants.get_generation,
+                                      grants.GrantError)
+
+    def test_bump_generation_shape(self):
+        for bad in ({}, 1, {"other": 1}):
+            self._assert_module_error(bad, grants.bump_generation,
+                                      grants.GrantError)
+
+    def test_allocate_shape(self):
+        for bad in ({}, 1, "x", {"other": 1}):
+            self._assert_module_error(bad,
+                                      owner_counters.allocate_next_epoch,
+                                      owner_counters.CounterError)
 
 
 class TestTransactionAtomicity(unittest.TestCase):

@@ -41,6 +41,22 @@ def _require_int(value, what: str, minimum: int) -> int:
     return value
 
 
+def _require_row(row, what: str, fields) -> None:
+    """Readback SHAPE validation: a row must be a mapping carrying the
+    required fields. A malformed result shape (empty dict, bare scalar,
+    wrong type) raises GrantError, never a raw KeyError/TypeError.
+    Genuine database operational errors are NOT caught anywhere in
+    this module - they propagate."""
+    if not hasattr(row, "__getitem__") or isinstance(row, (str, bytes)):
+        raise GrantError("malformed %s row: %r" % (what, row))
+    try:
+        missing = [f for f in fields if f not in row]
+    except TypeError:
+        raise GrantError("malformed %s row: %r" % (what, row))
+    if missing:
+        raise GrantError("%s row missing fields %r" % (what, missing))
+
+
 def _require_flag(value, what: str) -> bool:
     """Stored booleans must be real bools or the integers 0/1. A
     stored string like 'false' would silently coerce True via
@@ -85,10 +101,14 @@ def get_grants(db, uid: int) -> Tuple[Grant, ...]:
     filter with Grant.active(now)). Read at capability mint AND
     re-read inside the transaction (v4.1 sec 4 step 2)."""
     rows = db.q(GRANTS_READ_SQL, (_require_owner_uid(uid),), "all") or []
+    if not isinstance(rows, (list, tuple)):
+        raise GrantError("malformed grants result: %r" % (rows,))
     grants_out = []
     for r in rows:
+        _require_row(r, "grant", ("scope", "granted_at",
+                                  "expires_at", "per_op_expiry_optin"))
         scope = r["scope"]
-        if not isinstance(scope, str) or scope == "":
+        if not isinstance(scope, str) or scope.strip() == "":
             raise GrantError("invalid grant scope: %r" % (scope,))
         grants_out.append(Grant(
             scope=scope,
@@ -106,8 +126,10 @@ def get_generation(db, uid: int) -> int:
     """Current grants generation for the owner; 0 when no grant change
     has ever happened (no row)."""
     row = db.q(GENERATION_READ_SQL, (_require_owner_uid(uid),), "one")
-    return 0 if row is None else _require_int(row["generation"],
-                                              "generation", 0)
+    if row is None:
+        return 0
+    _require_row(row, "generation", ("generation",))
+    return _require_int(row["generation"], "generation", 0)
 
 
 def bump_generation(db, uid: int) -> int:
@@ -115,6 +137,7 @@ def bump_generation(db, uid: int) -> int:
     grant add/revoke/scope change INSIDE the same locked transaction
     as the grant-row write it accompanies (v4.1 sec 4 step 2)."""
     row = db.q(GENERATION_BUMP_SQL, (_require_owner_uid(uid),), "one")
-    if row is None or "generation" not in row:
+    if row is None:
         raise GrantError("grant generation bump returned no row")
+    _require_row(row, "bumped generation", ("generation",))
     return _require_int(row["generation"], "bumped generation", 1)
