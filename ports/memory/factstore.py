@@ -3829,7 +3829,11 @@ class IssuerHarness:
         is emitted and BEFORE completion is recorded. A 'cleared'
         outcome with raw_found=true is a CONTRADICTION = REFUSAL; an
         unknown/incomplete/failed check = 'refused' with safe IDs.
-        NOTHING is recorded and NO state changes on 'refused'."""
+        raw_found is the CLOSED bool: True when raw was found OR
+        absence is UNPROVEN (a None/0/empty/non-bool/failed/missing
+        probe = conservative True); False ONLY on a COMPLETE strict
+        literal-False probe set. NOTHING is recorded and NO state
+        changes on 'refused'."""
         _req_hex(token, 32)
         if not isinstance(refs, dict):
             raise cap.ModelInputError()
@@ -3869,24 +3873,38 @@ class IssuerHarness:
             live = getattr(c, "live_raw", None)
             if callable(live):
                 try:
-                    if live():
-                        raw_found = True
+                    probe = live()
                 except Exception:
                     unknown = True  # a FAILED probe is UNKNOWN
+                else:
+                    if type(probe) is not bool:
+                        # a NON-BOOL probe (None/0/empty/truthy) is
+                        # UNKNOWN - NEVER absence, NEVER presence
+                        unknown = True
+                    elif probe:
+                        raw_found = True
             else:
                 unknown = True  # NO probe = UNKNOWN, never a pass
         now = _clock_now(self._clock)
+        # the CLOSED BOOL (v80 2083): raw_found is ALWAYS a strict
+        # bool. An UNKNOWN/failed/non-bool probe is CONSERVATIVELY
+        # NOT-PROVEN-EMPTY (raw_found=True forces refusal); ONLY a
+        # COMPLETE set of strict literal-False probes proves absence
+        # (raw_found=False) - the strict literal-False proven-empty
+        # is required BEFORE 'cleared'.
+        if unknown:
+            raw_found = True
         live_check = {"checked_at": now, "containers": checked,
-                      "raw_found": (True if raw_found else
-                                    (None if unknown else False))}
+                      "raw_found": raw_found}
         complete = checked == list(self._SCRUB_CONTAINERS)
-        # ENFORCEMENT: cleared IFF complete AND every probe PASSED
-        # (raw_found strictly False) AND nothing unknown/failed; a
-        # 'cleared' + raw_found=true CONTRADICTION, an unknown probe,
-        # an incomplete check, or a failed destroy/probe = 'refused'
-        # with safe IDs (v80 2060-2137).
-        kind = "cleared" if (complete and not raw_found
-                             and not unknown) else "refused"
+        # ENFORCEMENT: cleared IFF complete AND raw_found is STRICTLY
+        # False (every probe returned the literal False and nothing
+        # was unknown/failed); a 'cleared' + raw_found=true
+        # CONTRADICTION, a None/0/empty/non-bool probe, an unknown/
+        # failed probe, an incomplete check, or a failed destroy =
+        # 'refused' with safe IDs (v80 2060-2137).
+        kind = "cleared" if (complete and raw_found is False
+                             ) else "refused"
         outcome = {"kind": kind,
                    "ref_ids": list(self._SCRUB_CONTAINERS),
                    "live_check": live_check}
@@ -3930,8 +3948,11 @@ class IssuerHarness:
         same-identity PENDING row = re-attempt (the row keeps the
         SAME token; redelivery replays receiver-side); DELIVERED =
         done; a MISSING, UNREADABLE, UNKNOWN-STATE, or INCOHERENT
-        (identity-mismatched) row = typed 'uncertain'. NEVER a blind
-        pending claim, NEVER blind redelivery."""
+        (identity-mismatched) row = typed 'uncertain'. An UNDECODABLE/
+        shape-incoherent durable row and a MISSING binding input (no
+        validated projection) are 'uncertain' too - NEVER a raw
+        exception, NEVER an unvalidated success. NEVER a blind pending
+        claim, NEVER blind redelivery."""
         try:
             row = self._conn.execute(
                 "SELECT recovery_id, projection_json, state FROM"
@@ -3948,15 +3969,28 @@ class IssuerHarness:
         # recovery + projection (source included) as the ack'd
         # delivery; an incoherent row is uncertain, never pending
         projection = getattr(ack_input, "projection", None)
-        if type(projection) is SafeEvidenceProjection:
-            if row[0] != projection.recovery_id:
-                return AckResult(kind="uncertain", token=token,
-                                 uncertain=AckUncertain.IO_UNREADABLE)
+        if type(projection) is not SafeEvidenceProjection:
+            # NO validated same-identity binding input (ack_input None
+            # or a missing projection): the row's identity CANNOT be
+            # established - typed uncertain, NEVER an unvalidated
+            # delivered/pending claim off the raw row state
+            return AckResult(kind="uncertain", token=token,
+                             uncertain=AckUncertain.IO_UNREADABLE)
+        if row[0] != projection.recovery_id:
+            return AckResult(kind="uncertain", token=token,
+                             uncertain=AckUncertain.IO_UNREADABLE)
+        try:
             stored = SafeEvidenceProjection.from_dict(
                 json.loads(row[1]))
-            if stored.to_dict() != projection.to_dict():
-                return AckResult(kind="uncertain", token=token,
-                                 uncertain=AckUncertain.IO_UNREADABLE)
+        except Exception:
+            # an UNDECODABLE or shape-incoherent durable row is
+            # UNREADABLE - a typed uncertain, NEVER a raw exception
+            # escaping the reread
+            return AckResult(kind="uncertain", token=token,
+                             uncertain=AckUncertain.IO_UNREADABLE)
+        if stored.to_dict() != projection.to_dict():
+            return AckResult(kind="uncertain", token=token,
+                             uncertain=AckUncertain.IO_UNREADABLE)
         if row[2] == "delivered":
             return AckResult(kind="delivered", token=token)
         if row[2] == "pending":

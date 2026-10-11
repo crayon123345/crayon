@@ -59,7 +59,7 @@ Expected: 96 tests, OK (~52s; file-backed exclusive-fixture DBs). No pytest depe
 
 ## Test-vector coverage (honest)
 
-Covered by the suite (96 tests):
+Covered by the suite (111 tests):
 
 - V01-V10 put/supersede classification incl. normalization collision,
   oversize and string rejections, N-to-1, duplicate old_fids, non-target
@@ -75,28 +75,48 @@ Covered by the suite (96 tests):
   prior-lifetime and cross-owner replay refusals, valid-capability replay,
   Phase-A-before-drift precedence (incl. EXPIRED first), REVOKED before
   replay, reseal/registry re-claim refusal.
-- V34 fault injection after each step class: Phase-A refusal (claim
-  unwinds; unchanged retry permitted), apply fault (the ENTIRE attempt
-  rolls back - no armed witness/registry left), commit-guard abort
-  (typed local_uncertain, NO blind retry), lost commit confirmation
-  (durable_blocked; the witness stays ARMED for the resolver). RESTART:
-  a real file close/reopen - old-session handles refuse, durable rows
-  survive, absent op rows type as UnknownOperation, never rollback proof.
+- V34 fault injection at the ENTRY of every declared step boundary (the
+  hooked method is replaced, so the hooked step body never runs; the
+  proven EXECUTED boundary is "all prior steps complete": entry(1a)=after
+  step 1, entry(2-3a)=after 1a, entry(4)=after 2-3a, entry(5)=after 4,
+  entry(6)=after 5, entry(7)=after 6, entry(8)=after 7, entry(9)=after 8;
+  steps 2/3a are ONE hooked seam - no literal after-2/after-3 boundary is
+  claimed; the post-apply boundary is the commit-guard abort/lost-commit
+  pair): the attempt rolls back ENTIRELY (no partial effects, no claim
+  leak), an unchanged retry is permitted, NO blind retry. RESTART leg per
+  boundary: a real file close/reopen after the injected fault - NO
+  partial attempt survives (no facts, no armed witness, no registry row)
+  and a fresh mint on the reopened store executes; old-session handles
+  refuse after reopen, durable rows survive, absent op rows type as
+  UnknownOperation, never rollback proof.
 - V34b receiver-side: exact repeat, delivery drift refusal, distinct
   same-second tokens, blocked repeat, blocked->resolved repeat with the
   closing resolution_event_id stamp; MIXED BATCH (old no-event + new
   late: 3 + 0), MIXED NO-EVENT/REPLAYED-LATE/NEW-LATE (0 + 0 + 3 = 3,
   stored_new_retained 1/3), DUPLICATE TOKENS IN ONE BATCH (late 3 not 6,
   blocked 1 not 2).
-- V34b issuer-harness vectors: LIVE ERASE (the scrub hook destroys
-  the volatile raw BEFORE the completion row; hook failure = step
-  refusal, nothing recorded), PENDING RESTART (unacked rows redelivered
-  with the SAME token), LOST RECEIVER ACK (row stays pending; same-token
-  redelivery replays receiver-side, no double-count), LOST
-  DELIVERED-STATE UPDATE (confirm-lost = typed uncertain; durable reread
-  decides; unreadable reread = typed uncertain), SAFE PAYLOAD/STABLE
-  TOKEN (ref_json is projection output only), forged committed_result /
-  invented EvidenceRef = REFUSED, never delivered.
+- V34b issuer-harness vectors: LIVE ERASE - SCRUB INTERFACE (exact):
+  the actual shape is scrub(token, refs) -> ScrubOutcome, the v80
+  scrub(refs: OwnedContainers) hook under the harness TOKEN WRAPPER that
+  binds the hook to the erase step's completion record: refs IS the
+  OwnedContainers closed enumeration {raw_ref_handle, comparison_buffer};
+  the token keys the scrub_log completion row, written ONLY AFTER
+  'cleared' is emitted (kind='cleared' AND raw_found=false STRICT AND ALL
+  containers checked); 'refused' records NOTHING and changes NO state.
+  raw_found is the CLOSED bool: True when raw was found OR absence is
+  UNPROVEN (a None/0/empty/non-bool/failed/missing probe = conservative
+  True); False ONLY on a COMPLETE strict literal-False probe set (the
+  strict literal-False proven-empty is required BEFORE 'cleared').
+  PENDING RESTART (unacked rows redelivered with the SAME token), LOST
+  RECEIVER ACK (row stays pending; same-token redelivery replays
+  receiver-side, no double-count), LOST DELIVERED-STATE UPDATE
+  (confirm-lost = typed uncertain; the durable reread binds token +
+  recovery + projection - delivered = done, pending = re-attempt; an
+  UNDECODABLE/shape-incoherent row or a MISSING binding input (no
+  validated projection) = typed uncertain, NEVER a raw exception, NEVER
+  an unvalidated success), SAFE PAYLOAD/STABLE TOKEN (ref_json is
+  projection output only), forged committed_result / invented EvidenceRef
+  = REFUSED, never delivered.
 - V35 durable-blocked and local-uncertain commit-uncertainty paths.
 - V38 receipt store_revision floor on no-op commits.
 - V39 conflicting-receipt evidence never auto-resolves; rollback proceeds

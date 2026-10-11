@@ -698,6 +698,48 @@ class V26ToV29EpochsAndCrossing(unittest.TestCase):
         r = store.execute(1, req, c, l, p, ctx)
         self.assertEqual(r.kind, "executed")
 
+    def test_t1_issuer_first_precedence_over_expiry(self):
+        # T1 precedence (v80 sec 10; PR-3 A-before-B): the ISSUER
+        # checks run BEFORE Phase A - a STALE issuer refuses typed
+        # STALE even when the capability is ALSO expired, and the real
+        # PR-3 expiry precedence is NEVER recoded as uniform stale:
+        # (1) invalid issuer + expired grant -> STALE_POLICY (never
+        # ExpiredRefused); (2) changed issuer + expired grant ->
+        # STALE_POLICY; (3) VALID issuer + expired grant ->
+        # ExpiredRefused (the documented Phase A precedence preserved)
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        # (1) invalid issuer + expired grant
+        c, l, p, b, ctx = mint(store, req)
+        store._q.q("UPDATE fixture_grants SET expires_at=%s WHERE uid=1",
+                   (T0 + 10,), "exec")
+        store._q.q("UPDATE issuer_state SET valid=0 WHERE uid=1", (),
+                   "exec")
+        store._clock.advance(11)
+        with self.assertRaises(cap.ConflictError) as cm:
+            store.execute(1, req, c, l, p, ctx)
+        self.assertIn("STALE_POLICY", str(cm.exception))
+        self.assertNotIsInstance(cm.exception, cap.ExpiredRefused)
+        # (2) changed issuer + expired grant
+        store, _ = mkstore()
+        c, l, p, b, ctx = mint(store, req)
+        store._q.q("UPDATE fixture_grants SET expires_at=%s WHERE uid=1",
+                   (T0 + 10,), "exec")
+        moved = dataclasses.replace(
+            ctx, current_issuer=env.SessionRef(session_token_hash="ef" * 32))
+        store._clock.advance(11)
+        with self.assertRaises(cap.ConflictError) as cm:
+            store.execute(1, req, c, l, p, moved)
+        self.assertIn("STALE_POLICY", str(cm.exception))
+        # (3) VALID issuer + expired grant -> the REAL PR-3 expiry
+        store, _ = mkstore()
+        c, l, p, b, ctx = mint(store, req)
+        store._q.q("UPDATE fixture_grants SET expires_at=%s WHERE uid=1",
+                   (T0 + 10,), "exec")
+        store._clock.advance(11)
+        with self.assertRaises(cap.ExpiredRefused):
+            store.execute(1, req, c, l, p, ctx)
+
 
 class V30ToV33Replay(unittest.TestCase):
     """V30 valid-capability replay = recorded outcome; V31 Phase A before
@@ -1552,21 +1594,32 @@ class V34StepFaultsAndRestart(unittest.TestCase):
                            store._clock, rctx)
 
 
-    def test_fault_after_each_execute_step_rolls_back(self):
-        # v80 3928: fault injection AFTER EACH of steps 1-8: the attempt
-        # rolls back ENTIRELY (no partial effects, no claim leak) and an
-        # UNCHANGED retry stays permitted (pre-commit refusal, NO blind
-        # retry, an absent row is never treated as rollback proof)
+    def test_fault_at_each_step_entry_rolls_back(self):
+        # v80 3928: fault injection at the ENTRY of each declared step
+        # (the hooked method is REPLACED - the hooked step body NEVER
+        # runs), so each hook proves the EXECUTED boundary "all steps
+        # BEFORE the hooked step complete": entry(2-3a)=after 1a,
+        # entry(4)=after 2-3a, entry(5)=after 4, entry(6)=after 5,
+        # entry(7)=after 6, entry(9)=after 8. Steps 2 and 3a are ONE
+        # hooked block (_execute_current_checks is the smallest
+        # injectable seam) - NO literal after-2/after-3 boundary is
+        # claimed; entry(1a) and entry(8) are the separate footprint/
+        # monotone-allocation tests below; the post-apply boundary is
+        # the commit-guard/lost-commit pair above. The attempt rolls
+        # back ENTIRELY (no partial effects, no claim leak) and an
+        # UNCHANGED retry stays permitted (pre-commit refusal, NO
+        # blind retry, an absent row is never treated as rollback
+        # proof)
         injectables = [
-            ("step2_3a_current_checks", "_execute_current_checks"),
-            ("step4_phase_b_readback", "_phase_b_lookup"),
-            ("step5_tombstone", "_tombstone_check"),
-            ("step6_cas", "_cas_check"),
-            ("step7_classify", "_classify"),
-            ("step9_apply_record", "_apply_and_record"),
+            ("entry_2_3a_current_checks", "_execute_current_checks"),
+            ("entry_4_phase_b_readback", "_phase_b_lookup"),
+            ("entry_5_tombstone", "_tombstone_check"),
+            ("entry_6_cas", "_cas_check"),
+            ("entry_7_classify", "_classify"),
+            ("entry_9_apply_record", "_apply_and_record"),
         ]
         for name, attr in injectables:
-            with self.subTest(step=name):
+            with self.subTest(boundary=name):
                 store, conn = mkstore()
                 req = put_req("a1" * 16)
                 c, l, p, b, ctx = mint(store, req)
@@ -1597,8 +1650,10 @@ class V34StepFaultsAndRestart(unittest.TestCase):
                     "SELECT count(*) FROM facts").fetchone()[0], 1)
 
     def test_fault_step1a_footprint_rolls_back(self):
-        # v80 3928 step 1a: a fault at the declared-footprint step
-        # rolls the attempt back ENTIRELY; an unchanged retry works
+        # v80 3928: a fault at the ENTRY of step 1a (the declared-
+        # footprint step; the step body never runs, so the executed
+        # boundary is step 1) rolls the attempt back ENTIRELY; an
+        # unchanged retry works
         store, conn = mkstore()
         req = put_req("a1" * 16)
         c, l, p, b, ctx = mint(store, req)
@@ -1623,8 +1678,10 @@ class V34StepFaultsAndRestart(unittest.TestCase):
         self.assertEqual(r.kind, "executed")
 
     def test_fault_step8_monotone_allocation_rolls_back(self):
-        # v80 3928 step 8: a fault at the monotone epoch allocation
-        # rolls the (epoch-setting) attempt back ENTIRELY; retry works
+        # v80 3928: a fault at the ENTRY of step 8 (the monotone
+        # epoch allocation; the step body never runs, so the executed
+        # boundary is step 7) rolls the (epoch-setting) attempt back
+        # ENTIRELY; retry works
         store, conn = mkstore()
         req = wipe_req("0a" * 16)
         c, l, p, b, ctx = mint(store, req)
@@ -1645,6 +1702,59 @@ class V34StepFaultsAndRestart(unittest.TestCase):
             "SELECT count(*) FROM attempt_registry").fetchone()[0], 0)
         r = store.execute(1, req, c, l, p, ctx)
         self.assertEqual(r.kind, "executed")
+
+    def test_fault_boundaries_restart_clean(self):
+        # V34 (v80 3928) RESTART leg PER BOUNDARY: a fault injected at
+        # each step ENTRY, then a REAL file close/reopen - NO partial
+        # attempt survives the restart (no facts, no armed witness, no
+        # registry row) and a FRESH mint on the reopened store
+        # executes normally (old-session claims refuse after reopen -
+        # test_v34/test_restart_reopen above - an absent row is never
+        # rollback proof, NO blind retry)
+        injectables = [
+            ("entry_2_3a_current_checks", "_execute_current_checks"),
+            ("entry_4_phase_b_readback", "_phase_b_lookup"),
+            ("entry_5_tombstone", "_tombstone_check"),
+            ("entry_6_cas", "_cas_check"),
+            ("entry_7_classify", "_classify"),
+            ("entry_9_apply_record", "_apply_and_record"),
+        ]
+        for name, attr in injectables:
+            with self.subTest(boundary=name):
+                store, conn, path = mkstore_path()
+                req = put_req("a1" * 16)
+                c, l, p, b, ctx = mint(store, req)
+                orig = getattr(store, attr)
+
+                def boom(*a, _name=name, **k):
+                    raise sqlite3.OperationalError(
+                        "injected fault: " + _name)
+                setattr(store, attr, boom)
+                try:
+                    with self.assertRaises(sqlite3.OperationalError):
+                        store.execute(1, req, c, l, p, ctx)
+                finally:
+                    setattr(store, attr, orig)
+                f.close_exclusive_db(conn)
+                # RESTART: reopen the SAME path under a NEW instance
+                conn2 = f.open_exclusive_db(path)
+                store2 = f.FactStore(conn2, f.JsonTestClock(T0))
+                try:
+                    self.assertEqual(conn2.execute(
+                        "SELECT count(*) FROM facts").fetchone()[0], 0)
+                    self.assertEqual(conn2.execute(
+                        "SELECT count(*) FROM abort_witnesses"
+                        " WHERE state='armed'").fetchone()[0], 0)
+                    self.assertEqual(conn2.execute(
+                        "SELECT count(*) FROM attempt_registry"
+                        ).fetchone()[0], 0)
+                    r, _ = run(store2, put_req("b7" * 16,
+                                               key="after-boundary-restart"))
+                    self.assertEqual(r.kind, "executed")
+                    self.assertEqual(conn2.execute(
+                        "SELECT count(*) FROM facts").fetchone()[0], 1)
+                finally:
+                    f.close_exclusive_db(conn2)
 
 
 class V36V37ReadbackUnavailable(unittest.TestCase):
@@ -2113,12 +2223,91 @@ class V34bHarnessVectors(unittest.TestCase):
             "raw_ref_handle": ExplodingHandle(),
             "comparison_buffer": BlindHandle()})
         self.assertEqual(out["kind"], "refused")
-        self.assertIsNone(out["live_check"]["raw_found"])
+        # UNKNOWN (failed/missing probe) = conservative raw_found
+        # True - absence UNPROVEN, the CLOSED bool is never None
+        self.assertIs(out["live_check"]["raw_found"], True)
         self.assertEqual(sorted(out.keys()),
                          ["kind", "live_check", "ref_ids"])
         self.assertEqual(oconn.execute(
             "SELECT count(*) FROM scrub_log WHERE token=?",
             (comp.token,)).fetchone()[0], 0)
+
+    def test_u1_scrub_probe_schema_is_strict_bool(self):
+        # U1 (v80 2080-2104, 2083): raw_found is the CLOSED bool - a
+        # None/0/empty/non-bool probe is UNKNOWN (conservatively
+        # NOT-PROVEN-EMPTY: raw_found True, 'refused', NOTHING
+        # recorded); ONLY a COMPLETE strict literal-False probe set
+        # clears with raw_found False
+        for bad in (None, 0, "", [], 0.0, 1, "x", [1]):
+            with self.subTest(probe=repr(bad)):
+                store, req, b, rid, provider, harness, proj, oconn = \
+                    self._rig()
+                comp = harness.compose(
+                    {"projection": proj, "recovery_id": rid})
+
+                class BadProbe:
+                    def clear(self):
+                        pass
+
+                    def live_raw(self):
+                        return bad  # non-bool: NEVER a pass/fail vote
+
+                class GoodProbe:
+                    def clear(self):
+                        pass
+
+                    def live_raw(self):
+                        return False
+
+                out = harness.scrub(comp.token, {
+                    "raw_ref_handle": BadProbe(),
+                    "comparison_buffer": GoodProbe()})
+                self.assertEqual(out["kind"], "refused")
+                self.assertIs(out["live_check"]["raw_found"], True)
+                self.assertEqual(sorted(out.keys()),
+                                 ["kind", "live_check", "ref_ids"])
+                self.assertEqual(oconn.execute(
+                    "SELECT count(*) FROM scrub_log WHERE token=?",
+                    (comp.token,)).fetchone()[0], 0)
+                self.assertEqual(harness.outbox_state(comp.token),
+                                 "pending")
+        # REAL both-owned CLEAR positive: BOTH literal-False probes ->
+        # 'cleared' + raw_found False + the completion row recorded
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+
+        class OwnedHandle:
+            def __init__(self):
+                self._raw = b"secret"
+
+            def clear(self):
+                self._raw = None
+
+            def live_raw(self):
+                return self._raw is not None
+
+        raw, buf = OwnedHandle(), OwnedHandle()
+        out = harness.scrub(comp.token, {
+            "raw_ref_handle": raw, "comparison_buffer": buf})
+        self.assertEqual(out["kind"], "cleared")
+        self.assertIs(out["live_check"]["raw_found"], False)
+        self.assertEqual(out["live_check"]["containers"],
+                         ["raw_ref_handle", "comparison_buffer"])
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log WHERE token=?",
+            (comp.token,)).fetchone()[0], 1)
+        # REAL both-owned REFUSE positive: one literal-True probe ->
+        # 'refused' + raw_found True, NOTHING recorded
+        comp2 = harness.compose({"projection": proj, "recovery_id": rid})
+        stuck = OwnedHandle()
+        stuck.clear = lambda: None  # clear() does NOT erase the raw
+        out2 = harness.scrub(comp2.token, {
+            "raw_ref_handle": stuck, "comparison_buffer": OwnedHandle()})
+        self.assertEqual(out2["kind"], "refused")
+        self.assertIs(out2["live_check"]["raw_found"], True)
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log WHERE token=?",
+            (comp2.token,)).fetchone()[0], 0)
 
     def test_t4_ack_reread_identity_coherence(self):
         # T4 (v80 1628-1645): the durable reread binds token +
@@ -2146,6 +2335,31 @@ class V34bHarnessVectors(unittest.TestCase):
         bad2 = dataclasses.replace(ack_input, projection=drifted)
         ar = harness._ack_durable_reread(comp.token, bad2)
         self.assertEqual(ar.kind, "uncertain")
+        # NO binding input (ack_input None) = uncertain, NEVER an
+        # unvalidated success off the raw row state
+        ar = harness._ack_durable_reread(comp.token, None)
+        self.assertEqual(ar.kind, "uncertain")
+        # a refused-kind ack carries NO projection: still uncertain
+        refused_input = f.AckInput(kind="refused", token=comp.token,
+                                   reason=f.AckRefusedReason.IO_FAILURE)
+        ar = harness._ack_durable_reread(comp.token, refused_input)
+        self.assertEqual(ar.kind, "uncertain")
+        # an UNDECODABLE durable projection row = typed uncertain,
+        # NEVER a raw exception escaping the reread
+        orig_json = oconn.execute(
+            "SELECT projection_json FROM outbox WHERE token=?",
+            (comp.token,)).fetchone()[0]
+        oconn.execute("UPDATE outbox SET projection_json='not-json'"
+                      " WHERE token=?", (comp.token,))
+        ar = harness._ack_durable_reread(comp.token, ack_input)
+        self.assertEqual(ar.kind, "uncertain")
+        # a shape-incoherent (valid JSON, wrong shape) row = uncertain
+        oconn.execute("UPDATE outbox SET projection_json='{}'"
+                      " WHERE token=?", (comp.token,))
+        ar = harness._ack_durable_reread(comp.token, ack_input)
+        self.assertEqual(ar.kind, "uncertain")
+        oconn.execute("UPDATE outbox SET projection_json=? WHERE"
+                      " token=?", (orig_json, comp.token))
         # delivered = done
         harness.ack(ack_input)
         ar = harness._ack_durable_reread(comp.token, ack_input)
@@ -2275,9 +2489,10 @@ class V34bHarnessVectors(unittest.TestCase):
         out2 = harness.scrub(comp2.token, {
             "raw_ref_handle": stuck, "comparison_buffer": RawHandle(None)})
         self.assertEqual(out2["kind"], "refused")
-        # NO probe on the stuck container = UNKNOWN (raw_found None),
-        # never an arbitrary len/bool pass/fail
-        self.assertIsNone(out2["live_check"]["raw_found"])
+        # NO probe on the stuck container = UNKNOWN (conservative
+        # raw_found True - absence UNPROVEN, never None), never an
+        # arbitrary len/bool pass/fail
+        self.assertIs(out2["live_check"]["raw_found"], True)
         self.assertNotIn("scrubbed", out2)
         self.assertEqual(oconn.execute(
             "SELECT count(*) FROM scrub_log WHERE token=?",
