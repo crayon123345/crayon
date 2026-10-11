@@ -47,9 +47,9 @@ def mkstore(scopes=ALL_SCOPES, uid=1, lid=1, epoch=1):
 
 def resolve_op(store, req, b):
     tgt = store._historical_targets(req.operation_id, req, b)
-    w = read_cap(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
+    w, rctx = read_pair(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
     return store.resolve(1, req.operation_id, req, b, w, store._clock,
-                         read_ctx(store))
+                         rctx)
 
 
 def new_fact(key="tea", value="green", category=f.Category.PREFERENCE,
@@ -99,9 +99,16 @@ def read_cap(store, op, method, targets, uid=1, lid=1):
     return w
 
 
+def read_pair(store, op, method, targets, uid=1, lid=1):
+    """The read wrapper WITH its PAIRED caller context (v80 3496-3501:
+    the commitment binds the ACTUAL SUPPLIED context, so a conformant
+    call supplies the context minted WITH the wrapper)."""
+    return store.mint_read_fixtures(uid, lid, op, method, targets)
+
+
 def get(store, fid, ctx, op="d1" * 16):
-    w = read_cap(store, op, f.ReadMethod.GET, {"fid": fid})
-    return store.get(1, fid, w, store._clock, ctx)
+    w, rctx = read_pair(store, op, f.ReadMethod.GET, {"fid": fid})
+    return store.get(1, fid, w, store._clock, rctx)
 
 
 class V01ToV06Put(unittest.TestCase):
@@ -253,8 +260,9 @@ class V07ToV10Supersede(unittest.TestCase):
 
 
 def closure_and_delete(store, ctx, fid, op):
-    w = read_cap(store, "f6" * 16, f.ReadMethod.PREPARE_CLOSURE, {"fid": fid})
-    m = store.prepare_closure(1, fid, w, store._clock, ctx)
+    w, rctx = read_pair(store, "f6" * 16, f.ReadMethod.PREPARE_CLOSURE,
+                        {"fid": fid})
+    m = store.prepare_closure(1, fid, w, store._clock, rctx)
     req = f.FactRequest(
         method=f.MethodCode.DELETE, intent=f.ModelIntent.DeleteFact,
         payload=f.DeletePayload(
@@ -311,10 +319,9 @@ class V11ToV14Delete(unittest.TestCase):
 
     def test_v12b_delete_absent_recorded_replay(self):
         store, conn = mkstore()
-        ctx = read_ctx(store)
-        w = read_cap(store, "f6" * 16, f.ReadMethod.PREPARE_CLOSURE,
-                     {"fid": 99})
-        m = store.prepare_closure(1, 99, w, store._clock, ctx)
+        w, rctx = read_pair(store, "f6" * 16, f.ReadMethod.PREPARE_CLOSURE,
+                            {"fid": 99})
+        m = store.prepare_closure(1, 99, w, store._clock, rctx)
         req = f.FactRequest(
             method=f.MethodCode.DELETE, intent=f.ModelIntent.DeleteFact,
             payload=f.DeletePayload(
@@ -360,12 +367,11 @@ class V11ToV14Delete(unittest.TestCase):
             information_ref="test")
         r2, _ = run(store, sup)
         new_fid = r2.result.outcome.readback.fact_id
-        ctx = read_ctx(store)
-        w = read_cap(store, "f6" * 16, f.ReadMethod.PREPARE_CLOSURE,
-                     {"fid": fid})
-        m = store.prepare_closure(1, fid, w, store._clock, ctx)
+        w, rctx = read_pair(store, "f6" * 16, f.ReadMethod.PREPARE_CLOSURE,
+                            {"fid": fid})
+        m = store.prepare_closure(1, fid, w, store._clock, rctx)
         self.assertIsNone(m.live)  # history-only fid
-        (r, _), = [closure_and_delete(store, ctx, fid, "09" * 16)]
+        (r, _), = [closure_and_delete(store, rctx, fid, "09" * 16)]
         oc = r.result.outcome
         self.assertEqual(oc.result_code, "applied")
         counts = oc.proof.closure_counts
@@ -436,9 +442,9 @@ class V15ToV18Wipe(unittest.TestCase):
             store.execute(1, req, c, l, p, ctx)
         # historical readback with supplied originals: ScrubbedOutcome
         tgt = store._historical_targets("a1" * 16, req, b)
-        w = read_cap(store, "b7" * 16, f.ReadMethod.READBACK, tgt)
+        w, rctx = read_pair(store, "b7" * 16, f.ReadMethod.READBACK, tgt)
         pr = store.readback(1, "a1" * 16, req, b, w, store._clock,
-                            read_ctx(store))
+                            rctx)
         self.assertIsInstance(pr, f.PostReadResult)
         self.assertIsInstance(pr.original_outcome, f.ScrubbedOutcome)
         self.assertNotIn("green", repr(pr.original_outcome))
@@ -450,10 +456,11 @@ class V15ToV18Wipe(unittest.TestCase):
         report = r.result.outcome.report
         self.assertNotIn("s3cr3t-value", repr(report))
         for i in range(report.page_count):
-            w = read_cap(store, "e%d" % i * 16, f.ReadMethod.READ_REPORT_PAGE,
-                         {"page_index": i, "report_id": report.report_id})
+            w, rctx = read_pair(store, "e%d" % i * 16,
+                                f.ReadMethod.READ_REPORT_PAGE,
+                                {"page_index": i, "report_id": report.report_id})
             rng = store.read_report_page(1, report.report_id, i, w,
-                                         store._clock, read_ctx(store))
+                                         store._clock, rctx)
             self.assertIsInstance(rng, f.ReportRange)
             for ref in rng.ids:
                 self.assertIsInstance(ref, f.InventoryRef)
@@ -472,11 +479,12 @@ class V15ToV18Wipe(unittest.TestCase):
         # no silent truncation
         seen = []
         for i in range(report.page_count):
-            w = read_cap(store, ("%032x" % (0xE000 + i)),
-                         f.ReadMethod.READ_REPORT_PAGE,
-                         {"page_index": i, "report_id": report.report_id})
+            w, rctx = read_pair(store, ("%032x" % (0xE000 + i)),
+                                f.ReadMethod.READ_REPORT_PAGE,
+                                {"page_index": i,
+                                 "report_id": report.report_id})
             rng = store.read_report_page(1, report.report_id, i, w,
-                                         store._clock, read_ctx(store))
+                                         store._clock, rctx)
             self.assertEqual(rng.page_index, i)
             self.assertLessEqual(len(rng.ids), f.PAGE_MAX)
             seen.extend(rng.ids)
@@ -842,9 +850,9 @@ class V44ToV48Reads(unittest.TestCase):
     def _list(self, store, ctx, op, cursor=None, limit=100):
         tgt = {"category": None, "cursor": cursor, "limit": limit,
                "row_kind": f.RowKind.LIVE.value}
-        w = read_cap(store, op, f.ReadMethod.LIST_FACTS, tgt)
+        w, rctx = read_pair(store, op, f.ReadMethod.LIST_FACTS, tgt)
         return store.list_facts(1, f.RowKind.LIVE, None, cursor, limit, w,
-                                store._clock, ctx)
+                                store._clock, rctx)
 
     def test_v47_cursor_suite(self):
         store, _ = mkstore()
@@ -879,10 +887,11 @@ class V44ToV48Reads(unittest.TestCase):
         ctx = read_ctx(store)
         page = self._list(store, ctx, "d1" * 16)
         tgt_c = {"filters": {"category": None, "include_superseded": False}}
-        wc = read_cap(store, "d2" * 16, f.ReadMethod.COUNT_FACTS, tgt_c)
+        wc, rctx_c = read_pair(store, "d2" * 16, f.ReadMethod.COUNT_FACTS,
+                               tgt_c)
         cnt = store.count_facts(
             1, f.CountFilters(category=None, include_superseded=False),
-            wc, store._clock, ctx)
+            wc, store._clock, rctx_c)
         self.assertEqual(cnt.value, len(page.rows))
 
 
@@ -897,16 +906,35 @@ class V49ToV52StubsAndOptIn(unittest.TestCase):
     def test_v50_sensitive_refused_tier_disabled(self):
         store, _ = mkstore()
         req = put_req("a1" * 16)
-        # the sensitive REQUEST path: a MEMORY_SENSITIVE-scope requirement
-        # refuses TIER_DISABLED at Phase A on EVERY path (the model grants
-        # no SENSITIVE scope)
+        # STRUCTURALLY VALID sensitive request: required_scopes = the
+        # DERIVED set (structural tier PASSES, v80 742-745) and the
+        # sensitive FLAG is set - tier 2 owns the refusal (811-815):
+        # EXACTLY TIER_DISABLED (the model grants no SENSITIVE scope)
+        c, l, p, b, ctx = mint(store, req)
+        cap_req = cap.Request(
+            operation_id=req.operation_id,
+            operation_class=f._METHOD_OPERATION[req.method],
+            required_scopes=frozenset(f._METHOD_SCOPES[req.method]),
+            captured_epoch=c.inner.request.captured_epoch,
+            requested_audience_id=None,
+            permitted_information_ref=req.information_ref,
+            extraction_intent=cap.ExtractionIntent.NOT_APPLICABLE,
+            group_action=None, sensitive=True)
+        with self.assertRaises(cap.SensitiveRefused) as cm:
+            store._evaluator.recheck_model(c.inner, cap_req)
+        self.assertEqual(cm.exception.code, cap.ModelCode.TIER_DISABLED)
+        self.assertEqual(store._store_revision(1), 0)  # nothing ran
+        # the POST-MINT widened twin maps STRUCTURALLY: exact
+        # MALFORMED_INPUT (v80 742-745 before 811-815) - V54
         c, l, p, b, ctx = mint(store, req)
         orig = f._METHOD_SCOPES[req.method]
         f._METHOD_SCOPES[req.method] = tuple(orig) + (cap.Scope.MEMORY_SENSITIVE,)
         try:
-            with self.assertRaises(Exception):
+            with self.assertRaises(Exception) as cm2:
                 store.execute(1, req, c, l, p, ctx)
-            self.assertEqual(store._store_revision(1), 0)  # nothing ran
+            self.assertEqual(getattr(cm2.exception, "code", None),
+                             cap.ModelCode.MALFORMED_INPUT)
+            self.assertEqual(store._store_revision(1), 0)
         finally:
             f._METHOD_SCOPES[req.method] = orig
 
@@ -958,9 +986,9 @@ class V53HistoricalAuth(unittest.TestCase):
         # unregistered -> UnknownOperation on the historical API
         _, _, _, b = store.mint_mutation_fixtures(put_req("ab" * 16))
         tgt = store._historical_targets("ab" * 16, None, b)
-        w = read_cap(store, "b9" * 16, f.ReadMethod.READBACK, tgt)
+        w, rctx = read_pair(store, "b9" * 16, f.ReadMethod.READBACK, tgt)
         with self.assertRaises(f.UnknownOperationError):
-            store.readback(1, "ab" * 16, None, b, w, store._clock, ctx)
+            store.readback(1, "ab" * 16, None, b, w, store._clock, rctx)
 
     def test_v53_load_stored_requires_binding(self):
         store, _ = mkstore()
@@ -968,10 +996,10 @@ class V53HistoricalAuth(unittest.TestCase):
         c, l, p, b, ctx = mint(store, req)
         store.execute(1, req, c, l, p, ctx)
         tgt = store._historical_targets("a1" * 16, None, b)
-        w = read_cap(store, "b1" * 16, f.ReadMethod.READBACK, tgt)
+        w, rctx = read_pair(store, "b1" * 16, f.ReadMethod.READBACK, tgt)
         with self.assertRaises(cap.ModelInputError):
-            store.readback(1, "a1" * 16, None, None, w, store._clock, ctx)
-        pr = store.readback(1, "a1" * 16, None, b, w, store._clock, ctx)
+            store.readback(1, "a1" * 16, None, None, w, store._clock, rctx)
+        pr = store.readback(1, "a1" * 16, None, b, w, store._clock, rctx)
         self.assertIsInstance(pr, f.PostReadResult)
 
 
@@ -1020,6 +1048,39 @@ def evidence(store, rid, op, token, kind=f.EvidenceKind.RECEIPT,
                                  ctx), proj
 
 
+    def test_b7_load_stored_full_hash_recomputation(self):
+        # B7: the LOAD_STORED path recomputes the FULL request+binding
+        # extended hash (the stored typed request + the caller's typed
+        # binding) and compares EQUAL to the retained commitment
+        store, conn = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store.execute(1, req, c, l, p, ctx)
+        tgt = store._historical_targets("a1" * 16, None, b)
+        w, rctx = read_pair(store, "b1" * 16, f.ReadMethod.READBACK, tgt)
+        pr = store.readback(1, "a1" * 16, None, b, w, store._clock,
+                            rctx)
+        self.assertIsInstance(pr, f.PostReadResult)
+        # a STORED request/binding pair that no longer hashes to the
+        # retained commitment = drift (the projection compare ALONE
+        # passes: binding_json untouched)
+        row = conn.execute(
+            "SELECT request_json FROM stored_requests WHERE"
+            " operation_id=?", ("a1" * 16,)).fetchone()
+        obj = json.loads(row[0])
+        obj["payload"]["value"] = "TAMPERED"
+        store._q.q("UPDATE stored_requests SET request_json=%s WHERE"
+                   " operation_id=%s", (json.dumps(obj), "a1" * 16),
+                   "exec")
+        tgt2 = store._historical_targets("a1" * 16, None, b)
+        w2, rctx2 = read_pair(store, "b2" * 16, f.ReadMethod.READBACK,
+                              tgt2)
+        with self.assertRaises(cap.ConflictError) as cm:
+            store.readback(1, "a1" * 16, None, b, w2, store._clock,
+                           rctx2)
+        self.assertIn("REQUEST_DRIFT", str(cm.exception))
+
+
 class V34bInsertionEvents(unittest.TestCase):
     """V34b receiver-side named vectors: repeat, drift, same-second,
     blocked repeat, blocked->resolved, late-after-resolution."""
@@ -1066,9 +1127,9 @@ class V34bInsertionEvents(unittest.TestCase):
         self.assertEqual(r1.kind, "blocked_inserted")
         # resolve stays UNRESOLVED without attested witnesses (V39 rule):
         tgt = store._historical_targets(req.operation_id, req, b)
-        w = read_cap(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
+        w, rctx = read_pair(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
         rr = store.resolve(1, req.operation_id, req, b, w, store._clock,
-                           read_ctx(store))
+                           rctx)
         self.assertEqual(rr.kind, "rolled_back")
         self.assertGreaterEqual(rr.attested_witness_count, 1)
         # BLOCKED->RESOLVED REPEAT: no event, no mint, no recount
@@ -1076,6 +1137,82 @@ class V34bInsertionEvents(unittest.TestCase):
         self.assertEqual(r2.kind, "blocked_replay_no_event")
         self.assertEqual(r2.contribution, 0)
         self.assertIsNotNone(r2.resolution_event_id)
+
+
+    def test_concurrent_double_delivery_one_winner(self):
+        # CONCURRENT DOUBLE-DELIVERY (v80 3931): two contenders compose
+        # the SAME delivery INDEPENDENTLY; the first commits (winner),
+        # the loser's full path replays with NO writes
+        store, conn = mkstore()
+        req, b, rid = blocked_op(store)
+        proj = f.SafeEvidenceProjection(
+            recovery_id=rid, uid=1, lifetime_id=1,
+            operation_id=req.operation_id,
+            commitment=f.extended_binding_hash(b, req),
+            kind=f.EvidenceKind.RECEIPT,
+            target=f.RecoveryBoundRef(recovery_id=rid,
+                                      source=f.EvidenceKind.RECEIPT),
+            source=f.EvidenceKind.RECEIPT,
+            accounting_scope=f.Lifetime(uid=1, lifetime_id=1))
+        wa, ctxa = store.mint_read_fixtures(
+            1, 1, "b3" * 16, f.ReadMethod.READBACK,
+            {"projection": proj.to_dict(), "token": "d" * 32})
+        wb, ctxb = store.mint_read_fixtures(
+            1, 1, "b3" * 16, f.ReadMethod.READBACK,
+            {"projection": proj.to_dict(), "token": "d" * 32})
+        ra = store.insert_evidence(1, 1, "b3" * 16, proj, "d" * 32,
+                                   wa, ctxa)
+        self.assertEqual(ra.kind, "blocked_inserted")
+        rb = store.insert_evidence(1, 1, "b3" * 16, proj, "d" * 32,
+                                   wb, ctxb)
+        self.assertEqual(rb.kind, "blocked_replay_no_event")
+        self.assertEqual(rb.contribution, 0)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM evidence_entries").fetchone()[0], 1)
+
+    def test_post_scrub_repeat_replays_safe_fields(self):
+        # POST-SCRUB REPEAT (v80 3940): the repeat compares the SAFE
+        # projection fields ONLY (never erased content) and replays
+        store, conn = mkstore()
+        req, b, rid = blocked_op(store)
+        r1, _ = evidence(store, rid, req.operation_id, "d" * 32)
+        self.assertEqual(r1.kind, "blocked_inserted")
+        run(store, wipe_req("0a" * 16))  # scrubs stored request+content
+        n = conn.execute(
+            "SELECT count(*) FROM evidence_entries").fetchone()[0]
+        r2, _ = evidence(store, rid, req.operation_id, "d" * 32)
+        self.assertEqual(r2.kind, "blocked_replay_no_event")
+        self.assertEqual(r2.contribution, 0)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM evidence_entries").fetchone()[0], n)
+
+    def test_unique_drift_conflict_rollback_refusal(self):
+        # UNIQUE DRIFT (v80 3944): the (recovery_id, delivery_token)
+        # UNIQUE fence exists; a direct conflicting insert raises and
+        # rolls back; the winner compare classifies a CHANGED
+        # projection under the same delivery identity = typed drift
+        store, conn = mkstore()
+        req, b, rid = blocked_op(store)
+        evidence(store, rid, req.operation_id, "d" * 32)
+        names = [r[1] for r in conn.execute(
+            "PRAGMA index_list('evidence_entries')").fetchall()]
+        self.assertIn("evidence_entries_delivery", names)
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO evidence_entries(evidence_id, recovery_id,"
+                " kind, delivery_token, received_at, ref,"
+                " projection_json, insertion_event_id,"
+                " resolution_event_id, origin_kind, inserting_uid,"
+                " inserting_lifetime_id, inserting_operation_id)"
+                " VALUES('dup', ?, 'receipt', ?, 0, 'evidence:dup',"
+                " '{}', NULL, NULL, 'blocked_arrival', 1, 1, ?)",
+                (rid, "d" * 32, req.operation_id))
+        conn.rollback()
+        with self.assertRaises(f.DeliveryDriftError):
+            evidence(store, rid, req.operation_id, "d" * 32,
+                     commitment="9" * 64)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM evidence_entries").fetchone()[0], 1)
 
 
 class V39V40Conflicts(unittest.TestCase):
@@ -1090,9 +1227,9 @@ class V39V40Conflicts(unittest.TestCase):
         # the op is NEVER auto-resolved by evidence; resolve still
         # unresolved without attested witnesses
         tgt = store._historical_targets(req.operation_id, req, b)
-        w = read_cap(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
+        w, rctx = read_pair(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
         rr = store.resolve(1, req.operation_id, req, b, w, store._clock,
-                           read_ctx(store))
+                           rctx)
         self.assertEqual(rr.kind, "rolled_back")
         self.assertGreaterEqual(rr.attested_witness_count, 1)
         # the conflicting receipt stays as IMMUTABLE evidence
@@ -1133,9 +1270,9 @@ class V44V45V46ReadViews(unittest.TestCase):
     def test_v44_changed_targets_refuse(self):
         store, _ = mkstore()
         run(store, put_req("a1" * 16))
-        w = read_cap(store, "d1" * 16, f.ReadMethod.GET, {"fid": 1})
+        w, rctx = read_pair(store, "d1" * 16, f.ReadMethod.GET, {"fid": 1})
         with self.assertRaises(cap.AuthError):
-            store.get(1, 2, w, store._clock, read_ctx(store))
+            store.get(1, 2, w, store._clock, rctx)
 
     def test_v45_v46_superseded_history_views(self):
         store, _ = mkstore()
@@ -1146,17 +1283,19 @@ class V44V45V46ReadViews(unittest.TestCase):
         # LIVE view: only the replacement
         tgt_l = {"category": None, "cursor": None, "limit": 10,
                  "row_kind": f.RowKind.LIVE.value}
-        wl = read_cap(store, "d1" * 16, f.ReadMethod.LIST_FACTS, tgt_l)
+        wl, rctxl = read_pair(store, "d1" * 16, f.ReadMethod.LIST_FACTS,
+                              tgt_l)
         live = store.list_facts(1, f.RowKind.LIVE, None, None, 10, wl,
-                                store._clock, ctx)
+                                store._clock, rctxl)
         self.assertEqual(len(live.rows), 1)
         self.assertEqual(live.rows[0].value, "v2")
         # HISTORY view: the superseded row, ordered by history_id
         tgt_h = {"category": None, "cursor": None, "limit": 10,
                  "row_kind": f.RowKind.HISTORY.value}
-        wh = read_cap(store, "d2" * 16, f.ReadMethod.LIST_FACTS, tgt_h)
+        wh, rctxh = read_pair(store, "d2" * 16, f.ReadMethod.LIST_FACTS,
+                              tgt_h)
         hist = store.list_facts(1, f.RowKind.HISTORY, None, None, 10, wh,
-                                store._clock, ctx)
+                                store._clock, rctxh)
         self.assertEqual(len(hist.rows), 1)
         self.assertTrue(all(isinstance(x, f.HistoryRow)
                             for x in hist.rows))
@@ -1324,12 +1463,81 @@ class V34StepFaultsAndRestart(unittest.TestCase):
         req = put_req("a1" * 16)  # minted but NEVER executed
         _, _, _, b = store.mint_mutation_fixtures(req)
         tgt = store._historical_targets(req.operation_id, req, b)
-        w = read_cap(store, "b5" * 16, f.ReadMethod.READBACK, tgt)
+        w, rctx = read_pair(store, "b5" * 16, f.ReadMethod.READBACK, tgt)
         # absent = a typed UnknownOperation, NEVER a rollback/committed
         # proof and NEVER a fabricated outcome
         with self.assertRaises(f.UnknownOperationError):
             store.readback(1, req.operation_id, req, b, w,
-                           store._clock, read_ctx(store))
+                           store._clock, rctx)
+
+
+    def test_fault_after_each_execute_step_rolls_back(self):
+        # v80 3928: fault injection AFTER EACH of steps 1-8: the attempt
+        # rolls back ENTIRELY (no partial effects, no claim leak) and an
+        # UNCHANGED retry stays permitted (pre-commit refusal, NO blind
+        # retry, an absent row is never treated as rollback proof)
+        injectables = [
+            ("steps1-4_launch_gate_phaseB", "_execute_readback"),
+            ("steps2-3a_current_checks", "_execute_current_checks"),
+            ("step5_tombstone", "_tombstone_check"),
+            ("step6_cas", "_cas_check"),
+            ("step7_classify", "_classify"),
+            ("step9_apply_record", "_apply_and_record"),
+        ]
+        for name, attr in injectables:
+            with self.subTest(step=name):
+                store, conn = mkstore()
+                req = put_req("a1" * 16)
+                c, l, p, b, ctx = mint(store, req)
+                orig = getattr(store, attr)
+
+                def boom(*a, _name=name, **k):
+                    raise sqlite3.OperationalError(
+                        "injected fault: " + _name)
+                setattr(store, attr, boom)
+                try:
+                    with self.assertRaises(sqlite3.OperationalError):
+                        store.execute(1, req, c, l, p, ctx)
+                finally:
+                    setattr(store, attr, orig)
+                # the ENTIRE attempt rolled back: no effects, NO leak
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM facts").fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM abort_witnesses"
+                    " WHERE state='armed'").fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM attempt_registry"
+                    ).fetchone()[0], 0)
+                # an UNCHANGED retry is PERMITTED
+                r = store.execute(1, req, c, l, p, ctx)
+                self.assertEqual(r.kind, "executed")
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM facts").fetchone()[0], 1)
+
+    def test_fault_step8_monotone_allocation_rolls_back(self):
+        # v80 3928 step 8: a fault at the monotone epoch allocation
+        # rolls the (epoch-setting) attempt back ENTIRELY; retry works
+        store, conn = mkstore()
+        req = wipe_req("0a" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        orig = f.owner_counters.allocate_next_epoch
+
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("injected step-8 fault")
+        f.owner_counters.allocate_next_epoch = boom
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                store.execute(1, req, c, l, p, ctx)
+        finally:
+            f.owner_counters.allocate_next_epoch = orig
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM abort_witnesses WHERE state='armed'"
+            ).fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM attempt_registry").fetchone()[0], 0)
+        r = store.execute(1, req, c, l, p, ctx)
+        self.assertEqual(r.kind, "executed")
 
 
 class V36V37ReadbackUnavailable(unittest.TestCase):
@@ -1378,8 +1586,8 @@ class V44OneTransactionBinding(unittest.TestCase):
         store, _ = mkstore()
         r, _ = run(store, put_req("a1" * 16))
         fid = r.result.outcome.readback.fact_id
-        ctx = read_ctx(store)
-        w = read_cap(store, "d1" * 16, f.ReadMethod.GET, {"fid": fid})
+        w, rctx = read_pair(store, "d1" * 16, f.ReadMethod.GET,
+                            {"fid": fid})
         seen = {}
         orig = store._evaluator.recheck_model
 
@@ -1388,7 +1596,7 @@ class V44OneTransactionBinding(unittest.TestCase):
             return orig(capability, request)
         store._evaluator.recheck_model = spy
         try:
-            store.get(1, fid, w, store._clock, ctx)
+            store.get(1, fid, w, store._clock, rctx)
         finally:
             store._evaluator.recheck_model = orig
         self.assertTrue(seen["in_txn"])  # Phase A INSIDE the one read txn
@@ -1400,11 +1608,11 @@ class V44OneTransactionBinding(unittest.TestCase):
         fid = r.result.outcome.readback.fact_id
         r2, _ = run(store, put_req("a2" * 16, key="other"))
         fid2 = r2.result.outcome.readback.fact_id
-        ctx = read_ctx(store)
-        w = read_cap(store, "d1" * 16, f.ReadMethod.GET, {"fid": fid})
+        w, rctx = read_pair(store, "d1" * 16, f.ReadMethod.GET,
+                            {"fid": fid})
         # the setup minted for fid1 can NEVER read fid2
         with self.assertRaises(cap.AuthError):
-            store.get(1, fid2, w, store._clock, ctx)
+            store.get(1, fid2, w, store._clock, rctx)
 
 
 class V47CursorRevisionAndRetention(unittest.TestCase):
@@ -1416,22 +1624,22 @@ class V47CursorRevisionAndRetention(unittest.TestCase):
         store, _ = mkstore()
         for i in range(3):
             run(store, put_req("%032x" % (0xA0 + i), key="k%d" % i))
-        ctx = read_ctx(store)
         tgt = {"category": None, "cursor": None, "limit": 2,
                "row_kind": f.RowKind.LIVE.value}
-        w = read_cap(store, "d1" * 16, f.ReadMethod.LIST_FACTS, tgt)
+        w, rctx = read_pair(store, "d1" * 16, f.ReadMethod.LIST_FACTS, tgt)
         page = store.list_facts(1, f.RowKind.LIVE, None, None, 2, w,
-                                store._clock, ctx)
+                                store._clock, rctx)
         cursor = page.next_cursor
         self.assertIsNotNone(cursor)
         # the live revision MOVES: the bound cursor is invalidated
         run(store, put_req("a9" * 16, key="mover"))
         tgt2 = {"category": None, "cursor": cursor, "limit": 2,
                 "row_kind": f.RowKind.LIVE.value}
-        w2 = read_cap(store, "d2" * 16, f.ReadMethod.LIST_FACTS, tgt2)
+        w2, rctx2 = read_pair(store, "d2" * 16, f.ReadMethod.LIST_FACTS,
+                              tgt2)
         with self.assertRaises(f.UnknownCursorError):
             store.list_facts(1, f.RowKind.LIVE, None, cursor, 2, w2,
-                             store._clock, ctx)
+                             store._clock, rctx2)
 
     def test_report_page_cursor_retained_until_erased(self):
         store, _ = mkstore()
@@ -1457,7 +1665,7 @@ class V47CursorRevisionAndRetention(unittest.TestCase):
                    (), "exec")
         tgt = {"category": None, "cursor": "zz", "limit": 2,
                "row_kind": f.RowKind.LIVE.value}
-        w = read_cap(store, "d1" * 16, f.ReadMethod.LIST_FACTS, tgt)
+        w, rctx = read_pair(store, "d1" * 16, f.ReadMethod.LIST_FACTS, tgt)
         with self.assertRaises(cap.ModelInputError):
             store.list_facts(1, f.RowKind.LIVE, None, "zz", 2, w,
                              store._clock, ctx)
@@ -1481,13 +1689,14 @@ class V54FullPrecedence(unittest.TestCase):
         try:
             with self.assertRaises(Exception) as cm:
                 store.execute(1, req, c, l, p, ctx)
-            # the structural/sensitive tiers refuse BEFORE expiry: the
-            # model maps the MEMORY_SENSITIVE requirement structurally
-            # (MALFORMED_INPUT) or as TIER_DISABLED - NEVER ExpiredRefused
+            # EXACT CODE (v80 742-745 structural BEFORE 811-815
+            # sensitive): a MEMORY_SENSITIVE requirement WIDENED AFTER
+            # MINT mismatches the minted capability structurally ->
+            # MALFORMED_INPUT, and structural tier refuses BEFORE
+            # expiry - NEVER ExpiredRefused, NEVER TIER_DISABLED here
             self.assertNotIsInstance(cm.exception, cap.ExpiredRefused)
-            self.assertIn(getattr(cm.exception, "code", None),
-                          (cap.ModelCode.MALFORMED_INPUT,
-                           cap.ModelCode.TIER_DISABLED))
+            self.assertEqual(getattr(cm.exception, "code", None),
+                             cap.ModelCode.MALFORMED_INPUT)
             self.assertEqual(store._store_revision(1), 0)  # nothing ran
         finally:
             f._METHOD_SCOPES[req.method] = orig
@@ -1574,9 +1783,9 @@ class V55FullClaimBindingMapping(unittest.TestCase):
         store, _ = mkstore()
         r, _ = run(store, put_req("a1" * 16))
         fid = r.result.outcome.readback.fact_id
-        ctx = read_ctx(store)
-        stale_ctx = dataclasses.replace(ctx, current_issuer_valid=False)
-        w = read_cap(store, "d1" * 16, f.ReadMethod.GET, {"fid": fid})
+        w, rctx = read_pair(store, "d1" * 16, f.ReadMethod.GET,
+                            {"fid": fid})
+        stale_ctx = dataclasses.replace(rctx, current_issuer_valid=False)
         with self.assertRaises(cap.ConflictError) as cm:
             store.get(1, fid, w, store._clock, stale_ctx)
         self.assertIn("STALE", str(cm.exception))
@@ -1680,6 +1889,63 @@ class V34bHarnessVectors(unittest.TestCase):
             accounting_scope=f.Lifetime(uid=1, lifetime_id=1))
         return store, req, b, rid, provider, harness, proj, oconn
 
+    def test_unrelated_same_owner_target_refused(self):
+        # the R1 repro (v80 795-812, 3948-3951 UNRELATED SAME-OWNER
+        # TARGET): a VALID recovery/hash with an UNRELATED same-owner
+        # ScopedInventoryRef target is NOT the subject's evidence -
+        # REFUSAL, NO blocked_inserted row
+        store, conn, path = mkstore_path()
+        req, b, rid = blocked_op(store)
+        bh = f.extended_binding_hash(b, req)
+        base = dict(recovery_id=rid, uid=1, lifetime_id=1,
+                    operation_id=req.operation_id, commitment=bh,
+                    kind=f.EvidenceKind.RECEIPT,
+                    source=f.EvidenceKind.RECEIPT,
+                    accounting_scope=f.Lifetime(uid=1, lifetime_id=1))
+        bad = f.SafeEvidenceProjection(
+            target=f.ScopedInventoryRef(
+                owner=f.Lifetime(uid=1, lifetime_id=1),
+                class_name=f.CopyClass.FACTS, entry_id="fake-entry"),
+            **base)
+        w, ctx = store.mint_read_fixtures(
+            1, 1, "b3" * 16, f.ReadMethod.READBACK,
+            {"projection": bad.to_dict(), "token": "ab" * 16})
+        with self.assertRaises(f.EvidenceScopeError):
+            store.insert_evidence(1, 1, "b3" * 16, bad, "ab" * 16, w, ctx)
+        self.assertEqual(store._q.q(
+            "SELECT count(*) AS n FROM evidence_entries", (),
+            "one")["n"], 0)
+        # a source != kind projection breaks the anchor's expected
+        # source association (v80 1289) - same refusal
+        bad2 = f.SafeEvidenceProjection(
+            target=f.RecoveryBoundRef(
+                recovery_id=rid, source=f.EvidenceKind.RECEIPT),
+            **{**base, "source": f.EvidenceKind.LATE_ACCOUNTING})
+        w2, ctx2 = store.mint_read_fixtures(
+            1, 1, "b3" * 16, f.ReadMethod.READBACK,
+            {"projection": bad2.to_dict(), "token": "cd" * 16})
+        with self.assertRaises(f.EvidenceScopeError):
+            store.insert_evidence(1, 1, "b3" * 16, bad2, "cd" * 16,
+                                  w2, ctx2)
+        self.assertEqual(store._q.q(
+            "SELECT count(*) AS n FROM evidence_entries", (),
+            "one")["n"], 0)
+        # the subject's OWN receipt entry (the store-built target)
+        # SATISFIES the binding and inserts
+        good = f.SafeEvidenceProjection(
+            target=f.ScopedInventoryRef(
+                owner=f.Lifetime(uid=1, lifetime_id=1),
+                class_name=f.CopyClass.OP_RECORDS,
+                entry_id="receipt:" + req.operation_id),
+            **base)
+        w3, ctx3 = store.mint_read_fixtures(
+            1, 1, "b3" * 16, f.ReadMethod.READBACK,
+            {"projection": good.to_dict(), "token": "ef" * 16})
+        r = store.insert_evidence(1, 1, "b3" * 16, good, "ef" * 16,
+                                  w3, ctx3)
+        self.assertEqual(r.kind, "blocked_inserted")
+        f.close_exclusive_db(conn)
+
     def test_safe_payload_stable_token(self):
         store, req, b, rid, provider, harness, proj, oconn = self._rig()
         comp = harness.compose({"projection": proj, "recovery_id": rid})
@@ -1733,11 +1999,12 @@ class V34bHarnessVectors(unittest.TestCase):
         # the receiver ack COMMITTED but the outbox update\'s COMMIT
         # CONFIRMATION is lost
         ar = harness.ack(d["ack"], confirm=False)
-        self.assertEqual(ar.kind, "uncertain")
-        self.assertEqual(ar.uncertain,
-                         f.AckUncertain.LOST_COMMIT_CONFIRMATION)
-        # the durable reread under the SAME identity decides: pending =
-        # re-attempt (replays receiver-side, NO double-count)
+        # LOST CONFIRMATION = the DURABLE REREAD under the SAME
+        # token/recovery/projection decides (v80 1628-1645): the row is
+        # still pending = re-attempt, NEVER an immediate uncertain or a
+        # blind pending claim without the reread
+        self.assertEqual(ar.kind, "still_pending")
+        self.assertEqual(ar.reason, f.AckRefusedReason.IO_FAILURE)
         self.assertEqual(harness.outbox_state(comp.token), "pending")
         d2 = provider.deliver({"projection": proj, "token": comp.token})
         self.assertEqual(d2["committed_result"].kind,
@@ -1745,37 +2012,69 @@ class V34bHarnessVectors(unittest.TestCase):
         ar2 = harness.ack(d2["ack"])
         self.assertEqual(ar2.kind, "delivered")
         self.assertEqual(harness.outbox_state(comp.token), "delivered")
+        # DELIVERED-COMMIT-THEN-LOSS: the reread sees the landed row =
+        # done (NO rollback claim, NO blind re-attempt)
+        ar2b = harness.ack(d2["ack"], confirm=False)
+        self.assertEqual(ar2b.kind, "delivered")
         # UNREADABLE reread = typed uncertain, NO blind pending claim
         provider._fault_io_unreadable = True
         ar3 = harness.ack(d2["ack"])
         self.assertEqual(ar3.kind, "uncertain")
         self.assertEqual(ar3.uncertain, f.AckUncertain.IO_UNREADABLE)
 
-    def test_live_erase_hook_ordering_and_refusal(self):
+    def test_live_erase_typed_outcome_and_refusal(self):
         store, req, b, rid, provider, harness, proj, oconn = self._rig()
         comp = harness.compose({"projection": proj, "recovery_id": rid})
         calls = []
 
-        def hook():
-            # the volatile raw is destroyed BEFORE any completion record
-            calls.append(oconn.execute(
-                "SELECT count(*) FROM scrub_log").fetchone()[0])
-        out = harness.scrub(comp.token, hook)
+        class RawHandle:
+            def __init__(self, payload, probe=None):
+                self._payload = payload
+                self._probe = probe
+
+            def clear(self):
+                if self._probe is not None:
+                    self._probe()
+                self._payload = None
+
+            def live_raw(self):
+                return self._payload is not None
+
+        raw = RawHandle(b"raw-secret", probe=lambda: calls.append(
+            oconn.execute(
+                "SELECT count(*) FROM scrub_log").fetchone()[0]))
+        buf = RawHandle(b"cmp-secret")
+        out = harness.scrub(comp.token, {
+            "raw_ref_handle": raw, "comparison_buffer": buf})
+        # ScrubOutcome (v80 2060-2137): kind/ref_ids/live_check typed
+        self.assertEqual(out["kind"], "cleared")
+        self.assertEqual(out["ref_ids"],
+                         ["raw_ref_handle", "comparison_buffer"])
+        self.assertEqual(out["live_check"]["raw_found"], False)
+        self.assertEqual(sorted(out["live_check"]["containers"]),
+                         ["comparison_buffer", "raw_ref_handle"])
         self.assertEqual(out["scrubbed"], comp.token)
-        self.assertEqual(calls, [0])  # NO completion recorded at hook time
+        self.assertEqual(calls, [0])  # NO completion BEFORE discard
+        self.assertFalse(raw.live_raw())
+        self.assertFalse(buf.live_raw())
         self.assertEqual(oconn.execute(
             "SELECT count(*) FROM scrub_log").fetchone()[0], 1)
-        # a hook FAILURE = the step REFUSAL: nothing recorded
+        # CONTRADICTION: raw still live after discard = 'refused',
+        # NOTHING recorded (a noop with populated raw can never clear)
         comp2 = harness.compose({"projection": proj, "recovery_id": rid})
-
-        def bad_hook():
-            raise RuntimeError("volatile raw destruction failed")
-        with self.assertRaises(RuntimeError):
-            harness.scrub(comp2.token, bad_hook)
+        stuck = object()  # no destroy/clear: raw cannot be discarded
+        out2 = harness.scrub(comp2.token, {
+            "raw_ref_handle": stuck, "comparison_buffer": RawHandle(None)})
+        self.assertEqual(out2["kind"], "refused")
+        self.assertEqual(out2["live_check"]["raw_found"], True)
+        self.assertNotIn("scrubbed", out2)
         self.assertEqual(oconn.execute(
             "SELECT count(*) FROM scrub_log WHERE token=?",
             (comp2.token,)).fetchone()[0], 0)
         self.assertEqual(harness.outbox_state(comp2.token), "pending")
+        # the CLOSED enumeration is exact: missing/extra keys refuse
+        with self.assertRaises(cap.ModelInputError):
+            harness.scrub(comp.token, {"raw_ref_handle": RawHandle(None)})
 
     def test_forged_result_or_ref_never_delivered(self):
         store, req, b, rid, provider, harness, proj, oconn = self._rig()

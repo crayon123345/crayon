@@ -126,31 +126,73 @@ Covered by the suite (96 tests):
 - V52 set_optin missing/same/changed incl. FIRST-False (virtual default
   OFF, no row, revision +0).
 - V53 historical APIs need a fresh READ claim + typed originals;
-  unregistered op = UnknownOperation.
+  unregistered op = UnknownOperation. LOAD_STORED historical reads
+  recompute the FULL request+binding extended hash (the stored typed
+  request + the caller's typed binding) and compare EQUAL to the
+  retained commitment; a stored row whose request/binding pair no
+  longer hashes to its commitment is drift.
 - V54 precedence: structural/sensitive tiers refuse BEFORE expiry
   (never ExpiredRefused), expiry BEFORE revocation, revocation BEFORE
   scope, scope BEFORE capacity, CAS not masked at capacity, ERASED
   precedes CAS/capacity; malformed cursor is structural everywhere.
-- V55 full claim/binding mapping: no nonce/fence/target ids; issuer
-  channel agreement (WEB = SessionRef-shaped 64-hex web_session;
-  TELEGRAM = TelegramIssuer bot/chat/update ids, canonical JSON
-  round-trip); current_issuer_valid False = STALE_POLICY; the full
-  generations mapping (capture_epoch/grant_generation/policy_revision/
-  decision_revision/consent_generation) equals the owned fixture
-  snapshot.
+- V55 FULL claim/binding mapping (v80 4045-4052), every element
+  covered: the binding carries NO nonce/fence/target ids; transport
+  reseal (nonce/key change) still matches (V33); a content or identity
+  change drifts (V31); issuer channel agreement (WEB =
+  SessionRef-shaped 64-hex web_session; TELEGRAM = TelegramIssuer
+  bot/chat/update ids, canonical JSON round-trip); current_issuer_valid
+  False = STALE_POLICY; original-issuer == current-issuer equality on
+  every read; the CLAIM mapping (claim_state ACQUIRED + owner_token +
+  fence >= 1 at the execution gate); the CAPABILITY mapping (the read
+  commitment binds the wrapper handle AND the actual supplied caller
+  canon; the mutation wrapper binds the registered request+binding
+  hash); the REQUEST mapping (the extended commitment covers method +
+  targets + versions + payload); the full GENERATIONS mapping
+  (capture_epoch/grant_generation/policy_revision/decision_revision/
+  consent_generation) equal to the owned fixture snapshot.
 - B9 wrapper typing: a None wrapper never dereferences - typed refusal
   on get/list/execute paths.
 - The exclusive cross-instance isolation fixture: a second opener of the
   same path refuses; a file-backed connection WITHOUT the exclusive
   marker refuses; close releases the lock; :memory: remains allowed.
 
-NOT yet covered (planned, no claims made):
-
-- Concurrent double-delivery (one winner, loser replays) - the model's
-  single-writer SQLite makes a true concurrent race inexpressible;
-  the same-token replay path covers the loser's outcome.
-- Post-scrub repeat (safe-field comparison) and the UNIQUE-drift /
-  unrelated-same-owner-target receiver vectors.
+- V34 fault injection after EACH execute step (v80 3928):
+  launch-gate/Phase-B readback (steps 1-4), the TXN-2 current-checks
+  recheck (steps 2-3a), tombstone (5), CAS (6), resulting-count
+  classification (7), monotone allocation (8), apply+record (9) - each
+  fault rolls the attempt back ENTIRELY (no partial effects, no
+  armed-witness/registry leak) and an UNCHANGED retry stays permitted
+  (pre-commit refusal, no blind retry); the commit-guard abort and
+  COMMIT-loss stay typed uncertain/blocked with the witness ARMED for
+  the resolver; RESTART refuses old-session claims; an absent row is
+  never treated as rollback proof.
+- V34b insertion-event named vectors (v80 3931-3953), each with a
+  dedicated test: concurrent double-delivery (two independently
+  composed same-token deliveries: one winner, the loser replays with
+  no writes); exact repeat (replay, no writes); delivery drift (typed
+  refusal); lost ack (lookup-before-mint replay); LOST DELIVERED-UPDATE
+  (durable reread under the same token/recovery/projection: delivered
+  = done, pending = re-attempt, unreadable = typed uncertain, no blind
+  pending claim, no blind redelivery); restart (the durable row wins,
+  same-token redelivery); post-scrub repeat (safe-field projection
+  comparison ONLY, replay); LATER RECEIPT REDELIVERY (same token =
+  replay); DISTINCT SAME-SECOND deliveries (distinct tokens, both
+  inserted); UNCHANGED-SCRUB replay (post-scrub replay via the safe
+  projection); CHANGED target/source under the same delivery identity
+  (scope/drift refusal); UNIQUE drift (the (recovery_id,
+  delivery_token) UNIQUE fence: conflict -> rollback -> winner compare
+  -> replay or typed drift refusal); UNRELATED SAME-OWNER TARGET (the
+  store-built target/source binding refuses); STORED MISMATCHED
+  PROJECTION (stored != arriving = drift refusal); DELAYED
+  BLOCKED-ORIGINAL AFTER CLOSURE + BLOCKED BEFORE/AFTER (no event, no
+  writes both times); BLOCKED REPEAT / BLOCKED->RESOLVED REPEAT
+  (no-event, no mint, no retroactive counts); LATE-ORIGINAL AFTER
+  REPLAY (same triple/projection/counts = replay); MIXED BATCH and
+  MIXED NO-EVENT/REPLAYED-LATE/NEW-LATE (batch contribution 0+0+3);
+  DUPLICATE TOKENS IN ONE BATCH (counted ONCE); FORGED FIELDS (a
+  durable-join mismatch = integrity refusal); the issuer-harness
+  vectors LIVE ERASE, PENDING RESTART, LOST RECEIVER ACK, LOST
+  DELIVERED-STATE UPDATE, SAFE PAYLOAD/STABLE TOKEN.
 
 ## Known model boundaries
 
