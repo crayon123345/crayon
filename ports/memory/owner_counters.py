@@ -25,6 +25,27 @@ class CounterError(Exception):
     """Allocation failed; the caller's transaction must roll back."""
 
 
+def _require_owner_uid(uid: int) -> int:
+    """Owner identity must be an EXACT int. bool, float, and str are
+    rejected, never coerced: int(True)/int(1.9)/int('1') aliasing a
+    caller's value onto owner 1 is a cross-owner write risk, so this
+    fails closed instead."""
+    if isinstance(uid, bool) or not isinstance(uid, int):
+        raise CounterError(
+            "owner id must be an exact int, got %r" % (uid,))
+    return uid
+
+
+def _require_epoch_value(value) -> int:
+    """Readback validation: an allocated epoch must be an exact int
+    >= 1. A malformed row fails closed - the caller's transaction
+    rolls back rather than trust a bad counter."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise CounterError(
+            "epoch allocation returned an invalid value: %r" % (value,))
+    return value
+
+
 ALLOCATE_SQL = (
     "INSERT INTO owner_counters(user_id,next_epoch) VALUES (%s,1) "
     "ON CONFLICT (user_id) DO UPDATE "
@@ -43,10 +64,7 @@ def allocate_next_epoch(db, uid: int) -> int:
     source. Caller MUST hold the owner advisory lock inside an open
     transaction (v4.1 sec 4).
     """
-    row = db.q(ALLOCATE_SQL, (int(uid),), "one")
+    row = db.q(ALLOCATE_SQL, (_require_owner_uid(uid),), "one")
     if row is None or "next_epoch" not in row:
         raise CounterError("epoch allocation returned no row for owner")
-    value = int(row["next_epoch"])
-    if value < 1:
-        raise CounterError("epoch allocation returned a non-positive value")
-    return value
+    return _require_epoch_value(row["next_epoch"])

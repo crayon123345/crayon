@@ -11,7 +11,7 @@ d63801c06c4f3fa93ead7e1d78fc557e9e32b94b.
 ```sql
 CREATE TABLE owner_counters(
   user_id    BIGINT PRIMARY KEY,
-  next_epoch BIGINT NOT NULL
+  next_epoch BIGINT NOT NULL CHECK (next_epoch >= 1)
 );
 ```
 
@@ -32,7 +32,10 @@ CREATE TABLE owner_grants(
   granted_at          BIGINT NOT NULL,
   expires_at          BIGINT,               -- NULL = no expiry
   per_op_expiry_optin BOOLEAN NOT NULL DEFAULT FALSE,
-  PRIMARY KEY (user_id, scope)
+  PRIMARY KEY (user_id, scope),
+  CHECK (scope <> ''),
+  CHECK (granted_at >= 0),
+  CHECK (expires_at IS NULL OR expires_at >= 0)
 );
 ```
 
@@ -45,7 +48,7 @@ CREATE TABLE owner_grants(
 ```sql
 CREATE TABLE grant_generations(
   user_id    BIGINT PRIMARY KEY,
-  generation BIGINT NOT NULL
+  generation BIGINT NOT NULL CHECK (generation >= 0)
 );
 ```
 
