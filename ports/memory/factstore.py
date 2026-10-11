@@ -20,9 +20,11 @@ recorded provenance ("minted by fixture F"), never authority.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac as _hmac
 import json
+import os
 import secrets
 import sqlite3
 import unicodedata
@@ -598,6 +600,28 @@ class UnknownOperationError(Exception):
 
 class DeliveryDriftError(Exception):
     pass
+
+
+class UnknownRecoveryError(Exception):
+    """insert_evidence: the recovery_id has NO CURRENT blocked record and
+    NO known (resolved) recovery - the typed unknown-recovery refusal."""
+
+
+class EvidenceScopeError(Exception):
+    """insert_evidence: the subject hash-owner-accounting scope or the
+    recovery target join does NOT bind to the owner accounting - the
+    typed refusal (sec 5; a forged uid/lifetime/recovery never lands)."""
+
+
+class HarnessRefusedError(Exception):
+    """The issuer-harness FIVE-STAGE equality REFUSAL: a mismatch at ANY
+    stage (compose/persist/send/restart/receiver checks) - no mint, no
+    send, no ack, no count, no state change."""
+
+    def __init__(self, stage: str, reason: str) -> None:
+        super().__init__(stage + ":" + reason)
+        self.stage = stage
+        self.reason = reason
 
 
 class ReadbackUnavailableError(Exception):
@@ -2722,10 +2746,10 @@ class _StoreProducer:
         snapshot = self._store._snapshots.read(request.owner_uid)
         now = _clock_now(self._store._clock)
         if issuer is None:
-            issuer = (env.SessionRef(session_token_hash=secrets.token_hex(32))
-                      if channel is cap.Channel.WEB
-                      else env.TelegramIssuer(bot_id=1, chat_id=1,
-                                              update_id=1))
+            issuer = self._store._stored_issuer(request.owner_uid)
+            if issuer is None:
+                issuer = env.SessionRef(
+                    session_token_hash=secrets.token_hex(32))
         capture_time = now
         if expiry is None:
             # PR-4 immutable submitted expiry: capture_time + MAX_AGE
@@ -2750,6 +2774,36 @@ class _StoreProducer:
             group_action=None, sensitive=False, origin=cap.Origin.DIRECT,
             capture_time=capture_time, expiry=expiry)
 
+    def build_read_binding(self, owner_uid: int, lifetime_id: int,
+                           operation_id: str,
+                           method: "ReadMethod") -> "env.ModelOnlyRequestBinding":
+        """The READ binding fixture (sec 13): the store's OWNED current
+        issuer/snapshot context source - never caller-asserted."""
+        snapshot = self._store._snapshots.read(owner_uid)
+        now = _clock_now(self._store._clock)
+        issuer = self._store._stored_issuer(owner_uid)
+        if issuer is None:
+            issuer = env.SessionRef(session_token_hash=secrets.token_hex(32))
+        return env.ModelOnlyRequestBinding(
+            uid=owner_uid, lifetime=lifetime_id, channel=cap.Channel.WEB,
+            surface=cap.Surface.PRIVATE, issuer=issuer,
+            operation_id=operation_id,
+            operation_class=cap.OperationClass.READ,
+            required_scopes=(cap.Scope.MEMORY_READ,),
+            audience=env.ModelOnlyAudience(kind=env.AudienceKind.PRIVATE,
+                                           id=None),
+            information_ref="read:" + method.value,
+            content_fingerprint=_sha256_hex(_canon(
+                {"method": method.value, "operation_id": operation_id})),
+            capture_epoch=snapshot.current_epoch,
+            grant_generation=snapshot.grants_generation,
+            policy_revision=snapshot.policy_revision,
+            decision_revision=snapshot.decision_revision,
+            consent_generation=snapshot.consent_generation,
+            extraction_intent=cap.ExtractionIntent.NOT_APPLICABLE,
+            group_action=None, sensitive=False, origin=cap.Origin.DIRECT,
+            capture_time=now, expiry=_checked_add(now, env.MAX_AGE_SECONDS))
+
     def seal_and_claim(self, binding: "env.ModelOnlyRequestBinding"):
         """The CLAIM setup: the REAL PR-4 verify_model + claim_model
         composition. Returns (capture, claim)."""
@@ -2771,16 +2825,395 @@ class _StoreProducer:
 # ---------------------------------------------------------------------------
 
 class ReceiverContextProvider:
+    """The INJECTED private typed receiver callback (sec 5). EVERY method
+    FIRST obtains a FRESH REGISTERED READ setup BOUND TO ITS ACTUAL INPUT
+    (minted via the store's producer, NEVER a raw handle) -> handle
+    checks + PhaseA + the CURRENT source/anchor read; NOTHING cached
+    across calls or stages. Every refusal reason a CLOSED enum."""
     __test__ = False
 
-    def __init__(self, owner_uid: int, lifetime_id: int,
-                 operation_id: str) -> None:
+    def __init__(self, store: "FactStore",
+                 outbox_conn: sqlite3.Connection,
+                 owner_uid: int, lifetime_id: int,
+                 operation_id: str, clock: StoreClock) -> None:
         _req_int(owner_uid, 0)
         _req_int(lifetime_id, 1)
         _req_hex(operation_id, OP_ID_LEN)
+        if type(outbox_conn) is not sqlite3.Connection:
+            raise cap.ModelInputError()
+        self._store = store          # the receiver FactStore (producer)
+        self._outbox = outbox_conn   # the ISSUER-OWNED outbox (read-only)
         self.owner_uid = owner_uid
         self.lifetime_id = lifetime_id
         self.operation_id = operation_id
+        self._clock = clock
+        # test fault hooks (fixture-only): a lost ack / unreadable reread
+        self._fault_no_ack = False
+        self._fault_io_unreadable = False
+
+    # -- the ONE source-bound read route ------------------------------------
+
+    def _fresh_setup(self, targets: dict):
+        """A FRESH REGISTERED READ setup bound to the ACTUAL input."""
+        return self._store.mint_read_fixtures(
+            self.owner_uid, self.lifetime_id, self.operation_id,
+            ReadMethod.READBACK, targets)
+
+    def _anchor_read(self, recovery_id: str) -> Optional[VerifiedAnchor]:
+        """The VALIDATED CURRENT anchor via the accepted recovery-anchor
+        JOIN: a resolved_accounting row = ResolvedAnchor; ELSE a CURRENT
+        blocked_records row = BlockedAnchor (resolved proof NULL). Runs
+        INSIDE the caller's read transaction."""
+        q = self._store._q
+        row = q.q("SELECT * FROM resolved_accounting WHERE recovery_id=%s",
+                  (recovery_id,), "one")
+        if row is not None:
+            src = json.loads(row["source_json"])
+            return VerifiedAnchor(
+                recovery_id=recovery_id, anchor_kind="ResolvedAnchor",
+                anchor_row=AnchorRow(uid=row["uid"],
+                                     lifetime_id=row["lifetime_id"],
+                                     operation_id=row["operation_id"]),
+                commitment=row["commitment"],
+                source=AnchorSource(
+                    table="resolved_accounting", row_key=recovery_id,
+                    resolved=ResolvedSource(
+                        anchor=src["anchor"], commitment=src["commitment"],
+                        operation_id=src["operation_id"],
+                        resolver=src["resolver"])),
+                validated_at=_clock_now(self._clock))
+        row = q.q("SELECT * FROM blocked_records WHERE recovery_id=%s",
+                  (recovery_id,), "one")
+        if row is None or row["state"] == "resolved":
+            return None
+        return VerifiedAnchor(
+            recovery_id=recovery_id, anchor_kind="BlockedAnchor",
+            anchor_row=AnchorRow(uid=row["uid"],
+                                 lifetime_id=row["lifetime_id"],
+                                 operation_id=row["operation_id"]),
+            commitment=row["binding_hash"],
+            source=AnchorSource(table="blocked_records",
+                                row_key=recovery_id, resolved=None),
+            validated_at=_clock_now(self._clock))
+
+    def _run_route(self, targets: dict):
+        """handle checks + PhaseA + the CURRENT issuer INSIDE the one
+        read transaction. Returns None on success or the CLOSED
+        AnchorRefusal."""
+        capability, context = self._fresh_setup(targets)
+        try:
+            self._store._read_prologue(self.owner_uid, capability,
+                                       ReadMethod.READBACK, targets,
+                                       context)
+        except cap.AuthError:
+            return None, None, AnchorRefusal.HANDLE_INVALID
+        except cap.ConflictError as exc:
+            if exc.args and exc.args[0] == cap.ModelCode.STALE_POLICY:
+                return None, None, AnchorRefusal.STALE_ANCHOR
+            return None, None, AnchorRefusal.PHASEA_FAILED
+        except Exception:
+            return None, None, AnchorRefusal.PHASEA_FAILED
+        return capability, context, None
+
+    # -- the FIVE declared methods ------------------------------------------
+
+    def get(self, target: dict) -> dict:
+        """get(target: {recovery_id}) -> verified/refused THROUGH the
+        wrapper chain (a fresh read wrapper minted for the target)."""
+        if type(target) is not dict or set(target) != {"recovery_id"}:
+            raise cap.ModelInputError()
+        recovery_id = target["recovery_id"]
+        _req_str(recovery_id, BOUNDED_STR_MAX)
+        targets = {"recovery_id": recovery_id}
+        capability, context, refusal = self._run_route(targets)
+        if refusal is not None:
+            return {"status": "refused", "reason": refusal}
+        try:
+            anchor = self._anchor_read(recovery_id)
+            self._store._read_commit()
+        except Exception:
+            self._store._read_abort()
+            raise
+        if anchor is None:
+            return {"status": "refused", "reason": AnchorRefusal.UNKNOWN_RECOVERY}
+        return {"status": "verified", "capability": capability,
+                "context": context}
+
+    def verify_anchor(self, input: dict) -> dict:
+        """verify_anchor({recovery_id, projection}): the NAMED
+        target-bound anchor method - registered setup -> handle checks
+        -> PhaseA -> the scoped CURRENT anchor."""
+        if type(input) is not dict \
+                or set(input) != {"recovery_id", "projection"}:
+            raise cap.ModelInputError()
+        recovery_id = input["recovery_id"]
+        projection = input["projection"]
+        _req_str(recovery_id, BOUNDED_STR_MAX)
+        if type(projection) is not SafeEvidenceProjection:
+            raise cap.ModelInputError()
+        if projection.recovery_id != recovery_id:
+            return {"status": "refused",
+                    "reason": AnchorRefusal.PROJECTION_MISMATCH}
+        targets = {"projection": projection.to_dict(),
+                   "recovery_id": recovery_id}
+        _, _, refusal = self._run_route(targets)
+        if refusal is not None:
+            return {"status": "refused", "reason": refusal}
+        try:
+            anchor = self._anchor_read(recovery_id)
+            self._store._read_commit()
+        except Exception:
+            self._store._read_abort()
+            raise
+        if anchor is None:
+            return {"status": "refused", "reason": AnchorRefusal.UNKNOWN_RECOVERY}
+        # the anchor's owner/operation/commitment MATCH the projection
+        if anchor.anchor_row.uid != projection.uid \
+                or anchor.anchor_row.lifetime_id != projection.lifetime_id \
+                or anchor.anchor_row.operation_id != projection.operation_id \
+                or anchor.commitment != projection.commitment:
+            return {"status": "refused",
+                    "reason": AnchorRefusal.PROJECTION_MISMATCH}
+        return {"status": "verified", "anchor": anchor}
+
+    def deliver(self, input: dict) -> dict:
+        """deliver({token, projection}) -> the DISJOINT three-way sum.
+        The target recovery_id is DERIVED from the ISSUER OUTBOX ROW
+        keyed by the token, NEVER from the caller."""
+        if type(input) is not dict or set(input) != {"token", "projection"}:
+            raise cap.ModelInputError()
+        token = input["token"]
+        projection = input["projection"]
+        _req_hex(token, 32)
+        if type(projection) is not SafeEvidenceProjection:
+            raise cap.ModelInputError()
+        try:
+            row = self._outbox.execute(
+                "SELECT recovery_id, projection_json FROM outbox"
+                " WHERE token=?", (token,)).fetchone()
+        except sqlite3.Error:
+            return {"status": "refused", "reason": DeliveryRefusal.IO_FAILURE}
+        if row is None:
+            return {"status": "refused",
+                    "reason": DeliveryRefusal.UNCONFIRMED_COMMIT}
+        outbox_recovery = row[0]
+        # TRANSPORT CHECK (i) BEFORE setup: the wire projection's
+        # recovery_id EQUALS the outbox row's recovery_id
+        if projection.recovery_id != outbox_recovery:
+            return {"status": "refused",
+                    "reason": DeliveryRefusal.WIRE_RECOVERY_MISMATCH}
+        stored = SafeEvidenceProjection.from_dict(json.loads(row[1]))
+        # the delivered projection MUST EQUAL the stored SAFE projection
+        if projection.to_dict() != stored.to_dict():
+            return {"status": "refused",
+                    "reason": DeliveryRefusal.ANCHOR_REFUSED}
+        # (ii) anchor validation INSIDE the fresh source-bound setup
+        targets = {"projection": projection.to_dict(), "token": token}
+        capability, context, refusal = self._run_route(targets)
+        if refusal is not None:
+            return {"status": "refused",
+                    "reason": DeliveryRefusal.ANCHOR_REFUSED}
+        try:
+            anchor = self._anchor_read(outbox_recovery)
+            self._store._read_commit()
+        except Exception:
+            self._store._read_abort()
+            raise
+        if anchor is None:
+            return {"status": "refused",
+                    "reason": DeliveryRefusal.ANCHOR_REFUSED}
+        # (iii) POST-SETUP: the anchor's recovery_id EQUALS the
+        # already-checked value (ONE equality chain, every named pair)
+        if anchor.recovery_id != outbox_recovery:
+            return {"status": "refused",
+                    "reason": DeliveryRefusal.WIRE_RECOVERY_MISMATCH}
+        if self._fault_no_ack:
+            return {"status": "uncertain",
+                    "reason": DeliveryUncertain.NO_ACK}
+        # the RECEIVER'S delivery commit (DISTINCT from the issuer's
+        # delivered outbox update - separate transactions)
+        try:
+            result = self._store.insert_evidence(
+                self.owner_uid, self.lifetime_id, self.operation_id,
+                projection, token, capability, context)
+        except (cap.AuthError, cap.CapRefused, DeliveryDriftError,
+                UnknownRecoveryError, EvidenceScopeError):
+            return {"status": "refused",
+                    "reason": DeliveryRefusal.ANCHOR_REFUSED}
+        except sqlite3.Error:
+            return {"status": "refused",
+                    "reason": DeliveryRefusal.IO_FAILURE}
+        # the EvidenceRef is DERIVED from the durable rows, NEVER carried
+        ev = self._store._q.q(
+            "SELECT evidence_id, origin_kind FROM evidence_entries"
+            " WHERE recovery_id=%s AND delivery_token=%s",
+            (projection.recovery_id, token), "one")
+        if ev is None:
+            return {"status": "uncertain",
+                    "reason": DeliveryUncertain.IO_UNREADABLE}
+        if result.kind in ("inserted", "replayed"):
+            evidence_ref = EvidenceRef(kind="late",
+                                       event_id=result.event_id,
+                                       evidence_id=ev["evidence_id"])
+        else:
+            evidence_ref = EvidenceRef(kind="blocked",
+                                       evidence_id=result.evidence_id)
+        ack = AckInput(kind="ack", token=token, projection=projection,
+                       committed_result=result, evidence_ref=evidence_ref)
+        return {"status": "delivered", "ack": ack,
+                "committed_result": result, "evidence_ref": evidence_ref}
+
+    def verify_ack(self, input: AckInput) -> ConfirmResult:
+        """verify_ack: the ACTUAL association - identity fields + the
+        branch class proof; the ONE FULL source-bound route."""
+        if type(input) is not AckInput:
+            raise cap.ModelInputError()
+        if input.kind == "refused":
+            # a refused ack carries no result: verify the token/projection
+            # association ONLY (a refused AckInput is NEVER 'delivered')
+            targets = {"kind": "refused", "token": input.token}
+            _, _, refusal = self._run_route(targets)
+            if refusal is not None:
+                return ConfirmResult(
+                    kind="refused",
+                    reason=AckRefusedReason.RECEIVER_UNAVAILABLE)
+            row = self._store._q.q(
+                "SELECT evidence_id FROM evidence_entries WHERE"
+                " delivery_token=%s", (input.token,), "one")
+            self._store._read_commit()
+            if row is None:
+                return ConfirmResult(
+                    kind="refused", reason=AckRefusedReason.MISMATCHED_TOKEN)
+            return ConfirmResult(kind="verified")
+        return self._confirm(input.token, input.projection.recovery_id,
+                             input.projection, input.committed_result,
+                             input.evidence_ref)
+
+    def confirm_committed_result(self, input: dict) -> ConfirmResult:
+        """confirm_committed_result: the FULL input - NO weak
+        token/result-only route; the SAME ONE full source-bound route."""
+        if type(input) is not dict or set(input) != {
+                "token", "recovery_id", "projection", "committed_result",
+                "evidence_ref"}:
+            raise cap.ModelInputError()
+        if type(input["projection"]) is not SafeEvidenceProjection \
+                or type(input["committed_result"]) is not InsertionEventResult \
+                or type(input["evidence_ref"]) is not EvidenceRef:
+            raise cap.ModelInputError()
+        _req_hex(input["token"], 32)
+        _req_str(input["recovery_id"], BOUNDED_STR_MAX)
+        return self._confirm(input["token"], input["recovery_id"],
+                             input["projection"], input["committed_result"],
+                             input["evidence_ref"])
+
+    def _confirm(self, token, recovery_id, projection, committed_result,
+                 evidence_ref) -> ConfirmResult:
+        """The ONE FULL SOURCE-BOUND route: fresh registered setup bound
+        to the FULL input -> handle checks + PhaseA -> the DURABLE REREAD
+        via the exact evidence/event/ledger joins; CANONICAL per-kind
+        field comparison - NEVER from presented values alone (a forged
+        ID/count FAILS the join)."""
+        targets = {"evidence_id": evidence_ref.evidence_id,
+                   "event_id": evidence_ref.event_id,
+                   "kind": committed_result.kind,
+                   "projection": projection.to_dict(),
+                   "recovery_id": recovery_id, "token": token}
+        _, _, refusal = self._run_route(targets)
+        if refusal is not None:
+            return ConfirmResult(kind="refused",
+                                 reason=AckRefusedReason.RECEIVER_UNAVAILABLE)
+        q = self._store._q
+        try:
+            if self._fault_io_unreadable:
+                raise sqlite3.OperationalError("injected")
+            row = q.q("SELECT * FROM evidence_entries WHERE"
+                      " recovery_id=%s AND delivery_token=%s",
+                      (recovery_id, token), "one")
+            if row is None:
+                self._store._read_commit()
+                return ConfirmResult(
+                    kind="refused", reason=AckRefusedReason.MISMATCHED_TOKEN)
+            stored = SafeEvidenceProjection.from_dict(
+                json.loads(row["projection_json"]))
+            if stored.to_dict() != projection.to_dict():
+                self._store._read_commit()
+                return ConfirmResult(
+                    kind="refused",
+                    reason=AckRefusedReason.MISMATCHED_PROJECTION)
+            expected = self._expected_result(row, committed_result.kind)
+            evidence_ref_expected = self._canonical_ref(row)
+            self._store._read_commit()
+        except sqlite3.Error:
+            try:
+                self._store._read_abort()
+            except Exception:
+                pass
+            return ConfirmResult(kind="uncertain",
+                                 uncertain=ConfirmUncertain.IO_UNREADABLE)
+        except Exception:
+            self._store._read_abort()
+            raise
+        # the CANONICAL comparison: a forged ID/count FAILS the join
+        if expected is None or expected != committed_result \
+                or evidence_ref_expected != evidence_ref:
+            return ConfirmResult(
+                kind="refused", reason=AckRefusedReason.MISMATCHED_RESULT)
+        return ConfirmResult(kind="verified")
+
+    def _expected_result(self, row, kind) -> Optional[InsertionEventResult]:
+        """The CANONICAL per-kind stable fields for the PRESENTED kind,
+        READ FROM THE DURABLE ROWS via the exact evidence/event/ledger
+        joins (NEVER from presented values; a forged ID/count FAILS the
+        join -> None)."""
+        if row["origin_kind"] == "blocked_arrival":
+            if kind == "blocked_inserted":
+                # original-1 = 1; resolution_event_id NULL ALWAYS
+                # (derived from the IMMUTABLE blocked origin, even
+                # after closure - the CURRENT closing proof is checked
+                # SEPARATELY, NEVER written into this result field)
+                return InsertionEventResult(
+                    kind="blocked_inserted", contribution=1,
+                    evidence_id=row["evidence_id"])
+            if kind == "blocked_replay_no_event":
+                # contribution 0 / stored 1; the stamp == the SELECTED
+                # CURRENT evidence stamp (NULL unresolved / the EXACT
+                # closing event once resolved)
+                return InsertionEventResult(
+                    kind="blocked_replay_no_event", contribution=0,
+                    evidence_id=row["evidence_id"], stored_new_retained=1,
+                    resolution_event_id=row["resolution_event_id"])
+            return None
+        event = self._store._q.q(
+            "SELECT new_retained, inserting_uid, inserting_lifetime_id,"
+            " inserting_operation_id FROM insertion_events WHERE"
+            " event_id=%s", (row["insertion_event_id"],), "one")
+        if event is None:
+            return None  # a forged event_id FAILS the join
+        # the late event/evidence identity-triple EQUALITY
+        if event["inserting_uid"] != row["inserting_uid"] \
+                or event["inserting_lifetime_id"] != row["inserting_lifetime_id"] \
+                or event["inserting_operation_id"] != row["inserting_operation_id"]:
+            return None
+        if kind == "inserted":
+            return InsertionEventResult(
+                kind="inserted", contribution=3,
+                event_id=row["insertion_event_id"])
+        if kind == "replayed":
+            return InsertionEventResult(
+                kind="replayed", contribution=0,
+                event_id=row["insertion_event_id"],
+                stored_new_retained=event["new_retained"])
+        return None
+
+    def _canonical_ref(self, row) -> EvidenceRef:
+        """The EvidenceRef DERIVED from the durable rows (late: event_id
+        + evidence_id; blocked: evidence_id ONLY, NO event field)."""
+        if row["origin_kind"] == "blocked_arrival":
+            return EvidenceRef(kind="blocked",
+                               evidence_id=row["evidence_id"])
+        return EvidenceRef(kind="late",
+                           event_id=row["insertion_event_id"],
+                           evidence_id=row["evidence_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -2908,6 +3341,117 @@ class SafeEvidenceProjection:
 
 
 # ---------------------------------------------------------------------------
+# Receiver anchor model (sec 5): the VALIDATED anchor + the CLOSED sums
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AnchorRow:
+    uid: int
+    lifetime_id: int
+    operation_id: str
+
+    def __post_init__(self) -> None:
+        _req_int(self.uid, 0)
+        _req_int(self.lifetime_id, 1)
+        _req_hex(self.operation_id, OP_ID_LEN)
+
+
+@dataclass(frozen=True)
+class ResolvedSource:
+    """The TYPED resolved proof (decoded resolved_accounting.source_json)."""
+    anchor: str
+    commitment: str
+    operation_id: str
+    resolver: str
+
+    def __post_init__(self) -> None:
+        _req_str(self.anchor, BOUNDED_STR_MAX)
+        _req_hex(self.commitment, HASH_LEN)
+        _req_hex(self.operation_id, OP_ID_LEN)
+        _req_str(self.resolver, BOUNDED_STR_MAX)
+
+
+@dataclass(frozen=True)
+class AnchorSource:
+    """CLOSED: the exact table + row identity + typed resolved proof.
+    ANCHOR COHERENCE (always): table='blocked_records' IFF resolved
+    NULL; 'resolved_accounting' IFF resolved present."""
+    table: str
+    row_key: str
+    resolved: Optional[ResolvedSource] = None
+
+    def __post_init__(self) -> None:
+        _req_str(self.row_key, BOUNDED_STR_MAX)
+        if self.table == "blocked_records":
+            if self.resolved is not None:
+                raise cap.ModelInputError()
+        elif self.table == "resolved_accounting":
+            if type(self.resolved) is not ResolvedSource:
+                raise cap.ModelInputError()
+        else:
+            raise cap.ModelInputError()
+
+
+@dataclass(frozen=True)
+class VerifiedAnchor:
+    """The VALIDATED CURRENT anchor (re-read FRESH at verification time;
+    typed-field equality, NO carried digest, NO cached snapshot)."""
+    recovery_id: str
+    anchor_kind: str            # BlockedAnchor|ResolvedAnchor
+    anchor_row: AnchorRow
+    commitment: str
+    source: AnchorSource
+    validated_at: int
+
+    def __post_init__(self) -> None:
+        _req_str(self.recovery_id, BOUNDED_STR_MAX)
+        if type(self.anchor_row) is not AnchorRow:
+            raise cap.ModelInputError()
+        _req_hex(self.commitment, HASH_LEN)
+        if type(self.source) is not AnchorSource:
+            raise cap.ModelInputError()
+        _req_int(self.validated_at, 0)
+        # the tag/table/resolved triple is ALWAYS coherent
+        if self.anchor_kind == "BlockedAnchor":
+            if self.source.table != "blocked_records" \
+                    or self.source.resolved is not None:
+                raise cap.ModelInputError()
+        elif self.anchor_kind == "ResolvedAnchor":
+            if self.source.table != "resolved_accounting" \
+                    or type(self.source.resolved) is not ResolvedSource:
+                raise cap.ModelInputError()
+        else:
+            raise cap.ModelInputError()
+        # SELECTED-ROW EQUALITY: the source row key IS the recovery_id
+        if self.source.row_key != self.recovery_id:
+            raise cap.ModelInputError()
+
+
+@dataclass(frozen=True)
+class ConfirmResult:
+    """The ONE CLOSED shape shared by verify_ack +
+    confirm_committed_result: verified | refused | uncertain (DISJOINT)."""
+    kind: str                     # verified|refused|uncertain
+    reason: Optional[AckRefusedReason] = None
+    uncertain: Optional[ConfirmUncertain] = None
+
+    def __post_init__(self) -> None:
+        if self.kind == "verified":
+            if self.reason is not None or self.uncertain is not None:
+                raise cap.ModelInputError()
+        elif self.kind == "refused":
+            _req_enum(self.reason, AckRefusedReason)
+            if self.uncertain is not None:
+                raise cap.ModelInputError()
+        elif self.kind == "uncertain":
+            _req_enum(self.uncertain, ConfirmUncertain)
+            if self.reason is not None:
+                raise cap.ModelInputError()
+        else:
+            raise cap.ModelInputError()
+
+
+# ---------------------------------------------------------------------------
 # IssuerHarness (sec 5 - TYPED, PRIVATE/test-only, INJECTED standalone
 # issuer-store boundary; the receiver path does NOT own it; NO public
 # surface expansion). Its fixture_store_conn is a SEPARATE connection.
@@ -2939,6 +3483,36 @@ class PersistConfirmation:
         _req_int(self.fsynced_at, 0)
 
 
+class AnchorRefusal(Enum):
+    """The CLOSED anchor-refusal reasons (sec 5 provider contract)."""
+    UNKNOWN_RECOVERY = "unknown_recovery"
+    STALE_ANCHOR = "stale_anchor"
+    HANDLE_INVALID = "handle_invalid"
+    PHASEA_FAILED = "phasea_failed"
+    PROJECTION_MISMATCH = "projection_mismatch"
+
+
+class DeliveryRefusal(Enum):
+    """The CLOSED delivery-refusal reasons; wire_recovery_mismatch has
+    the EXACT named predicate (the recovery_id equality chain) and NEVER
+    launders an IO failure."""
+    UNCONFIRMED_COMMIT = "unconfirmed_commit"
+    ANCHOR_REFUSED = "anchor_refused"
+    IO_FAILURE = "io_failure"
+    WIRE_RECOVERY_MISMATCH = "wire_recovery_mismatch"
+
+
+class DeliveryUncertain(Enum):
+    NO_ACK = "no_ack"
+    IO_UNREADABLE = "io_unreadable"
+
+
+class ConfirmUncertain(Enum):
+    """'uncertain' ONLY when the confirm's DURABLE REREAD is unreadable;
+    NO AckRefusedReason maps to 'uncertain'."""
+    IO_UNREADABLE = "io_unreadable"
+
+
 class AckRefusedReason(Enum):
     MISMATCHED_TOKEN = "mismatched_token"
     MISMATCHED_RECOVERY = "mismatched_recovery"
@@ -2962,10 +3536,11 @@ class EvidenceRef:
 
     def __post_init__(self) -> None:
         if self.kind == "late":
+            # the MINIMAL CLOSED sum: event_id + evidence_id
             _req_str(self.event_id, BOUNDED_STR_MAX)
-            if self.evidence_id is not None:
-                raise cap.ModelInputError()
+            _req_hex(self.evidence_id, 32)
         elif self.kind == "blocked":
+            # blocked: evidence_id ONLY - NO event field AT ALL
             _req_hex(self.evidence_id, 32)
             if self.event_id is not None:
                 raise cap.ModelInputError()
@@ -2975,23 +3550,27 @@ class EvidenceRef:
 
 @dataclass(frozen=True)
 class AckInput:
-    """ONE CLOSED TAGGED UNION: ack | refused."""
+    """ONE CLOSED TAGGED UNION: ack | refused. An 'ack' carries the FULL
+    VALIDATED payload: projection + committed_result + evidence_ref."""
     kind: str                     # ack|refused
     token: str
     projection: Optional[SafeEvidenceProjection] = None
-    committed_result: Optional[EvidenceRef] = None
+    committed_result: Optional["InsertionEventResult"] = None
+    evidence_ref: Optional[EvidenceRef] = None
     reason: Optional[AckRefusedReason] = None
 
     def __post_init__(self) -> None:
         _req_hex(self.token, 32)
         if self.kind == "ack":
             if type(self.projection) is not SafeEvidenceProjection \
-                    or type(self.committed_result) is not EvidenceRef \
+                    or type(self.committed_result) is not InsertionEventResult \
+                    or type(self.evidence_ref) is not EvidenceRef \
                     or self.reason is not None:
                 raise cap.ModelInputError()
         elif self.kind == "refused":
             _req_enum(self.reason, AckRefusedReason)
-            if self.projection is not None or self.committed_result is not None:
+            if self.projection is not None or self.committed_result is not None \
+                    or self.evidence_ref is not None:
                 raise cap.ModelInputError()
         else:
             raise cap.ModelInputError()
@@ -3040,6 +3619,8 @@ class InsertionEventResult:
         elif self.kind == "blocked_inserted":
             _req_int(self.contribution, 1, 1)
             _req_hex(self.evidence_id, 32)
+            if self.event_id is not None:  # the field EXISTS and is NULL
+                raise cap.ModelInputError()
         elif self.kind == "replayed":
             _req_int(self.contribution, 0, 0)
             _req_str(self.event_id, BOUNDED_STR_MAX)
@@ -3048,7 +3629,12 @@ class InsertionEventResult:
             _req_int(self.contribution, 0, 0)
             _req_hex(self.evidence_id, 32)
             _req_int(self.stored_new_retained, 0)
+            if self.event_id is not None:  # the field EXISTS and is NULL
+                raise cap.ModelInputError()
         else:
+            raise cap.ModelInputError()
+        if self.kind in ("inserted", "replayed") \
+                and self.evidence_id is not None:
             raise cap.ModelInputError()
 
 
@@ -3057,6 +3643,8 @@ CREATE TABLE IF NOT EXISTS outbox(
   token TEXT PRIMARY KEY, recovery_id TEXT NOT NULL,
   projection_json TEXT NOT NULL, state TEXT NOT NULL,
   composed_at INTEGER NOT NULL, delivered_at INTEGER);
+CREATE TABLE IF NOT EXISTS scrub_log(
+  token TEXT PRIMARY KEY, scrubbed_at INTEGER NOT NULL);
 """
 
 
@@ -3066,14 +3654,50 @@ class IssuerHarness:
     atomicity with the receiver is claimed."""
 
     def __init__(self, fixture_store_conn: sqlite3.Connection,
-                 clock: StoreClock) -> None:
+                 clock: StoreClock, snapshots: FactStoreSnapshotStore,
+                 receiver_context: ReceiverContextProvider) -> None:
+        """Deps are CONCRETE and EXACTLY: fixture_store_conn (the
+        fixture's OWN file connection backing the outbox - SEPARATE from
+        the FactStore conn), clock (SECONDS, shared with the fixtures),
+        snapshots, AND receiver_context (the INJECTED
+        ReceiverContextProvider - a DECLARED dep)."""
         if type(fixture_store_conn) is not sqlite3.Connection:
+            raise cap.ModelInputError()
+        if type(snapshots) is not FactStoreSnapshotStore:
+            raise cap.ModelInputError()
+        if type(receiver_context) is not ReceiverContextProvider:
             raise cap.ModelInputError()
         self._conn = fixture_store_conn
         self._conn.isolation_level = None
         self._conn.executescript(_OUTBOX_DDL)
         self._clock = clock
+        self._snapshots = snapshots
+        self._receiver = receiver_context
         self._pending_hook = None
+
+    def _verify_stage(self, stage: str, token: str):
+        """FIVE-STAGE EQUALITY (sec 5), RE-VERIFIED at EVERY stage
+        (compose, persist, send, restart, AND the receiver+ack checks):
+        the STORED projection/token/pending state is re-read and
+        outbox.recovery_id == ref_json.recovery_id == the VALIDATED
+        recovery anchor; a mismatch at ANY stage = REFUSAL (no mint, no
+        send, no ack, no count, no state change)."""
+        row = self._conn.execute(
+            "SELECT recovery_id, projection_json, state FROM outbox"
+            " WHERE token=?", (token,)).fetchone()
+        if row is None:
+            raise HarnessRefusedError(stage, "unknown_token")
+        stored = SafeEvidenceProjection.from_dict(json.loads(row[1]))
+        if stored.recovery_id != row[0]:
+            raise HarnessRefusedError(stage, "recovery_mismatch")
+        verdict = self._receiver.verify_anchor(
+            {"recovery_id": row[0], "projection": stored})
+        if verdict["status"] != "verified":
+            raise HarnessRefusedError(
+                stage, "anchor_refused:" + verdict["reason"].value)
+        if verdict["anchor"].recovery_id != row[0]:
+            raise HarnessRefusedError(stage, "anchor_mismatch")
+        return row, stored
 
     def compose(self, delivery: dict) -> ComposeResult:
         """Mint the delivery token BEFORE send (sec 5 delivery identity)."""
@@ -3086,6 +3710,13 @@ class IssuerHarness:
         _req_str(recovery_id, BOUNDED_STR_MAX)
         if projection.recovery_id != recovery_id:
             raise cap.ModelInputError()
+        # FIVE-STAGE (compose): the recovery anchor must verify BEFORE
+        # the token mint - a mismatch = REFUSAL, no mint, no state change
+        verdict = self._receiver.verify_anchor(
+            {"recovery_id": recovery_id, "projection": projection})
+        if verdict["status"] != "verified":
+            raise HarnessRefusedError(
+                "compose", "anchor_refused:" + verdict["reason"].value)
         token = secrets.token_hex(16)
         now = _clock_now(self._clock)
         self._conn.execute("BEGIN IMMEDIATE")
@@ -3105,12 +3736,20 @@ class IssuerHarness:
 
     def confirm_persisted(self, token: str) -> PersistConfirmation:
         _req_hex(token, 32)
-        row = self._conn.execute(
-            "SELECT token FROM outbox WHERE token=?", (token,)).fetchone()
-        if row is None:
-            raise cap.ModelInputError()
+        self._verify_stage("persist", token)  # five-stage, persist stage
         return PersistConfirmation(token=token, persisted=True,
                                    fsynced_at=_clock_now(self._clock))
+
+    def send(self, token: str) -> dict:
+        """The SEND stage: re-read + re-verify the STORED state BEFORE
+        dispatch; returns the wire payload {token, recovery_id,
+        projection}. A mismatch = HarnessRefusedError, NO send."""
+        _req_hex(token, 32)
+        row, stored = self._verify_stage("send", token)
+        if row[2] != "pending":
+            raise HarnessRefusedError("send", "not_pending")
+        return {"projection": stored, "recovery_id": row[0],
+                "token": token}
 
     def outbox_state(self, token: str) -> str:
         _req_hex(token, 32)
@@ -3120,12 +3759,42 @@ class IssuerHarness:
             raise cap.ModelInputError()
         return row[0]
 
+    def scrub(self, token: str, hook) -> dict:
+        """LIVE ERASE (sec 5): the scrub hook destroys the volatile raw
+        BEFORE the erase/readback completion is recorded; a hook failure
+        = the step REFUSAL (NOTHING recorded, NO state change)."""
+        _req_hex(token, 32)
+        if not callable(hook):
+            raise cap.ModelInputError()
+        hook()  # the volatile raw is destroyed FIRST
+        self._verify_stage("scrub", token)  # re-verified AFTER the raw
+        now = _clock_now(self._clock)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO scrub_log(token, scrubbed_at) VALUES(?,?)",
+                (token, now))
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return {"scrubbed": token, "scrubbed_at": now}
+
     def redeliver_pending(self) -> dict:
-        """PENDING RESTART: unacked rows redelivered with the SAME token."""
+        """PENDING RESTART: unacked rows redelivered with the SAME token;
+        the RESTART stage re-verifies every row BEFORE redispatch - a
+        mismatch is REFUSED (NOT redelivered, no state change)."""
         rows = self._conn.execute(
             "SELECT token FROM outbox WHERE state='pending'"
             " ORDER BY composed_at").fetchall()
-        return {"redelivered": [r[0] for r in rows]}
+        redelivered = []
+        for r in rows:
+            try:
+                self._verify_stage("restart", r[0])
+            except HarnessRefusedError:
+                continue
+            redelivered.append(r[0])
+        return {"redelivered": redelivered}
 
     def ack(self, ack_input: AckInput,
             confirm: bool = True) -> AckResult:
@@ -3151,6 +3820,26 @@ class IssuerHarness:
         if ack_input.projection.to_dict() != stored.to_dict():
             return AckResult(kind="still_pending", token=ack_input.token,
                              reason=AckRefusedReason.MISMATCHED_PROJECTION)
+        # the RECEIVER+ACK stage: the fixture snapshot re-read +
+        # committed_result/evidence_ref EQUALITY through the provider's
+        # ONE full source-bound route (an invented EvidenceRef or a
+        # forged result is REFUSED, never 'delivered')
+        try:
+            self._snapshots.read(self._receiver.owner_uid)
+        except Exception:
+            return AckResult(kind="still_pending", token=ack_input.token,
+                             reason=AckRefusedReason.RECEIVER_UNAVAILABLE)
+        confirm_result = self._receiver.confirm_committed_result(
+            {"token": ack_input.token, "recovery_id": row[0],
+             "projection": ack_input.projection,
+             "committed_result": ack_input.committed_result,
+             "evidence_ref": ack_input.evidence_ref})
+        if confirm_result.kind == "uncertain":
+            return AckResult(kind="uncertain", token=ack_input.token,
+                             uncertain=AckUncertain.IO_UNREADABLE)
+        if confirm_result.kind != "verified":
+            return AckResult(kind="still_pending", token=ack_input.token,
+                             reason=confirm_result.reason)
         if row[2] == "delivered":
             return AckResult(kind="delivered", token=ack_input.token)
         if not confirm:
@@ -3175,7 +3864,90 @@ class IssuerHarness:
 # FactStore (sec 13) - the seam core
 # ---------------------------------------------------------------------------
 
+def _issuer_canon(issuer) -> Optional[dict]:
+    """The canonical JSON form of the TYPED issuer union (sec 4)."""
+    if issuer is None:
+        return None
+    if type(issuer) is env.SessionRef:
+        return {"kind": "session",
+                "session_token_hash": issuer.session_token_hash}
+    if type(issuer) is env.TelegramIssuer:
+        return {"kind": "telegram", "bot_id": issuer.bot_id,
+                "chat_id": issuer.chat_id, "update_id": issuer.update_id}
+    raise cap.ModelInputError()
+
+
+def _typed_issuer_from_json(issuer_json: str):
+    """issuer_state.issuer_json -> the TYPED owner/issuer (sec 4)."""
+    if type(issuer_json) is not str:
+        raise cap.ModelInputError()
+    try:
+        d = json.loads(issuer_json)
+    except ValueError:
+        raise cap.ModelInputError()
+    if not isinstance(d, dict) or not d:
+        return None
+    if d.get("kind") == "session":
+        return env.SessionRef(session_token_hash=d["session_token_hash"])
+    if d.get("kind") == "telegram":
+        return env.TelegramIssuer(bot_id=d["bot_id"], chat_id=d["chat_id"],
+                                  update_id=d["update_id"])
+    raise cap.ModelInputError()
+
+
+def _context_canon(context: "env.ModelOnlyCallerContext") -> dict:
+    """The canonical form of the TYPED caller context (sec 13)."""
+    return {
+        "original_binding": (context.original_binding.projection_dict()
+                             if context.original_binding is not None
+                             else None),
+        "current_uid": context.current_uid,
+        "current_lifetime": context.current_lifetime,
+        "current_capture_epoch": context.current_capture_epoch,
+        "current_grant_generation": context.current_grant_generation,
+        "current_policy_revision": context.current_policy_revision,
+        "current_decision_revision": context.current_decision_revision,
+        "current_consent_generation": context.current_consent_generation,
+        "current_issuer": _issuer_canon(context.current_issuer),
+        "current_issuer_valid": bool(context.current_issuer_valid)}
+
+
 MODEL_TTL_SECONDS = 3600
+
+# The EXCLUSIVE cross-instance isolation fixture (contract sec 5): the
+# disposable test DB is opened with an EXCLUSIVE file lock; a second
+# process/instance attempting to open it REFUSES. The lock is ISOLATION
+# ONLY - it NEVER supplies liveness or death evidence about any session
+# or attempt. sqlite3.Connection carries no attributes, so the fixture
+# marker lives in this module-level registry keyed by id(conn).
+_EXCLUSIVE_DB_LOCKS: dict = {}
+
+
+def open_exclusive_db(path: str) -> sqlite3.Connection:
+    """Open the disposable file-backed test DB under an EXCLUSIVE lock."""
+    if type(path) is not str or not 1 <= len(path) <= 1000:
+        raise cap.ModelInputError()
+    lock_fd = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock_fd)
+        raise cap.ModelInputError()  # a second opener REFUSES
+    conn = sqlite3.connect(path)
+    _EXCLUSIVE_DB_LOCKS[id(conn)] = lock_fd
+    return conn
+
+
+def close_exclusive_db(conn: sqlite3.Connection) -> None:
+    """Close the fixture DB and release its exclusive lock."""
+    lock_fd = _EXCLUSIVE_DB_LOCKS.pop(id(conn), None)
+    conn.close()
+    if lock_fd is not None:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
 
 
 class _EnvClockAdapter(env.ModelOnlyClock):
@@ -3195,6 +3967,11 @@ class FactStore:
                  snapshots: Optional[FactStoreSnapshotStore] = None) -> None:
         if type(conn) is not sqlite3.Connection:
             raise cap.ModelInputError()
+        db_file = conn.execute("PRAGMA database_list").fetchone()
+        if db_file is not None and db_file[2] \
+                and id(conn) not in _EXCLUSIVE_DB_LOCKS:
+            raise cap.ModelInputError()  # file-backed models REQUIRE the
+            # exclusive cross-instance isolation fixture (contract sec 5)
         conn.isolation_level = None
         conn.execute("PRAGMA foreign_keys=ON")
         self._q = _Queryable(conn)
@@ -3222,8 +3999,20 @@ class FactStore:
         self._live_sessions = frozenset({self._session_id})
         # issued-handle registry: handle -> (inner object, binding_hash)
         self._handles: dict = {}
+        # producer-mint registry (sec 13): wrap() accepts ONLY objects
+        # minted by the store's OWNED producer THIS SESSION - a copy or
+        # unproduced object is a MISSING_IDENTITY refusal
+        self._minted: set = set()
+        # registered READ contexts: handle -> {caller, clock_reading}
+        # captured at mint; the projection comparison RE-USES the
+        # registered context (never a literal/fresh-clock rebuild)
+        self._read_contexts: dict = {}
         # in-memory LOCAL uncertain associations (never durable proof)
         self._uncertain: dict = {}
+        # test fault hooks (fixture-only, never production): a lost
+        # commit confirmation / a failed post-commit read
+        self._fault_commit_lost = False
+        self._fault_readback_cause: Optional[ReadbackCause] = None
         self._producer = _StoreProducer(self)
 
     # -- session + handle machinery (sec 13) --------------------------------
@@ -3260,9 +4049,15 @@ class FactStore:
         """The store's OWNED current issuer/snapshot context (sec 13)."""
         uid = binding.uid
         snap = self._snapshots.read(uid)
-        issuer_row = self._q.q("SELECT valid FROM issuer_state WHERE uid=%s",
-                               (uid,), "one")
-        valid = bool(issuer_row["valid"]) if issuer_row is not None else True
+        issuer_row = self._q.q("SELECT issuer_json, valid FROM issuer_state"
+                               " WHERE uid=%s", (uid,), "one")
+        if issuer_row is None:
+            # NO default-true: an unproven issuer row is INVALID (sec 4)
+            current_issuer, valid = binding.issuer, False
+        else:
+            current_issuer = _typed_issuer_from_json(
+                issuer_row["issuer_json"]) or binding.issuer
+            valid = bool(issuer_row["valid"])
         return env.ModelOnlyCallerContext(
             original_binding=binding, current_uid=uid,
             current_lifetime=binding.lifetime,
@@ -3271,7 +4066,7 @@ class FactStore:
             current_policy_revision=snap.policy_revision,
             current_decision_revision=snap.decision_revision,
             current_consent_generation=snap.consent_generation,
-            current_issuer=binding.issuer, current_issuer_valid=valid)
+            current_issuer=current_issuer, current_issuer_valid=valid)
 
     # -- fixture setup helpers (test-facing; producer-OWNED mints) ----------
 
@@ -3296,7 +4091,10 @@ class FactStore:
         q.q("INSERT INTO lifetime_state(uid, lifetime_id, generation)"
             " VALUES(%s,%s,%s)", (uid, lifetime_id, 1), "exec")
         q.q("INSERT INTO issuer_state(uid, issuer_json, valid, updated_at)"
-            " VALUES(%s,%s,%s,%s)", (uid, "{}", 1, now), "exec")
+            " VALUES(%s,%s,%s,%s)",
+            (uid, _canon(_issuer_canon(env.SessionRef(
+                session_token_hash=secrets.token_hex(32)))).decode("utf-8"),
+             1, now), "exec")
         q.q("INSERT INTO fixture_snapshot(uid, lifetime_id, current_epoch,"
             " grants_generation, policy_revision, decision_revision,"
             " consent_generation) VALUES(%s,%s,%s,0,0,0,0)",
@@ -3329,6 +4127,26 @@ class FactStore:
         self._q.q("UPDATE fixture_snapshot SET grants_generation="
                   " grants_generation+1 WHERE uid=%s", (uid,), "exec")
 
+    def _stored_issuer(self, uid: int):
+        """The TYPED current issuer from issuer_state (None when absent)."""
+        row = self._q.q("SELECT issuer_json FROM issuer_state WHERE uid=%s",
+                        (uid,), "one")
+        if row is None:
+            return None
+        return _typed_issuer_from_json(row["issuer_json"])
+
+    def set_issuer(self, uid: int, issuer, valid: bool) -> None:
+        """Fixture: set the CURRENT typed issuer + validity (sec 4)."""
+        _req_int(uid, 0)
+        _req_bool(valid)
+        canon = _issuer_canon(issuer)
+        if canon is None:
+            raise cap.ModelInputError()
+        self._q.q("UPDATE issuer_state SET issuer_json=%s, valid=%s,"
+                  " updated_at=%s WHERE uid=%s",
+                  (_canon(canon).decode("utf-8"), 1 if valid else 0,
+                   _clock_now(self._clock), uid), "exec")
+
     def set_issuer_valid(self, uid: int, valid: bool) -> None:
         _req_bool(valid)
         self._q.q("UPDATE issuer_state SET valid=%s, updated_at=%s"
@@ -3337,9 +4155,15 @@ class FactStore:
 
     # -- producer-facing wrap (PRIVATE store helper; sec 13) -----------------
 
+    def _register_minted(self, obj) -> None:
+        """The OWNED producer registers EVERY object it mints."""
+        self._minted.add(id(obj))
+
     def _wrap(self, inner, binding_hash: str):
         """wrap(cap|claim|capture) -> SessionBound*. The store wraps ONLY
         objects IT minted this session via the OWNED producer."""
+        if id(inner) not in self._minted:
+            raise cap.AuthError()  # MISSING_IDENTITY - unproduced/copy
         if type(inner) is cap.Capability:
             return SessionBoundCapability(
                 session_id=self._session_id,
@@ -3367,6 +4191,9 @@ class FactStore:
         binding = self._producer.build_binding(request, capability)
         binding_hash = extended_binding_hash(binding, request)
         capture, claim = self._producer.seal_and_claim(binding)
+        self._register_minted(capability)
+        self._register_minted(capture)
+        self._register_minted(claim)
         return (self._wrap(capability, binding_hash),
                 self._wrap(claim, binding_hash),
                 self._wrap(capture, binding_hash), binding)
@@ -3375,22 +4202,31 @@ class FactStore:
                            operation_id: str, method: ReadMethod,
                            targets: dict):
         """The READ producer call: returns (wrapped capability, context).
-        binding_hash = the READ wrapper commitment (sec 13)."""
+        The projection binds the store's OWNED current typed context
+        (issuer/snapshot from the owned fixtures - never a literal or a
+        caller-asserted value); it is REGISTERED and re-used at call
+        time, so a valid later call never miscompares on clock drift."""
         _req_int(owner_uid, 0)
         _req_int(lifetime_id, 1)
         _req_hex(operation_id, OP_ID_LEN)
         _req_enum(method, ReadMethod)
+        if type(targets) is not dict:
+            raise cap.ModelInputError()
         capability = self._producer.mint_read(owner_uid, lifetime_id,
                                               operation_id, method)
-        binding_hash = _sha256_hex(_canon({
-            "context": {"caller": "receiver", "clock_reading":
-                        _clock_now(self._clock)},
-            "method": method.value,
-            "owner": {"lifetime_id": lifetime_id, "uid": owner_uid},
-            "session_id": self._session_id,
-            "targets": targets,
-        }))
-        return self._wrap(capability, binding_hash), binding_hash
+        self._register_minted(capability)
+        read_binding = self._producer.build_read_binding(
+            owner_uid, lifetime_id, operation_id, method)
+        context = self._caller_context(read_binding)
+        caller_canon = json.loads(_canon(_context_canon(context)))
+        clock_reading = _clock_now(self._clock)
+        binding_hash = _read_projection(self, method, owner_uid,
+                                        lifetime_id, targets,
+                                        clock_reading, caller_canon)
+        wrapped = self._wrap(capability, binding_hash)
+        self._read_contexts[wrapped.handle] = {
+            "caller": caller_canon, "clock_reading": clock_reading}
+        return wrapped, context
 
     # -- Phase helpers -------------------------------------------------------
 
@@ -3458,31 +4294,95 @@ class FactStore:
             raise cap.ConflictError(cap.ModelCode.REQUEST_DRIFT)
 
         conn = self._q.raw
+        uid, lid = owner_uid, request.lifetime_id
+        op_id = request.operation_id
+        # TXN 1 (ONE atomic transaction): Phase A + the registered-op
+        # readback (the launch gate's clean-state establishment) and,
+        # for a NEW execution ONLY, the witness ARM + registry claim.
+        # NO execution step runs before the claim commits (sec 5 race
+        # vectors). A refusal here is PRE-EXECUTION: nothing claimed or
+        # armed, so an UNCHANGED retry is permitted; the refused
+        # attempt row records the refusal and NEVER blocks (sec 5).
+        conn.execute("BEGIN IMMEDIATE")
+        attempt_id = None
+        try:
+            pre = self._execute_readback(owner_uid, request,
+                                         capability_inner, claim_inner,
+                                         capture_inner, binding,
+                                         binding_hash, context,
+                                         capability.binding_hash,
+                                         claim.binding_hash,
+                                         capture.binding_hash)
+            if pre is None:
+                attempt_id = secrets.token_hex(16)  # FRESH per attempt
+                self._arm_and_claim(uid, lid, request, attempt_id,
+                                    binding_hash)
+            conn.execute("COMMIT")
+        except Exception as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            self._record_refused_attempt(uid, lid, op_id, binding_hash,
+                                         type(exc).__name__)
+            raise
+        if pre is not None:
+            return pre
+        # TXN 2: the 9-step commit. The COMMIT GUARD consumes the armed
+        # witness + clears the registry IN THE SAME transaction.
         conn.execute("BEGIN IMMEDIATE")
         try:
-            result = self._execute_locked(owner_uid, request,
-                                          capability_inner, claim_inner,
-                                          capture_inner, binding,
-                                          binding_hash, context,
-                                          capability.binding_hash,
-                                          claim.binding_hash,
-                                          capture.binding_hash)
-            conn.execute("COMMIT")
-            return result
+            result = self._execute_apply(uid, lid, request, claim_inner,
+                                         binding, binding_hash)
+            self._commit_guard(op_id, attempt_id)
+            if self._fault_commit_lost:
+                raise _CommitUncertain()
         except _CommitUncertain:
             try:
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
             return self._commit_uncertain(owner_uid, request, binding_hash)
-        except Exception:
-            conn.execute("ROLLBACK")
+        except _CommitGuardAbort:
+            # fenced/owned by ANOTHER attempt: ABORT; the operation is
+            # resolver-only and its outcome stays UNKNOWN to this caller
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            return ExecuteResult(
+                kind="local_uncertain", operation_id=op_id,
+                owner=Lifetime(uid=uid, lifetime_id=lid),
+                binding_hash=binding_hash)
+        except Exception as exc:
+            # a REFUSAL rolls back the ENTIRE attempt (sec 5): unwind
+            # the claim (disarm + drop the registry row) so an UNCHANGED
+            # retry stays permitted, then record the refused attempt row
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            self._unwind_claim(op_id, attempt_id)
+            self._record_refused_attempt(uid, lid, op_id, binding_hash,
+                                         type(exc).__name__)
             raise
+        try:
+            conn.execute("COMMIT")
+        except Exception:
+            # COMMIT outcome UNCERTAIN (sec 9): NEVER assumed rolled
+            # back - a COMMIT exception MAY have written
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            return self._commit_uncertain(owner_uid, request, binding_hash)
+        # READBACK (same step): the REACQUIRED post-commit read (sec 10)
+        return self._post_commit_read(owner_uid, request, result)
 
-    def _execute_locked(self, owner_uid, request, capability, claim,
-                        capture, binding, binding_hash, context,
-                        wrapper_cap_hash, wrapper_claim_hash,
-                        wrapper_capture_hash):
+    def _execute_readback(self, owner_uid, request, capability, claim,
+                          capture, binding, binding_hash, context,
+                          wrapper_cap_hash, wrapper_claim_hash,
+                          wrapper_capture_hash):
         q = self._q
         uid, lid = owner_uid, request.lifetime_id
         # STEP 1a: ordered footprint (SQLite serializes at BEGIN IMMEDIATE;
@@ -3490,9 +4390,18 @@ class FactStore:
         _footprint(request)
         # STEP 2: CURRENT fixture + issuer re-read FIRST, then the REAL PR-3
         # recheck against that CURRENT snapshot (Phase A)
-        issuer_row = q.q("SELECT valid FROM issuer_state WHERE uid=%s",
-                         (uid,), "one")
-        if issuer_row is not None and not issuer_row["valid"]:
+        # CURRENT issuer re-read: the table row (NOT the caller's
+        # flag) is the validity proof; the re-read typed issuer must
+        # EQUAL the context's current_issuer; current_issuer_valid
+        # False = STALE (sec 4, V55)
+        issuer_row = q.q("SELECT issuer_json, valid FROM issuer_state"
+                         " WHERE uid=%s", (uid,), "one")
+        if issuer_row is None or not issuer_row["valid"] \
+                or not context.current_issuer_valid:
+            raise cap.ConflictError(cap.ModelCode.STALE_POLICY)
+        stored_issuer = _typed_issuer_from_json(issuer_row["issuer_json"])
+        if stored_issuer is not None \
+                and stored_issuer != context.current_issuer:
             raise cap.ConflictError(cap.ModelCode.STALE_POLICY)
         operation_class = _METHOD_OPERATION[request.method]
         scopes = _METHOD_SCOPES[request.method]
@@ -3567,6 +4476,141 @@ class FactStore:
                 or claim.owner_token is None or claim.fence is None \
                 or claim.fence < 1:
             raise cap.AuthError()
+        return None  # CLEAN state: the caller arms + claims, then applies
+
+    def _arm_and_claim(self, uid, lid, request, attempt_id, binding_hash):
+        """The ONE atomic claim (sec 5): a FRESH attempt_id
+        (secrets.token_hex(16)); the witness is ARMED for THAT
+        (operation_id, attempt_id) AND the attempt registered as the
+        ACTIVE owner in attempt_registry IN THE SAME transaction that
+        established the clean state."""
+        now = _clock_now(self._clock)
+        op_id = request.operation_id
+        self._q.q("INSERT INTO abort_witnesses(operation_id, attempt_id,"
+                  " uid, lifetime_id, commitment, fence, session_id,"
+                  " state, terminal_state, attested_at,"
+                  " resolution_event_id, written_at)"
+                  " VALUES(%s,%s,%s,%s,%s,1,%s,'armed',NULL,NULL,NULL,%s)",
+                  (op_id, attempt_id, uid, lid, binding_hash,
+                   self._session_id, now), "exec")
+        self._q.q("INSERT INTO attempt_registry(operation_id, uid,"
+                  " lifetime_id, attempt_id, session_id, commitment,"
+                  " state, fenced_by, fenced_at, resolution_event_id,"
+                  " minted_at) VALUES(%s,%s,%s,%s,%s,%s,'active',NULL,"
+                  " NULL,NULL,%s)",
+                  (op_id, uid, lid, attempt_id, self._session_id,
+                   binding_hash, now), "exec")
+
+    def _commit_guard(self, op_id, attempt_id):
+        """COMMIT GUARD (sec 5 fencing/serialization): the commit
+        transaction of attempt A MUST find (1) witness(A) 'armed' AND
+        (2) the attempt_registry row 'active' OWNED BY A - then
+        CONSUMES the witness AND clears the registry IN THE SAME
+        transaction. ANY other state (missing/attested/foreign) ABORTS:
+        once a witness leaves 'armed', that attempt can NEVER commit."""
+        cur = self._q.raw.execute(
+            "UPDATE abort_witnesses SET state='consumed' WHERE"
+            " operation_id=? AND attempt_id=? AND state='armed'",
+            (op_id, attempt_id))
+        if cur.rowcount != 1:
+            raise _CommitGuardAbort()
+        cur = self._q.raw.execute(
+            "DELETE FROM attempt_registry WHERE operation_id=? AND"
+            " attempt_id=? AND state='active'", (op_id, attempt_id))
+        if cur.rowcount != 1:
+            raise _CommitGuardAbort()
+
+    def _unwind_claim(self, op_id, attempt_id) -> None:
+        """Refusal unwind: delete THIS attempt's armed witness + active
+        registry row (best-effort, own transaction). Uncertainty paths
+        NEVER call this - an uncertain attempt stays armed for the
+        resolver."""
+        try:
+            self._q.raw.execute("BEGIN IMMEDIATE")
+            self._q.raw.execute(
+                "DELETE FROM abort_witnesses WHERE operation_id=? AND"
+                " attempt_id=? AND state='armed'", (op_id, attempt_id))
+            self._q.raw.execute(
+                "DELETE FROM attempt_registry WHERE operation_id=? AND"
+                " attempt_id=? AND state='active'", (op_id, attempt_id))
+            self._q.raw.execute("COMMIT")
+        except Exception:
+            try:
+                self._q.raw.execute("ROLLBACK")
+            except Exception:
+                pass
+
+    def _record_refused_attempt(self, uid, lid, op_id, binding_hash,
+                                refusal: str) -> None:
+        """A REFUSED PRE-EXECUTION attempt row (sec 5): it NEVER blocks -
+        a refused attempt never claimed the registry, never armed a
+        witness, never wrote a record; an UNCHANGED retry is PERMITTED."""
+        now = _clock_now(self._clock)
+        try:
+            self._q.raw.execute("BEGIN IMMEDIATE")
+            row = self._q.q("SELECT COALESCE(MAX(attempt_seq),0)+1 AS s"
+                            " FROM attempt_records WHERE uid=%s AND"
+                            " lifetime_id=%s AND operation_id=%s",
+                            (uid, lid, op_id), "one")
+            self._q.q("INSERT INTO attempt_records(uid, lifetime_id,"
+                      " operation_id, attempt_seq, attempt_binding_hash,"
+                      " refusal, created_at)"
+                      " VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                      (uid, lid, op_id, int(row["s"]), binding_hash,
+                       refusal[:BOUNDED_STR_MAX], now), "exec")
+            self._q.raw.execute("COMMIT")
+        except Exception:
+            try:
+                self._q.raw.execute("ROLLBACK")
+            except Exception:
+                pass
+
+    def _post_commit_read(self, owner_uid, request, result):
+        """READBACK (sec 10, same step): COMMIT + the REACQUIRED
+        post-commit read bound to owner + fence + scope + outcome.
+        COMMITTED + read FAILS = 'unavailable' with the typed cause:
+        ReadbackUnavailableError carries the KNOWN outcome + revision;
+        the commit certainty is UNCHANGED - never uncertain, never
+        rolled back, never retried."""
+        if result.kind != "executed":
+            return result
+        outcome = result.result.outcome
+        known_revision = result.result.receipt.store_revision
+        try:
+            if self._fault_readback_cause is not None:
+                raise _InjectedReadbackFailure()
+            self._q.raw.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._current_view(owner_uid,
+                                             request.lifetime_id, outcome)
+                revision = max(self._store_revision(owner_uid), 1)
+                self._q.raw.execute("COMMIT")
+            except Exception:
+                try:
+                    self._q.raw.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        except _InjectedReadbackFailure:
+            raise ReadbackUnavailableError(outcome, known_revision,
+                                           self._fault_readback_cause)
+        except sqlite3.Error as exc:
+            raise ReadbackUnavailableError(outcome, known_revision,
+                                           ReadbackCause.OPERATIONAL)                 from exc
+        except Exception as exc:
+            raise ReadbackUnavailableError(outcome, known_revision,
+                                           ReadbackCause.PROTOCOL) from exc
+        return ExecuteResult(
+            kind="executed", result=result.result,
+            post=PostReadResult(
+                original_outcome=outcome,
+                applied_at_revision=outcome.applied_at_revision,
+                current_revision=revision, current=current))
+
+    def _execute_apply(self, uid, lid, request, claim, binding,
+                       binding_hash):
+        """TXN 2 (the 9-step commit): steps 5-9. Runs ONLY after the
+        claim commits - no execution step precedes the claim (sec 5)."""
         # STEP 5: tombstone check (put/supersede ONLY)
         if request.method in (MethodCode.PUT, MethodCode.SUPERSEDE):
             self._tombstone_check(uid, lid, request)
@@ -3606,17 +4650,9 @@ class FactStore:
                 (recovery_id, uid, lid, op_id, binding_hash, "{}",
                  ResolverCode.MANUAL.value, now + 86400,
                  RetentionCode.STANDARD.value, now), "exec")
-            # the attempt protocol: the abort witness is ARMED before the
-            # commit; commit-outcome uncertainty leaves it ARMED (the
-            # resolver fences + attests it; commit consumes it)
-            self._q.q(
-                "INSERT OR REPLACE INTO abort_witnesses(operation_id,"
-                " attempt_id, uid, lifetime_id, commitment, fence,"
-                " session_id, state, terminal_state, attested_at,"
-                " resolution_event_id, written_at)"
-                " VALUES(%s,%s,%s,%s,%s,1,%s,'armed',NULL,NULL,NULL,%s)",
-                (op_id, "attempt:" + op_id, uid, lid, binding_hash,
-                 self._session_id, now), "exec")
+            # the attempt witness stays ARMED and the registry row
+            # ACTIVE (armed+claimed in TXN 1): the resolver fences +
+            # attests them - the durable block marker NEVER consumes
             self._q.raw.execute("COMMIT")
             row = self._q.q("SELECT * FROM blocked_records WHERE"
                             " recovery_id=%s", (recovery_id,), "one")
@@ -3637,6 +4673,15 @@ class FactStore:
 
 class _CommitUncertain(Exception):
     """Internal: commit-outcome uncertainty injection (test fault hook)."""
+
+
+class _CommitGuardAbort(Exception):
+    """Internal: the commit guard found the witness/registry fenced or
+    owned by ANOTHER attempt - the commit ABORTS (sec 5)."""
+
+
+class _InjectedReadbackFailure(Exception):
+    """Internal: post-commit read failure injection (test fault hook)."""
 
 
 def _phase_a_error(code: "cap.ModelCode"):
@@ -4728,9 +5773,12 @@ _ERASED_JSON = json.dumps("erased")
 
 def _read_projection(store, method: ReadMethod, owner_uid: int,
                      lifetime_id: int, targets: dict,
-                     clock_reading: int) -> str:
+                     clock_reading: int, caller_canon: dict) -> str:
+    """The READ wrapper commitment (sec 13): session + handle-bound
+    method/owner/targets + the store-OWNED typed caller context -
+    NEVER a literal receiver string or a caller-asserted value."""
     return _sha256_hex(_canon({
-        "context": {"caller": "receiver", "clock_reading": clock_reading},
+        "context": {"caller": caller_canon, "clock_reading": clock_reading},
         "method": method.value,
         "owner": {"lifetime_id": lifetime_id, "uid": owner_uid},
         "session_id": store._session_id,
@@ -4741,35 +5789,60 @@ def _read_projection(store, method: ReadMethod, owner_uid: int,
 class _Reads:
     """Mixin: the read surface."""
 
-    def _read_prologue(self, owner_uid, lifetime_id, capability,
-                       method, targets, context):
-        """(1) HANDLE validation -> (2) PROJECTION COMPARISON -> (3) fresh
-        READ Phase A. Returns the unwrapped capability."""
+    def _read_prologue(self, owner_uid, capability, method, targets,
+                       context):
+        """(1) HANDLE validation -> (2) PROJECTION COMPARISON over the
+        REGISTERED read context -> BEGIN -> (3) issuer + fresh READ
+        Phase A INSIDE the one read transaction (V44). Returns
+        (inner capability, lifetime_id); the caller reads and COMMITs
+        in THIS transaction."""
         _req_int(owner_uid, 0)
-        _req_int(lifetime_id, 1)
         if type(context) is not env.ModelOnlyCallerContext:
             raise cap.ModelInputError()
         inner = self._validate_handle(capability, SessionBoundCapability,
                                       "capability")
-        now = _clock_now(self._clock)
-        expected = _read_projection(self, method, owner_uid, lifetime_id,
-                                    targets, now)
+        lid = inner.identity.lifetime_id
+        _req_int(lid, 1)
+        registered = self._read_contexts.get(capability.handle)
+        if registered is None:
+            raise cap.AuthError()  # MISSING_IDENTITY - not a read handle
+        expected = _read_projection(self, method, owner_uid, lid, targets,
+                                    registered["clock_reading"],
+                                    registered["caller"])
         if expected != capability.binding_hash:
             raise cap.AuthError()  # MISSING_IDENTITY - changed targets
-        if identity_mismatch(inner, owner_uid, lifetime_id):
+        if identity_mismatch(inner, owner_uid, lid):
             raise cap.AuthError()
-        cap_request = cap.Request(
-            operation_id=inner.request.operation_id,
-            operation_class=cap.OperationClass.READ,
-            required_scopes=frozenset({cap.Scope.MEMORY_READ}),
-            captured_epoch=None, requested_audience_id=None,
-            permitted_information_ref="read:" + method.value,
-            extraction_intent=cap.ExtractionIntent.NOT_APPLICABLE,
-            group_action=None, sensitive=False)
-        decision = self._evaluator.recheck_model(inner, cap_request)
-        if not decision.allowed:
-            raise _phase_a_error(decision.code)
-        return inner
+        self._read_txn()
+        try:
+            # CURRENT issuer re-read: TYPED equality + BOTH validity
+            # flags (the caller's flag is NOT proof; the table re-read
+            # is - sec 4; current_issuer_valid False = STALE, V55)
+            issuer_row = self._q.q(
+                "SELECT issuer_json, valid FROM issuer_state WHERE uid=%s",
+                (owner_uid,), "one")
+            if issuer_row is None or not issuer_row["valid"] \
+                    or not context.current_issuer_valid:
+                raise cap.ConflictError(cap.ModelCode.STALE_POLICY)
+            stored_issuer = _typed_issuer_from_json(issuer_row["issuer_json"])
+            if stored_issuer is not None \
+                    and stored_issuer != context.current_issuer:
+                raise cap.ConflictError(cap.ModelCode.STALE_POLICY)
+            cap_request = cap.Request(
+                operation_id=inner.request.operation_id,
+                operation_class=cap.OperationClass.READ,
+                required_scopes=frozenset({cap.Scope.MEMORY_READ}),
+                captured_epoch=None, requested_audience_id=None,
+                permitted_information_ref="read:" + method.value,
+                extraction_intent=cap.ExtractionIntent.NOT_APPLICABLE,
+                group_action=None, sensitive=False)
+            decision = self._evaluator.recheck_model(inner, cap_request)
+            if not decision.allowed:
+                raise _phase_a_error(decision.code)
+        except Exception:
+            self._read_abort()
+            raise
+        return inner, lid
 
     def _read_txn(self):
         self._q.raw.execute("BEGIN IMMEDIATE")
@@ -4788,12 +5861,8 @@ class _Reads:
             context: "env.ModelOnlyCallerContext") -> GetResult:
         _req_int(fid, 1)
         targets = {"fid": fid}
-        inner = self._read_prologue(owner_uid,
-                                    capability.inner.identity.lifetime_id,
-                                    capability, ReadMethod.GET, targets,
-                                    context)
-        lid = inner.identity.lifetime_id
-        self._read_txn()
+        inner, lid = self._read_prologue(owner_uid, capability,
+                                         ReadMethod.GET, targets, context)
         try:
             row = self._q.q("SELECT * FROM facts WHERE uid=%s AND"
                             " lifetime_id=%s AND fact_id=%s",
@@ -4814,12 +5883,8 @@ class _Reads:
         if type(setting) is not OptInSetting:
             raise cap.ModelInputError()
         targets = {"setting": {"category": setting.category.value}}
-        inner = self._read_prologue(owner_uid,
-                                    capability.inner.identity.lifetime_id,
-                                    capability, ReadMethod.GET_OPTIN,
-                                    targets, context)
-        lid = inner.identity.lifetime_id
-        self._read_txn()
+        inner, lid = self._read_prologue(owner_uid, capability,
+                                         ReadMethod.GET_OPTIN, targets, context)
         try:
             row = self._q.q("SELECT * FROM optins WHERE uid=%s AND"
                             " lifetime_id=%s AND category=%s",
@@ -4872,15 +5937,15 @@ class _Reads:
         if category is not None:
             _req_enum(category, Category)
         _req_int(limit, LIST_LIMIT_MIN, LIST_LIMIT_MAX)
+        if cursor is not None and (
+                type(cursor) is not str or len(cursor) != CURSOR_WIRE_LEN
+                or any(c not in "0123456789abcdef" for c in cursor)):
+            raise cap.ModelInputError()  # malformed cursor: STRUCTURAL
         targets = {"category": category.value if category else None,
                    "cursor": cursor, "limit": limit,
                    "row_kind": row_kind.value}
-        inner = self._read_prologue(owner_uid,
-                                    capability.inner.identity.lifetime_id,
-                                    capability, ReadMethod.LIST_FACTS,
-                                    targets, context)
-        lid = inner.identity.lifetime_id
-        self._read_txn()
+        inner, lid = self._read_prologue(owner_uid, capability,
+                                         ReadMethod.LIST_FACTS, targets, context)
         try:
             position = 0
             if cursor is not None:
@@ -4934,12 +5999,8 @@ class _Reads:
             "category": (filters.category.value
                          if filters.category else None),
             "include_superseded": filters.include_superseded}}
-        inner = self._read_prologue(owner_uid,
-                                    capability.inner.identity.lifetime_id,
-                                    capability, ReadMethod.COUNT_FACTS,
-                                    targets, context)
-        lid = inner.identity.lifetime_id
-        self._read_txn()
+        inner, lid = self._read_prologue(owner_uid, capability,
+                                         ReadMethod.COUNT_FACTS, targets, context)
         try:
             value = 0
             sql = ("SELECT COUNT(*) AS n FROM facts WHERE uid=%s AND"
@@ -4970,12 +6031,8 @@ class _Reads:
         _req_str(report_id, BOUNDED_STR_MAX)
         _req_int(page_index, 0)
         targets = {"page_index": page_index, "report_id": report_id}
-        inner = self._read_prologue(owner_uid,
-                                    capability.inner.identity.lifetime_id,
-                                    capability, ReadMethod.READ_REPORT_PAGE,
-                                    targets, context)
-        lid = inner.identity.lifetime_id
-        self._read_txn()
+        inner, lid = self._read_prologue(owner_uid, capability,
+                                         ReadMethod.READ_REPORT_PAGE, targets, context)
         try:
             page = self._q.q("SELECT * FROM report_pages WHERE report_id=%s"
                              " AND page_index=%s AND uid=%s AND"
@@ -5035,12 +6092,8 @@ class _Reads:
         MODEL; the PRODUCTION path is a stub that refuses)."""
         _req_int(fid, 1)
         targets = {"fid": fid}
-        inner = self._read_prologue(owner_uid,
-                                    capability.inner.identity.lifetime_id,
-                                    capability, ReadMethod.PREPARE_CLOSURE,
-                                    targets, context)
-        lid = inner.identity.lifetime_id
-        self._read_txn()
+        inner, lid = self._read_prologue(owner_uid, capability,
+                                         ReadMethod.PREPARE_CLOSURE, targets, context)
         try:
             live = self._q.q("SELECT row_version FROM facts WHERE uid=%s"
                              " AND lifetime_id=%s AND fact_id=%s",
@@ -5097,6 +6150,31 @@ FactStore.prepare_closure = _Reads.prepare_closure
 class _Historical:
     """Mixin: readback, resolve, evidence."""
 
+    def _historical_targets(self, operation_id: str, original_request,
+                            original_binding) -> dict:
+        """The HistoricalTarget CLOSED SUM (sec 13): SUPPLIED binds the
+        RECOMPUTED single extended hash from the caller's typed
+        originals; LOAD_STORED binds the op + the TYPED original
+        binding. The discriminant IS the shape."""
+        _req_hex(operation_id, OP_ID_LEN)
+        if original_request is None:
+            if type(original_binding) is not env.ModelOnlyRequestBinding:
+                raise cap.ModelInputError()
+            originals = {
+                "mode": "LOAD_STORED", "operation_id": operation_id,
+                "original_binding": json.loads(_canon(
+                    original_binding.projection_dict()))}
+        else:
+            if type(original_request) is not FactRequest \
+                    or type(original_binding) \
+                    is not env.ModelOnlyRequestBinding:
+                raise cap.ModelInputError()
+            originals = {
+                "mode": "SUPPLIED",
+                "recomputed_commitment": extended_binding_hash(
+                    original_binding, original_request)}
+        return {"operation_id": operation_id, "originals": originals}
+
     def _historical_load(self, owner_uid, lid, operation_id,
                          original_request, original_binding):
         """The scoped authenticated original-load + FULL hash verification
@@ -5127,6 +6205,13 @@ class _Historical:
                 raise cap.ConflictError(cap.ModelCode.REQUEST_DRIFT)
             if type(original_binding) is not env.ModelOnlyRequestBinding:
                 raise cap.ModelInputError()
+            # the REQUIRED original-binding comparison: the AUTHENTICATED
+            # LOAD supplies the retained commitment; the caller's typed
+            # original binding is compared EQUAL to the STORED
+            # projection BEFORE any outcome decode (sec 13)
+            stored_binding = json.loads(stored["binding_json"])
+            if original_binding.projection_dict() != stored_binding:
+                raise cap.ConflictError(cap.ModelCode.REQUEST_DRIFT)
             binding_hash = stored["binding_hash"]
             return LoadStoredMode(operation_id=operation_id,
                                   original_binding=original_binding), \
@@ -5154,16 +6239,12 @@ class _Historical:
                  context: "env.ModelOnlyCallerContext"):
         """Historical; writes NO records. PostReadResult ONLY for a known
         committed outcome; BlockedStatus for unresolved."""
-        mode_tag = "SUPPLIED" if original_request is not None \
-            else "LOAD_STORED"
-        targets = {"operation_id": operation_id,
-                   "originals": {"mode": mode_tag}}
-        inner = self._read_prologue(owner_uid,
-                                    capability.inner.identity.lifetime_id,
-                                    capability, ReadMethod.READBACK,
-                                    targets, context)
-        lid = inner.identity.lifetime_id
-        self._read_txn()
+        targets = self._historical_targets(operation_id,
+                                           original_request,
+                                           original_binding)
+        inner, lid = self._read_prologue(owner_uid, capability,
+                                         ReadMethod.READBACK, targets,
+                                         context)
         try:
             _mode, record, binding_hash = self._historical_load(
                 owner_uid, lid, operation_id, original_request,
@@ -5220,17 +6301,13 @@ class _Historical:
         """Historical; resolver writes are EXACTLY the RESOLVER WRITE
         WHITELIST. EVIDENCE NEVER REOPENS EXECUTION."""
         _req_enum(resolver, ResolverCode)
-        mode_tag = "SUPPLIED" if original_request is not None \
-            else "LOAD_STORED"
-        targets = {"operation_id": operation_id,
-                   "originals": {"mode": mode_tag}}
-        inner = self._read_prologue(owner_uid,
-                                    capability.inner.identity.lifetime_id,
-                                    capability, ReadMethod.RESOLVE,
-                                    targets, context)
-        lid = inner.identity.lifetime_id
+        targets = self._historical_targets(operation_id,
+                                           original_request,
+                                           original_binding)
+        inner, lid = self._read_prologue(owner_uid, capability,
+                                         ReadMethod.RESOLVE, targets,
+                                         context)
         now = _clock_now(self._clock)
-        self._read_txn()
         try:
             _mode, record, binding_hash = self._historical_load(
                 owner_uid, lid, operation_id, original_request,
@@ -5440,11 +6517,56 @@ class _Historical:
                                       "capability")
         if identity_mismatch(inner, owner_uid, lifetime_id):
             raise cap.AuthError()
+        # the FULL receiver chain (sec 5): the capability MUST be a FRESH
+        # REGISTERED READ setup BOUND TO THIS ACTUAL INPUT (minted via
+        # the store's producer by the injected provider) - nothing cached
+        registered = self._read_contexts.get(capability.handle)
+        if registered is None:
+            raise cap.AuthError()  # not a registered read handle
+        read_targets = {"projection": projection.to_dict(),
+                        "token": delivery_token}
+        expected = _read_projection(self, ReadMethod.READBACK, owner_uid,
+                                    lifetime_id, read_targets,
+                                    registered["clock_reading"],
+                                    registered["caller"])
+        if expected != capability.binding_hash:
+            raise cap.AuthError()  # the setup is NOT bound to this input
+        # SUBJECT hash-owner-accounting scope: the projection binds to
+        # THIS owner accounting (a forged uid/lifetime NEVER lands)
+        if projection.uid != owner_uid \
+                or projection.lifetime_id != lifetime_id \
+                or projection.accounting_scope != Lifetime(
+                    uid=owner_uid, lifetime_id=lifetime_id):
+            raise EvidenceScopeError()
         now = _clock_now(self._clock)
         conn = self._q.raw
         conn.execute("BEGIN IMMEDIATE")
         try:
             q = self._q
+            # PhaseA (the REAL recheck) + the CURRENT issuer freshness,
+            # INSIDE the insertion transaction (revoked grants refuse)
+            issuer_row = q.q("SELECT issuer_json, valid FROM issuer_state"
+                             " WHERE uid=%s", (owner_uid,), "one")
+            if issuer_row is None or not issuer_row["valid"] \
+                    or not context.current_issuer_valid:
+                raise cap.ConflictError(cap.ModelCode.STALE_POLICY)
+            stored_issuer = _typed_issuer_from_json(
+                issuer_row["issuer_json"])
+            if stored_issuer is not None \
+                    and stored_issuer != context.current_issuer:
+                raise cap.ConflictError(cap.ModelCode.STALE_POLICY)
+            cap_request = cap.Request(
+                operation_id=inner.request.operation_id,
+                operation_class=cap.OperationClass.READ,
+                required_scopes=frozenset({cap.Scope.MEMORY_READ}),
+                captured_epoch=None, requested_audience_id=None,
+                permitted_information_ref=(
+                    "read:" + ReadMethod.READBACK.value),
+                extraction_intent=cap.ExtractionIntent.NOT_APPLICABLE,
+                group_action=None, sensitive=False)
+            decision = self._evaluator.recheck_model(inner, cap_request)
+            if not decision.allowed:
+                raise _phase_a_error(decision.code)
             existing = q.q("SELECT * FROM evidence_entries WHERE"
                            " recovery_id=%s AND delivery_token=%s",
                            (projection.recovery_id, delivery_token), "one")
@@ -5476,32 +6598,55 @@ class _Historical:
             # classify by the CURRENT op state: unresolved = blocked
             # branch (row ONLY, NO event); resolved = late branch (one
             # insertion event + one ledger row)
-            resolved = q.q("SELECT recovery_id FROM resolved_accounting"
+            resolved = q.q("SELECT * FROM resolved_accounting"
                            " WHERE recovery_id=%s",
                            (projection.recovery_id,), "one")
             origin = "late_insert" if resolved is not None \
                 else "blocked_arrival"
             event_id = None
+            if origin == "late_insert":
+                # the TARGET JOIN: the resolved anchor's owner/operation/
+                # commitment MUST join to the owner accounting
+                if resolved["uid"] != owner_uid \
+                        or resolved["lifetime_id"] != lifetime_id \
+                        or resolved["operation_id"] != projection.operation_id \
+                        or resolved["commitment"] != projection.commitment:
+                    conn.execute("ROLLBACK")
+                    raise EvidenceScopeError()
             if origin == "blocked_arrival":
                 # EVIDENCE OVERFLOW (sec 5): count freezes at 64; the
                 # overflow marker flips to 1 and STAYS; a delivery past
                 # the cap is RECEIVED-REFUSED (the marker row is proof)
                 blocked_row = q.q(
-                    "SELECT evidence_count, overflow_marker FROM"
+                    "SELECT uid, lifetime_id, operation_id, binding_hash,"
+                    " state, evidence_count, overflow_marker FROM"
                     " blocked_records WHERE recovery_id=%s",
                     (projection.recovery_id,), "one")
-                if blocked_row is not None:
-                    if blocked_row["evidence_count"] >= 64:
-                        if blocked_row["overflow_marker"] != 1:
-                            q.q("UPDATE blocked_records SET"
-                                " overflow_marker=1 WHERE recovery_id=%s",
-                                (projection.recovery_id,), "exec")
-                        conn.execute("COMMIT")
-                        raise cap.CapRefused(65)
-                    q.q("UPDATE blocked_records SET"
-                        " evidence_count=evidence_count+1 WHERE"
-                        " recovery_id=%s", (projection.recovery_id,),
-                        "exec")
+                # CURRENT-RECOVERY EXISTENCE: the recovery_id MUST name a
+                # CURRENT blocked record (a nonexistent recovery NEVER
+                # lands - the typed unknown-recovery refusal)
+                if blocked_row is None or blocked_row["state"] == "resolved":
+                    conn.execute("ROLLBACK")
+                    raise UnknownRecoveryError()
+                # the TARGET JOIN: the blocked record's owner/operation/
+                # commitment MUST join to the owner accounting
+                if blocked_row["uid"] != owner_uid \
+                        or blocked_row["lifetime_id"] != lifetime_id \
+                        or blocked_row["operation_id"] != projection.operation_id \
+                        or blocked_row["binding_hash"] != projection.commitment:
+                    conn.execute("ROLLBACK")
+                    raise EvidenceScopeError()
+                if blocked_row["evidence_count"] >= 64:
+                    if blocked_row["overflow_marker"] != 1:
+                        q.q("UPDATE blocked_records SET"
+                            " overflow_marker=1 WHERE recovery_id=%s",
+                            (projection.recovery_id,), "exec")
+                    conn.execute("COMMIT")
+                    raise cap.CapRefused(65)
+                q.q("UPDATE blocked_records SET"
+                    " evidence_count=evidence_count+1 WHERE"
+                    " recovery_id=%s", (projection.recovery_id,),
+                    "exec")
                 q.q("INSERT INTO evidence_entries(evidence_id, recovery_id,"
                     " kind, delivery_token, received_at, ref,"
                     " projection_json, insertion_event_id,"
@@ -5557,6 +6702,7 @@ class _Historical:
             raise
 
 
+FactStore._historical_targets = _Historical._historical_targets
 FactStore._historical_load = _Historical._historical_load
 FactStore.readback = _Historical.readback
 FactStore._historical_current_view = _Historical._historical_current_view

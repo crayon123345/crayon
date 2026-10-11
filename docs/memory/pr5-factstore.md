@@ -27,7 +27,7 @@ cd ports/memory
 python3 -m unittest tests.test_pr5_factstore
 ```
 
-Expected: 61 tests, OK (~8s). No pytest dependency; stdlib unittest.
+Expected: 96 tests, OK (~52s; file-backed exclusive-fixture DBs). No pytest dependency; stdlib unittest.
 
 ## Shape
 
@@ -59,7 +59,7 @@ Expected: 61 tests, OK (~8s). No pytest dependency; stdlib unittest.
 
 ## Test-vector coverage (honest)
 
-Covered by the suite (61 tests):
+Covered by the suite (96 tests):
 
 - V01-V10 put/supersede classification incl. normalization collision,
   oversize and string rejections, N-to-1, duplicate old_fids, non-target
@@ -75,10 +75,28 @@ Covered by the suite (61 tests):
   prior-lifetime and cross-owner replay refusals, valid-capability replay,
   Phase-A-before-drift precedence (incl. EXPIRED first), REVOKED before
   replay, reseal/registry re-claim refusal.
-- V34 (partial) restart: old-session handles refuse after reopen.
-- V34b (receiver-side subset): exact repeat, delivery drift refusal,
-  distinct same-second tokens, blocked repeat, blocked->resolved repeat
-  with the closing resolution_event_id stamp.
+- V34 fault injection after each step class: Phase-A refusal (claim
+  unwinds; unchanged retry permitted), apply fault (the ENTIRE attempt
+  rolls back - no armed witness/registry left), commit-guard abort
+  (typed local_uncertain, NO blind retry), lost commit confirmation
+  (durable_blocked; the witness stays ARMED for the resolver). RESTART:
+  a real file close/reopen - old-session handles refuse, durable rows
+  survive, absent op rows type as UnknownOperation, never rollback proof.
+- V34b receiver-side: exact repeat, delivery drift refusal, distinct
+  same-second tokens, blocked repeat, blocked->resolved repeat with the
+  closing resolution_event_id stamp; MIXED BATCH (old no-event + new
+  late: 3 + 0), MIXED NO-EVENT/REPLAYED-LATE/NEW-LATE (0 + 0 + 3 = 3,
+  stored_new_retained 1/3), DUPLICATE TOKENS IN ONE BATCH (late 3 not 6,
+  blocked 1 not 2).
+- V34b issuer-harness vectors: LIVE ERASE (the scrub hook destroys
+  the volatile raw BEFORE the completion row; hook failure = step
+  refusal, nothing recorded), PENDING RESTART (unacked rows redelivered
+  with the SAME token), LOST RECEIVER ACK (row stays pending; same-token
+  redelivery replays receiver-side, no double-count), LOST
+  DELIVERED-STATE UPDATE (confirm-lost = typed uncertain; durable reread
+  decides; unreadable reread = typed uncertain), SAFE PAYLOAD/STABLE
+  TOKEN (ref_json is projection output only), forged committed_result /
+  invented EvidenceRef = REFUSED, never delivered.
 - V35 durable-blocked and local-uncertain commit-uncertainty paths.
 - V38 receipt store_revision floor on no-op commits.
 - V39 conflicting-receipt evidence never auto-resolves; rollback proceeds
@@ -88,10 +106,19 @@ Covered by the suite (61 tests):
 - V41 revision bump table (applied/unchanged/conflict/wipe).
 - V42 store_revision overflow refusal.
 - V43 uid 0 valid.
-- V44 changed read targets refuse (MISSING_IDENTITY).
+- V36/V37 known-commit read failures (protocol AND operational):
+  ReadbackUnavailableError carries the KNOWN outcome + revision; the
+  commit certainty is unchanged (the same op replays); a failed current
+  read yields NO PostReadResult (current_revision None).
+- V44 one-transaction binding: Phase A runs INSIDE the one read
+  transaction (observed via the evaluator seam); changed read targets
+  refuse (MISSING_IDENTITY); a setup minted for fid1 never reads fid2.
 - V45/V46 live vs history views never merged; history ordered.
-- V47 cursor suite: malformed structure, fabricated id, unknown cursor,
-  paging to exhaustion.
+- V47 cursor suite: malformed structure (STRUCTURAL - refuses before
+  revocation), fabricated id, unknown cursor, paging to exhaustion;
+  live-revision movement invalidates 'facts' cursors; 'report_page'
+  cursors RETAINED against their bound revision until erased (wipe
+  clears the registry).
 - V48 count matches list under identical filters.
 - V49 production stubs refuse unconditionally.
 - V50 sensitive-scope requirement refuses at Phase A (no execution).
@@ -100,25 +127,30 @@ Covered by the suite (61 tests):
   OFF, no row, revision +0).
 - V53 historical APIs need a fresh READ claim + typed originals;
   unregistered op = UnknownOperation.
-- V54 (partial) ERASED precedes CAS/capacity; malformed cursor covered in
-  V47.
-- V55 (partial) binding projection carries no nonce/fence/target ids;
-  identity/channel/capture fields present and stable.
+- V54 precedence: structural/sensitive tiers refuse BEFORE expiry
+  (never ExpiredRefused), expiry BEFORE revocation, revocation BEFORE
+  scope, scope BEFORE capacity, CAS not masked at capacity, ERASED
+  precedes CAS/capacity; malformed cursor is structural everywhere.
+- V55 full claim/binding mapping: no nonce/fence/target ids; issuer
+  channel agreement (WEB = SessionRef-shaped 64-hex web_session;
+  TELEGRAM = TelegramIssuer bot/chat/update ids, canonical JSON
+  round-trip); current_issuer_valid False = STALE_POLICY; the full
+  generations mapping (capture_epoch/grant_generation/policy_revision/
+  decision_revision/consent_generation) equals the owned fixture
+  snapshot.
+- B9 wrapper typing: a None wrapper never dereferences - typed refusal
+  on get/list/execute paths.
+- The exclusive cross-instance isolation fixture: a second opener of the
+  same path refuses; a file-backed connection WITHOUT the exclusive
+  marker refuses; close releases the lock; :memory: remains allowed.
 
 NOT yet covered (planned, no claims made):
 
-- V34 step-by-step fault injection after each of steps 1-8 individually.
-- V34b issuer-harness vectors (LIVE ERASE hook, pending restart, lost
-  receiver ack, lost delivered-update reread, safe payload/stable token)
-  and the mixed-batch accounting vectors; the receiver-side
-  duplicate-token-in-one-batch accounting.
-- V36/V37 known-commit read failures (ReadbackUnavailableError shape).
-- V44's one-transaction binding property (structural; not directly
-  observable in the model test harness).
-- V47 report-page cursor retention rules beyond the suite's checks;
-  live-revision invalidation of facts cursors.
-- V54 full precedence matrix beyond the covered rows.
-- V55 full claim/cap/request/current-issuer/generations mapping rows.
+- Concurrent double-delivery (one winner, loser replays) - the model's
+  single-writer SQLite makes a true concurrent race inexpressible;
+  the same-token replay path covers the loser's outcome.
+- Post-scrub repeat (safe-field comparison) and the UNIQUE-drift /
+  unrelated-same-owner-target receiver vectors.
 
 ## Known model boundaries
 

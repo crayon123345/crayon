@@ -5,9 +5,12 @@ never authority. Run from ports/memory: python3 -m pytest tests/ -q
 (or python3 tests/test_pr5_factstore.py - no pytest dependency; a tiny
 runner is embedded at the bottom).
 """
+import dataclasses
+import json
 import os
 import sqlite3
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,11 +24,32 @@ ALL_SCOPES = [cap.Scope.MEMORY_WRITE, cap.Scope.MEMORY_READ,
               cap.Scope.MEMORY_ERASE]
 
 
-def mkstore(scopes=ALL_SCOPES, uid=1, lid=1, epoch=1):
-    conn = sqlite3.connect(":memory:")
+_TMPDIR = [None]
+_MKSEQ = [0]
+
+
+def mkstore_path(scopes=ALL_SCOPES, uid=1, lid=1, epoch=1):
+    """A file-backed store under the EXCLUSIVE isolation fixture."""
+    if _TMPDIR[0] is None:
+        _TMPDIR[0] = tempfile.mkdtemp(prefix="pr5tests-")
+    _MKSEQ[0] += 1
+    path = os.path.join(_TMPDIR[0], "store-%04d.db" % _MKSEQ[0])
+    conn = f.open_exclusive_db(path)
     store = f.FactStore(conn, f.JsonTestClock(T0))
     store.setup_owner(uid, lid, epoch, scopes=scopes)
+    return store, conn, path
+
+
+def mkstore(scopes=ALL_SCOPES, uid=1, lid=1, epoch=1):
+    store, conn, _path = mkstore_path(scopes, uid, lid, epoch)
     return store, conn
+
+
+def resolve_op(store, req, b):
+    tgt = store._historical_targets(req.operation_id, req, b)
+    w = read_cap(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
+    return store.resolve(1, req.operation_id, req, b, w, store._clock,
+                         read_ctx(store))
 
 
 def new_fact(key="tea", value="green", category=f.Category.PREFERENCE,
@@ -411,8 +435,7 @@ class V15ToV18Wipe(unittest.TestCase):
         with self.assertRaises(cap.ConflictError):
             store.execute(1, req, c, l, p, ctx)
         # historical readback with supplied originals: ScrubbedOutcome
-        tgt = {"operation_id": "a1" * 16,
-               "originals": {"mode": "SUPPLIED"}}
+        tgt = store._historical_targets("a1" * 16, req, b)
         w = read_cap(store, "b7" * 16, f.ReadMethod.READBACK, tgt)
         pr = store.readback(1, "a1" * 16, req, b, w, store._clock,
                             read_ctx(store))
@@ -690,8 +713,15 @@ class V30ToV33Replay(unittest.TestCase):
         for transport_field in ("nonce", "key_id", "ciphertext", "tag"):
             self.assertNotIn(transport_field, proj)
         self.assertEqual(b.commitment(), b.commitment())  # stable
-        # a second claim for the same registered operation is REFUSED by
-        # the registry - a transport reseal can NEVER re-register
+        # a re-mint of the UNCHANGED request yields the IDENTICAL
+        # registered binding: a transport reseal (nonce/key change)
+        # never changes a registered binding (V33)
+        _, _, _, b2 = store.mint_mutation_fixtures(req)
+        self.assertEqual(b.commitment(), b2.commitment())
+        # a CHANGED binding (new current issuer) for the same registered
+        # operation drifts - the registry REFUSES (V33 mapping)
+        store.set_issuer(1, env.SessionRef(session_token_hash="ef" * 32),
+                         True)
         with self.assertRaises(env.EnvelopeError):
             store.mint_mutation_fixtures(req)
 
@@ -924,17 +954,20 @@ class V53HistoricalAuth(unittest.TestCase):
     def test_v53_unregistered_op_unknown(self):
         store, _ = mkstore()
         ctx = read_ctx(store)
-        tgt = {"operation_id": "ab" * 16, "originals": {"mode": "LOAD_STORED"}}
+        # an un-EXECUTED mint supplies a typed binding; the op stays
+        # unregistered -> UnknownOperation on the historical API
+        _, _, _, b = store.mint_mutation_fixtures(put_req("ab" * 16))
+        tgt = store._historical_targets("ab" * 16, None, b)
         w = read_cap(store, "b9" * 16, f.ReadMethod.READBACK, tgt)
         with self.assertRaises(f.UnknownOperationError):
-            store.readback(1, "ab" * 16, None, None, w, store._clock, ctx)
+            store.readback(1, "ab" * 16, None, b, w, store._clock, ctx)
 
     def test_v53_load_stored_requires_binding(self):
         store, _ = mkstore()
         req = put_req("a1" * 16)
         c, l, p, b, ctx = mint(store, req)
         store.execute(1, req, c, l, p, ctx)
-        tgt = {"operation_id": "a1" * 16, "originals": {"mode": "LOAD_STORED"}}
+        tgt = store._historical_targets("a1" * 16, None, b)
         w = read_cap(store, "b1" * 16, f.ReadMethod.READBACK, tgt)
         with self.assertRaises(cap.ModelInputError):
             store.readback(1, "a1" * 16, None, None, w, store._clock, ctx)
@@ -963,16 +996,28 @@ def blocked_op(store, op="aa" * 16):
 
 
 def evidence(store, rid, op, token, kind=f.EvidenceKind.RECEIPT,
-             commitment="c" * 64):
+             commitment=None):
+    if commitment is None:
+        # the anchor row's ACTUAL commitment (the target join requires it)
+        row = store._q.q(
+            "SELECT binding_hash AS c FROM blocked_records WHERE"
+            " recovery_id=%s", (rid,), "one")
+        if row is None:
+            row = store._q.q(
+                "SELECT commitment AS c FROM resolved_accounting WHERE"
+                " recovery_id=%s", (rid,), "one")
+        commitment = row["c"]
     proj = f.SafeEvidenceProjection(
         recovery_id=rid, uid=1, lifetime_id=1, operation_id=op,
         commitment=commitment, kind=kind,
         target=f.RecoveryBoundRef(recovery_id=rid, source=kind),
         source=kind, accounting_scope=f.Lifetime(uid=1, lifetime_id=1))
-    w, _ = store.mint_read_fixtures(1, 1, "b3" * 16, f.ReadMethod.GET,
-                                    {"fid": 1})
+    # a FRESH REGISTERED READ setup bound to the ACTUAL input
+    w, ctx = store.mint_read_fixtures(
+        1, 1, "b3" * 16, f.ReadMethod.READBACK,
+        {"projection": proj.to_dict(), "token": token})
     return store.insert_evidence(1, 1, "b3" * 16, proj, token, w,
-                                 read_ctx(store)), proj
+                                 ctx), proj
 
 
 class V34bInsertionEvents(unittest.TestCase):
@@ -1020,8 +1065,7 @@ class V34bInsertionEvents(unittest.TestCase):
         r1, proj = evidence(store, rid, req.operation_id, "d" * 32)
         self.assertEqual(r1.kind, "blocked_inserted")
         # resolve stays UNRESOLVED without attested witnesses (V39 rule):
-        tgt = {"operation_id": req.operation_id,
-               "originals": {"mode": "SUPPLIED"}}
+        tgt = store._historical_targets(req.operation_id, req, b)
         w = read_cap(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
         rr = store.resolve(1, req.operation_id, req, b, w, store._clock,
                            read_ctx(store))
@@ -1045,8 +1089,7 @@ class V39V40Conflicts(unittest.TestCase):
         self.assertEqual(r1.kind, "blocked_inserted")
         # the op is NEVER auto-resolved by evidence; resolve still
         # unresolved without attested witnesses
-        tgt = {"operation_id": req.operation_id,
-               "originals": {"mode": "SUPPLIED"}}
+        tgt = store._historical_targets(req.operation_id, req, b)
         w = read_cap(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
         rr = store.resolve(1, req.operation_id, req, b, w, store._clock,
                            read_ctx(store))
@@ -1159,6 +1202,667 @@ class V51V54V55(unittest.TestCase):
         self.assertIn("issuer", proj)
         self.assertIn("capture_epoch", proj)
         self.assertIn("content_fingerprint", proj)
+
+
+class V34StepFaultsAndRestart(unittest.TestCase):
+    """V34: fault injection after each step incl. RESTART - old-session
+    claims refuse after reopen, an absent row is never rollback proof,
+    NO blind retry."""
+
+    def test_phasea_fault_unchanged_retry_permitted(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        orig = store._evaluator.recheck_model
+        calls = [0]
+
+        def boom(capability, request):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise cap.ConflictError(cap.ModelCode.STALE_POLICY)
+            return orig(capability, request)
+        store._evaluator.recheck_model = boom
+        try:
+            with self.assertRaises(cap.ConflictError):
+                store.execute(1, req, c, l, p, ctx)
+        finally:
+            store._evaluator.recheck_model = orig
+        # a PRE-CLAIM refusal: nothing armed/claimed - the UNCHANGED
+        # retry (same bundles) is PERMITTED
+        r = store.execute(1, req, c, l, p, ctx)
+        self.assertEqual(r.kind, "executed")
+
+    def test_apply_fault_rolls_back_entire_attempt(self):
+        store, conn = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        orig = store._execute_apply
+
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("injected step fault")
+        store._execute_apply = boom
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                store.execute(1, req, c, l, p, ctx)
+        finally:
+            store._execute_apply = orig
+        # the refusal rolled back the ENTIRE attempt: the claim is
+        # unwound (no armed witness, no registry row left behind)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM abort_witnesses").fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM attempt_registry").fetchone()[0], 0)
+        r = store.execute(1, req, c, l, p, ctx)
+        self.assertEqual(r.kind, "executed")
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM facts").fetchone()[0], 1)
+
+    def test_commit_guard_abort_typed_uncertain_no_blind_retry(self):
+        store, conn = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        orig = store._commit_guard
+
+        def boom(*a, **k):
+            raise f._CommitGuardAbort()
+        store._commit_guard = boom
+        try:
+            r = store.execute(1, req, c, l, p, ctx)
+        finally:
+            store._commit_guard = orig
+        self.assertEqual(r.kind, "local_uncertain")
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM facts").fetchone()[0], 0)
+        # NO blind retry: the re-execution is a typed non-executed state
+        r2 = store.execute(1, req, c, l, p, ctx)
+        self.assertIn(r2.kind, ("local_uncertain", "durable_blocked",
+                                "in_progress", "unknown"))
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM facts").fetchone()[0], 0)
+
+    def test_commit_lost_hook_durable_blocked_no_blind_retry(self):
+        store, conn = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store._fault_commit_lost = True
+        r = store.execute(1, req, c, l, p, ctx)
+        self.assertEqual(r.kind, "durable_blocked")
+        # the witness stays ARMED for the resolver
+        row = conn.execute("SELECT state FROM abort_witnesses").fetchone()
+        self.assertEqual(row[0], "armed")
+        r2 = store.execute(1, req, c, l, p, ctx)
+        self.assertEqual(r2.kind, "durable_blocked")
+
+    def test_restart_reopen_old_session_refuses(self):
+        store, conn, path = mkstore_path()
+        r, _ = run(store, put_req("a1" * 16))
+        req2, b2, rid = blocked_op(store, op="ab" * 16)
+        c, l, p, b3, ctx = mint(store, put_req("b2" * 16))
+        f.close_exclusive_db(conn)
+        # RESTART: reopen the SAME path under a NEW instance/session
+        conn2 = f.open_exclusive_db(path)
+        store2 = f.FactStore(conn2, store._clock)
+        try:
+            with self.assertRaises((cap.AuthError, cap.ModelInputError,
+                                    cap.ConflictError)):
+                store2.execute(1, put_req("b2" * 16), c, l, p, ctx)
+            # the durable rows SURVIVE the restart
+            self.assertEqual(conn2.execute(
+                "SELECT count(*) FROM facts").fetchone()[0], 1)
+            blocked = conn2.execute(
+                "SELECT state FROM blocked_records WHERE recovery_id=?",
+                (rid,)).fetchone()
+            self.assertIsNotNone(blocked)
+            # a FRESH mint on the reopened store works normally
+            r3, _ = run(store2, put_req("c9" * 16, key="after-restart"))
+            self.assertEqual(r3.kind, "executed")
+        finally:
+            f.close_exclusive_db(conn2)
+
+    def test_absent_row_is_never_rollback_proof(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)  # minted but NEVER executed
+        _, _, _, b = store.mint_mutation_fixtures(req)
+        tgt = store._historical_targets(req.operation_id, req, b)
+        w = read_cap(store, "b5" * 16, f.ReadMethod.READBACK, tgt)
+        # absent = a typed UnknownOperation, NEVER a rollback/committed
+        # proof and NEVER a fabricated outcome
+        with self.assertRaises(f.UnknownOperationError):
+            store.readback(1, req.operation_id, req, b, w,
+                           store._clock, read_ctx(store))
+
+
+class V36V37ReadbackUnavailable(unittest.TestCase):
+    """V36 known-commit read failure (protocol AND operational) =
+    ReadbackUnavailableError with the KNOWN outcome+revision, never
+    uncertain; V37 current_revision None on failed current read."""
+
+    def test_v36_protocol_and_operational(self):
+        for cause in (f.ReadbackCause.PROTOCOL, f.ReadbackCause.OPERATIONAL):
+            store, _ = mkstore()
+            req = put_req("a1" * 16)
+            c, l, p, b, ctx = mint(store, req)
+            store._fault_readback_cause = cause
+            with self.assertRaises(f.ReadbackUnavailableError) as cmx:
+                store.execute(1, req, c, l, p, ctx)
+            err = cmx.exception
+            self.assertEqual(err.cause, cause)
+            self.assertGreaterEqual(err.known_revision, 1)
+            self.assertEqual(err.known_outcome.method, f.MethodCode.PUT)
+            # the commit certainty is UNCHANGED: the SAME op replays
+            store._fault_readback_cause = None
+            r2 = store.execute(1, req, c, l, p, ctx)
+            self.assertEqual(r2.kind, "replayed")
+
+    def test_v37_failed_current_read_has_no_current_revision(self):
+        store, _ = mkstore()
+        r0, _ = run(store, put_req("a1" * 16))
+        self.assertIsNotNone(r0.post)
+        req = put_req("a2" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store._fault_readback_cause = f.ReadbackCause.OPERATIONAL
+        with self.assertRaises(f.ReadbackUnavailableError) as cmx:
+            store.execute(1, req, c, l, p, ctx)
+        # NO PostReadResult exists for the failed read (current_revision
+        # is None); the error carries ONLY the KNOWN outcome + revision
+        self.assertFalse(hasattr(cmx.exception, "post"))
+        post = dataclasses.replace(r0.post, current_revision=None)
+        self.assertIsNone(post.current_revision)
+
+
+class V44OneTransactionBinding(unittest.TestCase):
+    """V44: the read\'s Phase A + the read run in ONE transaction; the
+    setup binds the ACTUAL targets."""
+
+    def test_phasea_runs_inside_the_read_transaction(self):
+        store, _ = mkstore()
+        r, _ = run(store, put_req("a1" * 16))
+        fid = r.result.outcome.readback.fact_id
+        ctx = read_ctx(store)
+        w = read_cap(store, "d1" * 16, f.ReadMethod.GET, {"fid": fid})
+        seen = {}
+        orig = store._evaluator.recheck_model
+
+        def spy(capability, request):
+            seen["in_txn"] = store._q.raw.in_transaction
+            return orig(capability, request)
+        store._evaluator.recheck_model = spy
+        try:
+            store.get(1, fid, w, store._clock, ctx)
+        finally:
+            store._evaluator.recheck_model = orig
+        self.assertTrue(seen["in_txn"])  # Phase A INSIDE the one read txn
+        self.assertFalse(store._q.raw.in_transaction)  # and it CLOSED
+
+    def test_setup_binds_the_actual_target(self):
+        store, _ = mkstore()
+        r, _ = run(store, put_req("a1" * 16))
+        fid = r.result.outcome.readback.fact_id
+        r2, _ = run(store, put_req("a2" * 16, key="other"))
+        fid2 = r2.result.outcome.readback.fact_id
+        ctx = read_ctx(store)
+        w = read_cap(store, "d1" * 16, f.ReadMethod.GET, {"fid": fid})
+        # the setup minted for fid1 can NEVER read fid2
+        with self.assertRaises(cap.AuthError):
+            store.get(1, fid2, w, store._clock, ctx)
+
+
+class V47CursorRevisionAndRetention(unittest.TestCase):
+    """V47: live-revision movement invalidates \'facts\' cursors;
+    \'report_page\' cursors RETAINED against their bound revision until
+    erased."""
+
+    def test_live_revision_movement_invalidates_facts_cursor(self):
+        store, _ = mkstore()
+        for i in range(3):
+            run(store, put_req("%032x" % (0xA0 + i), key="k%d" % i))
+        ctx = read_ctx(store)
+        tgt = {"category": None, "cursor": None, "limit": 2,
+               "row_kind": f.RowKind.LIVE.value}
+        w = read_cap(store, "d1" * 16, f.ReadMethod.LIST_FACTS, tgt)
+        page = store.list_facts(1, f.RowKind.LIVE, None, None, 2, w,
+                                store._clock, ctx)
+        cursor = page.next_cursor
+        self.assertIsNotNone(cursor)
+        # the live revision MOVES: the bound cursor is invalidated
+        run(store, put_req("a9" * 16, key="mover"))
+        tgt2 = {"category": None, "cursor": cursor, "limit": 2,
+                "row_kind": f.RowKind.LIVE.value}
+        w2 = read_cap(store, "d2" * 16, f.ReadMethod.LIST_FACTS, tgt2)
+        with self.assertRaises(f.UnknownCursorError):
+            store.list_facts(1, f.RowKind.LIVE, None, cursor, 2, w2,
+                             store._clock, ctx)
+
+    def test_report_page_cursor_retained_until_erased(self):
+        store, _ = mkstore()
+        cid = store._cursor_mint(1, 1, f.QueryKind.REPORT_PAGE,
+                                 "ff" * 8, 0, f.RowKind.LIVE)
+        # live-revision movement does NOT invalidate it
+        run(store, put_req("a1" * 16))
+        row = store._cursor_open(1, 1, cid, f.QueryKind.REPORT_PAGE)
+        self.assertEqual(row["cursor_id"], cid)
+        # ...until ERASED (wipe clears the registry)
+        run(store, wipe_req("0a" * 16))
+        with self.assertRaises(f.UnknownCursorError):
+            store._cursor_open(1, 1, cid, f.QueryKind.REPORT_PAGE)
+
+    def test_malformed_cursor_is_structural_everywhere(self):
+        store, _ = mkstore()
+        run(store, put_req("a1" * 16))
+        ctx = read_ctx(store)
+        # even with REVOKED grants the STRUCTURAL malformed-cursor
+        # refusal wins (tier order: structural before revocation)
+        store._q.q("UPDATE fixture_snapshot SET"
+                   " grants_generation=grants_generation+1 WHERE uid=1",
+                   (), "exec")
+        tgt = {"category": None, "cursor": "zz", "limit": 2,
+               "row_kind": f.RowKind.LIVE.value}
+        w = read_cap(store, "d1" * 16, f.ReadMethod.LIST_FACTS, tgt)
+        with self.assertRaises(cap.ModelInputError):
+            store.list_facts(1, f.RowKind.LIVE, None, "zz", 2, w,
+                             store._clock, ctx)
+
+
+class V54FullPrecedence(unittest.TestCase):
+    """V54: the PR-3 tier order (structural -> sensitive -> expiry ->
+    revocation/staleness -> policy/scope/consent -> capacity) THEN
+    Phase B THEN Phase C (ERASED -> CAS -> CAPACITY)."""
+
+    def test_sensitive_beats_expiry(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store._q.q("UPDATE fixture_grants SET expires_at=%s WHERE uid=1",
+                   (T0 + 10,), "exec")
+        store._clock.advance(11)
+        orig = f._METHOD_SCOPES[req.method]
+        f._METHOD_SCOPES[req.method] = tuple(orig) + (
+            cap.Scope.MEMORY_SENSITIVE,)
+        try:
+            with self.assertRaises(Exception) as cm:
+                store.execute(1, req, c, l, p, ctx)
+            # the structural/sensitive tiers refuse BEFORE expiry: the
+            # model maps the MEMORY_SENSITIVE requirement structurally
+            # (MALFORMED_INPUT) or as TIER_DISABLED - NEVER ExpiredRefused
+            self.assertNotIsInstance(cm.exception, cap.ExpiredRefused)
+            self.assertIn(getattr(cm.exception, "code", None),
+                          (cap.ModelCode.MALFORMED_INPUT,
+                           cap.ModelCode.TIER_DISABLED))
+            self.assertEqual(store._store_revision(1), 0)  # nothing ran
+        finally:
+            f._METHOD_SCOPES[req.method] = orig
+
+    def test_expiry_beats_revocation(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store._q.q("UPDATE fixture_grants SET expires_at=%s WHERE uid=1",
+                   (T0 + 10,), "exec")
+        store._q.q("UPDATE fixture_snapshot SET"
+                   " grants_generation=grants_generation+1 WHERE uid=1",
+                   (), "exec")
+        store._clock.advance(11)
+        with self.assertRaises(cap.ExpiredRefused):
+            store.execute(1, req, c, l, p, ctx)
+
+    def test_revocation_beats_scope(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store._q.q("DELETE FROM fixture_grants WHERE uid=1 AND scope=%s",
+                   (cap.Scope.MEMORY_WRITE.value,), "exec")
+        store._q.q("UPDATE fixture_snapshot SET"
+                   " grants_generation=grants_generation+1 WHERE uid=1",
+                   (), "exec")
+        with self.assertRaises(cap.ConflictError) as cm:
+            store.execute(1, req, c, l, p, ctx)
+        self.assertIn("REVOKED", str(cm.exception))
+
+    def test_scope_beats_capacity(self):
+        store, conn = mkstore()
+        orig_cap = f.LIVE_FACT_CAP
+        f.LIVE_FACT_CAP = 1
+        try:
+            run(store, put_req("a1" * 16))
+            # drop the WRITE grant (no generation bump: scope-missing,
+            # NOT revocation) - the MISSING_SCOPE refusal beats CAPACITY
+            store._q.q("DELETE FROM fixture_grants WHERE uid=1 AND"
+                       " scope=%s", (cap.Scope.MEMORY_WRITE.value,), "exec")
+            with self.assertRaises(cap.ScopeRefused):
+                run(store, put_req("a2" * 16, key="second"))
+        finally:
+            f.LIVE_FACT_CAP = orig_cap
+
+    def test_cas_at_capacity_is_not_masked(self):
+        store, conn = mkstore()
+        orig_cap = f.LIVE_FACT_CAP
+        f.LIVE_FACT_CAP = 1
+        try:
+            r1, _ = run(store, put_req("a1" * 16))
+            fid = r1.result.outcome.readback.fact_id
+            # at capacity, the wrong-CAS supersede refuses CAS - the
+            # capacity refusal NEVER masks it
+            with self.assertRaises(f.FactConflict):
+                run(store, sup_req("e5" * 16, [fid], {fid: 999}))
+        finally:
+            f.LIVE_FACT_CAP = orig_cap
+
+
+class V55FullClaimBindingMapping(unittest.TestCase):
+    """V55: the FULL claim/binding mapping - issuer channel agreement,
+    current_issuer_valid False = STALE, the generations mapping."""
+
+    def test_issuer_channel_agreement_mapping(self):
+        # WEB = SessionRef (64-hex session token hash)
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        _, _, _, b = store.mint_mutation_fixtures(req)
+        proj = b.projection_dict()
+        issuer = proj["issuer"]
+        self.assertEqual(issuer["type"], "web_session")
+        self.assertEqual(len(issuer["session_token_hash"]), 64)
+        int(issuer["session_token_hash"], 16)
+        # TELEGRAM = TelegramIssuer bot/chat/update ids (the typed union)
+        tg = env.TelegramIssuer(bot_id=7, chat_id=8, update_id=9)
+        canon = f._issuer_canon(tg)
+        self.assertEqual(canon, {"bot_id": 7, "chat_id": 8,
+                                 "kind": "telegram", "update_id": 9})
+        back = f._typed_issuer_from_json(json.dumps(canon))
+        self.assertEqual(back, tg)
+
+    def test_current_issuer_valid_false_is_stale(self):
+        store, _ = mkstore()
+        r, _ = run(store, put_req("a1" * 16))
+        fid = r.result.outcome.readback.fact_id
+        ctx = read_ctx(store)
+        stale_ctx = dataclasses.replace(ctx, current_issuer_valid=False)
+        w = read_cap(store, "d1" * 16, f.ReadMethod.GET, {"fid": fid})
+        with self.assertRaises(cap.ConflictError) as cm:
+            store.get(1, fid, w, store._clock, stale_ctx)
+        self.assertIn("STALE", str(cm.exception))
+
+    def test_generations_mapping_complete(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        _, _, _, b = store.mint_mutation_fixtures(req)
+        proj = b.projection_dict()
+        for field in ("capture_epoch", "grant_generation",
+                      "policy_revision", "decision_revision",
+                      "consent_generation", "issuer", "uid", "lifetime",
+                      "operation_id", "content_fingerprint"):
+            self.assertIn(field, proj)
+        # the generations equal the OWNED fixture snapshot values
+        snap = store._q.q("SELECT * FROM fixture_snapshot WHERE uid=1",
+                          (), "one")
+        self.assertEqual(proj["capture_epoch"], snap["current_epoch"])
+        self.assertEqual(proj["grant_generation"],
+                         snap["grants_generation"])
+        self.assertEqual(proj["policy_revision"], snap["policy_revision"])
+
+
+class V34bBatchAccounting(unittest.TestCase):
+    """V34b: MIXED BATCH + MIXED NO-EVENT/REPLAYED-LATE/NEW-LATE +
+    DUPLICATE TOKENS IN ONE BATCH - batch sums DISTINCT per result and a
+    duplicated token counts ONCE."""
+
+    def test_mixed_batch_old_noevent_and_new_late(self):
+        store, _ = mkstore()
+        req, b, rid = blocked_op(store, op="aa" * 16)
+        old, _ = evidence(store, rid, req.operation_id, "d1" * 16)
+        self.assertEqual(old.kind, "blocked_inserted")
+        resolve_op(store, req, b)
+        new_late, _ = evidence(store, rid, req.operation_id, "d2" * 16)
+        self.assertEqual(new_late.kind, "inserted")
+        replay, _ = evidence(store, rid, req.operation_id, "d1" * 16)
+        self.assertEqual(replay.kind, "blocked_replay_no_event")
+        # new late rows mint, the old replays: 3 + 0, NEITHER recounted
+        self.assertEqual(new_late.contribution + replay.contribution, 3)
+        self.assertEqual(replay.stored_new_retained, 1)
+
+    def test_mixed_noevent_replayed_late_new_late(self):
+        store, _ = mkstore()
+        req, b, rid = blocked_op(store, op="aa" * 16)
+        evidence(store, rid, req.operation_id, "d1" * 16)
+        resolve_op(store, req, b)
+        late1, _ = evidence(store, rid, req.operation_id, "d2" * 16)
+        self.assertEqual(late1.kind, "inserted")
+        r_noevent, _ = evidence(store, rid, req.operation_id, "d1" * 16)
+        r_late, _ = evidence(store, rid, req.operation_id, "d2" * 16)
+        r_new, _ = evidence(store, rid, req.operation_id, "d3" * 16)
+        self.assertEqual(r_noevent.kind, "blocked_replay_no_event")
+        self.assertEqual(r_noevent.stored_new_retained, 1)
+        self.assertEqual(r_late.kind, "replayed")
+        self.assertEqual(r_late.stored_new_retained, 3)
+        self.assertEqual(r_new.kind, "inserted")
+        # batch contribution = 0 + 0 + 3 = 3
+        self.assertEqual(r_noevent.contribution + r_late.contribution
+                         + r_new.contribution, 3)
+
+    def test_duplicate_tokens_in_one_batch_count_once(self):
+        store, _ = mkstore()
+        req, b, rid = blocked_op(store, op="aa" * 16)
+        resolve_op(store, req, b)
+        # a duplicated NEW LATE token yields 3, NOT 6
+        first, _ = evidence(store, rid, req.operation_id, "d1" * 16)
+        dup, _ = evidence(store, rid, req.operation_id, "d1" * 16)
+        self.assertEqual((first.kind, dup.kind), ("inserted", "replayed"))
+        self.assertEqual(first.contribution + dup.contribution, 3)
+        # a duplicated NEW BLOCKED token yields 1, NOT 2
+        req2, b2, rid2 = blocked_op(store, op="bb" * 16)
+        f1, _ = evidence(store, rid2, req2.operation_id, "e1" * 16)
+        f2, _ = evidence(store, rid2, req2.operation_id, "e1" * 16)
+        self.assertEqual((f1.kind, f2.kind),
+                         ("blocked_inserted", "blocked_replay_no_event"))
+        self.assertEqual(f1.contribution + f2.contribution, 1)
+
+
+class V34bHarnessVectors(unittest.TestCase):
+    """The named ISSUER-HARNESS vectors (B9): LIVE ERASE, PENDING
+    RESTART, LOST RECEIVER ACK, LOST DELIVERED-STATE UPDATE, SAFE
+    PAYLOAD/STABLE TOKEN."""
+
+    def _rig(self, op="aa" * 16):
+        store, conn, path = mkstore_path()
+        req, b, rid = blocked_op(store, op=op)
+        bh = f.extended_binding_hash(b, req)
+        oconn = f.open_exclusive_db(path + ".outbox")
+        provider = f.ReceiverContextProvider(store, oconn, 1, 1,
+                                             "c3" * 16, store._clock)
+        harness = f.IssuerHarness(oconn, store._clock, store._snapshots,
+                                  provider)
+        proj = f.SafeEvidenceProjection(
+            recovery_id=rid, uid=1, lifetime_id=1,
+            operation_id=req.operation_id, commitment=bh,
+            kind=f.EvidenceKind.RECEIPT,
+            target=f.RecoveryBoundRef(recovery_id=rid,
+                                      source=f.EvidenceKind.RECEIPT),
+            source=f.EvidenceKind.RECEIPT,
+            accounting_scope=f.Lifetime(uid=1, lifetime_id=1))
+        return store, req, b, rid, provider, harness, proj, oconn
+
+    def test_safe_payload_stable_token(self):
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        row = oconn.execute(
+            "SELECT projection_json, recovery_id FROM outbox WHERE"
+            " token=?", (comp.token,)).fetchone()
+        # ref_json is projection output ONLY (no extra fields)
+        self.assertEqual(json.loads(row[0]), proj.to_dict())
+        self.assertEqual(row[1], rid)
+        # the token is STABLE across redeliveries
+        red = harness.redeliver_pending()
+        self.assertEqual(red["redelivered"], [comp.token])
+
+    def test_pending_restart_redelivers_same_token(self):
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        c1 = harness.compose({"projection": proj, "recovery_id": rid})
+        c2 = harness.compose({"projection": proj, "recovery_id": rid})
+        red = harness.redeliver_pending()
+        self.assertEqual(red["redelivered"], [c1.token, c2.token])
+        # after one delivery+ack, only the OTHER stays pending
+        d = provider.deliver({"projection": proj, "token": c1.token})
+        self.assertEqual(d["status"], "delivered")
+        ar = harness.ack(d["ack"])
+        self.assertEqual(ar.kind, "delivered")
+        red2 = harness.redeliver_pending()
+        self.assertEqual(red2["redelivered"], [c2.token])
+
+    def test_lost_receiver_ack_replays_without_double_count(self):
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        d = provider.deliver({"projection": proj, "token": comp.token})
+        self.assertEqual(d["status"], "delivered")
+        self.assertEqual(d["committed_result"].kind, "blocked_inserted")
+        # the ACK SIGNAL is lost: the issuer row STAYS pending
+        self.assertEqual(harness.outbox_state(comp.token), "pending")
+        # redelivery with the SAME token replays receiver-side: the
+        # receiver sees its OWN committed result, NO double-count
+        d2 = provider.deliver({"projection": proj, "token": comp.token})
+        self.assertEqual(d2["status"], "delivered")
+        self.assertEqual(d2["committed_result"].kind,
+                         "blocked_replay_no_event")
+        self.assertEqual(d2["committed_result"].contribution, 0)
+        n = store._q.q("SELECT count(*) AS n FROM evidence_entries", (),
+                       "one")["n"]
+        self.assertEqual(n, 1)
+
+    def test_lost_delivered_state_update(self):
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        d = provider.deliver({"projection": proj, "token": comp.token})
+        # the receiver ack COMMITTED but the outbox update\'s COMMIT
+        # CONFIRMATION is lost
+        ar = harness.ack(d["ack"], confirm=False)
+        self.assertEqual(ar.kind, "uncertain")
+        self.assertEqual(ar.uncertain,
+                         f.AckUncertain.LOST_COMMIT_CONFIRMATION)
+        # the durable reread under the SAME identity decides: pending =
+        # re-attempt (replays receiver-side, NO double-count)
+        self.assertEqual(harness.outbox_state(comp.token), "pending")
+        d2 = provider.deliver({"projection": proj, "token": comp.token})
+        self.assertEqual(d2["committed_result"].kind,
+                         "blocked_replay_no_event")
+        ar2 = harness.ack(d2["ack"])
+        self.assertEqual(ar2.kind, "delivered")
+        self.assertEqual(harness.outbox_state(comp.token), "delivered")
+        # UNREADABLE reread = typed uncertain, NO blind pending claim
+        provider._fault_io_unreadable = True
+        ar3 = harness.ack(d2["ack"])
+        self.assertEqual(ar3.kind, "uncertain")
+        self.assertEqual(ar3.uncertain, f.AckUncertain.IO_UNREADABLE)
+
+    def test_live_erase_hook_ordering_and_refusal(self):
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        calls = []
+
+        def hook():
+            # the volatile raw is destroyed BEFORE any completion record
+            calls.append(oconn.execute(
+                "SELECT count(*) FROM scrub_log").fetchone()[0])
+        out = harness.scrub(comp.token, hook)
+        self.assertEqual(out["scrubbed"], comp.token)
+        self.assertEqual(calls, [0])  # NO completion recorded at hook time
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 1)
+        # a hook FAILURE = the step REFUSAL: nothing recorded
+        comp2 = harness.compose({"projection": proj, "recovery_id": rid})
+
+        def bad_hook():
+            raise RuntimeError("volatile raw destruction failed")
+        with self.assertRaises(RuntimeError):
+            harness.scrub(comp2.token, bad_hook)
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log WHERE token=?",
+            (comp2.token,)).fetchone()[0], 0)
+        self.assertEqual(harness.outbox_state(comp2.token), "pending")
+
+    def test_forged_result_or_ref_never_delivered(self):
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        d = provider.deliver({"projection": proj, "token": comp.token})
+        self.assertEqual(d["status"], "delivered")
+        # a FORGED committed_result (the join FAILS) = REFUSED
+        forged = f.AckInput(
+            kind="ack", token=comp.token, projection=proj,
+            committed_result=f.InsertionEventResult(
+                kind="inserted", contribution=3,
+                event_id="insert:" + "0" * 32),
+            evidence_ref=f.EvidenceRef(kind="late",
+                                       event_id="insert:" + "0" * 32,
+                                       evidence_id="0" * 32))
+        ar = harness.ack(forged)
+        self.assertEqual(ar.kind, "still_pending")
+        self.assertEqual(ar.reason, f.AckRefusedReason.MISMATCHED_RESULT)
+        self.assertEqual(harness.outbox_state(comp.token), "pending")
+        # an INVENTED blocked EvidenceRef = REFUSED
+        forged2 = f.AckInput(
+            kind="ack", token=comp.token, projection=proj,
+            committed_result=d["committed_result"],
+            evidence_ref=f.EvidenceRef(kind="blocked", evidence_id="f" * 32))
+        ar2 = harness.ack(forged2)
+        self.assertEqual(ar2.kind, "still_pending")
+        self.assertEqual(harness.outbox_state(comp.token), "pending")
+        # the REAL payload = delivered
+        ar3 = harness.ack(d["ack"])
+        self.assertEqual(ar3.kind, "delivered")
+
+
+class NoneWrapperTypedRefusal(unittest.TestCase):
+    """B9: a None wrapper NEVER dereferences - typed refusal everywhere."""
+
+    def test_none_wrappers_refuse_typed(self):
+        store, _ = mkstore()
+        r, _ = run(store, put_req("a1" * 16))
+        fid = r.result.outcome.readback.fact_id
+        ctx = read_ctx(store)
+        with self.assertRaises((cap.ModelInputError, cap.AuthError)):
+            store.get(1, fid, None, store._clock, ctx)
+        with self.assertRaises((cap.ModelInputError, cap.AuthError)):
+            store.list_facts(1, f.RowKind.LIVE, None, None, 10, None,
+                             store._clock, ctx)
+        req = put_req("a2" * 16)
+        c, l, p, b, ctx2 = mint(store, req)
+        for cap_arg, claim_arg in ((None, l), (c, None)):
+            with self.assertRaises((cap.ModelInputError, cap.AuthError)):
+                store.execute(1, req, cap_arg, claim_arg, p, ctx2)
+
+
+class ExclusiveIsolationFixture(unittest.TestCase):
+    """The exclusive cross-instance isolation fixture: a second opener
+    refuses; an unmarked file connection refuses; close releases."""
+
+    def test_second_opener_refuses(self):
+        store, conn, path = mkstore_path()
+        try:
+            with self.assertRaises(cap.ModelInputError):
+                f.open_exclusive_db(path)
+        finally:
+            f.close_exclusive_db(conn)
+
+    def test_unmarked_file_connection_refused(self):
+        store, conn, path = mkstore_path()
+        f.close_exclusive_db(conn)
+        raw = sqlite3.connect(path)
+        try:
+            with self.assertRaises(cap.ModelInputError):
+                f.FactStore(raw, f.JsonTestClock(T0))
+        finally:
+            raw.close()
+
+    def test_close_releases_the_lock(self):
+        store, conn, path = mkstore_path()
+        f.close_exclusive_db(conn)
+        conn2 = f.open_exclusive_db(path)  # the released lock re-acquires
+        f.close_exclusive_db(conn2)
+
+    def test_memory_db_allowed(self):
+        conn = sqlite3.connect(":memory:")
+        store = f.FactStore(conn, f.JsonTestClock(T0))
+        store.setup_owner(1, 1, 1, scopes=ALL_SCOPES)
+        r, _ = run(store, put_req("a1" * 16))
+        self.assertEqual(r.kind, "executed")
+        conn.close()
 
 
 if __name__ == "__main__":
