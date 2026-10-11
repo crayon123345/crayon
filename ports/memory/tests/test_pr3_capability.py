@@ -1216,6 +1216,142 @@ class TestPrecedenceCollisions(unittest.TestCase):
             ev.mint_model(make_proof(), make_request())
 
 
+class TestPrivateGroupWriteRejected(unittest.TestCase):
+    """Residual r2-1: GROUP_WRITE requires a concrete GROUP source surface;
+    a PRIVATE identity has none and none may be inferred."""
+
+    def _request(self, action, audience):
+        scope = (cap.Scope.MEMORY_WRITE if action is cap.GroupAction.WRITE
+                 else cap.Scope.MEMORY_EXTRACT)
+        return make_request(
+            operation_class=cap.OperationClass.GROUP_WRITE,
+            required_scopes=frozenset({cap.Scope.MEMORY_GROUP_WRITE, scope}),
+            captured_epoch=7,
+            requested_audience_id=audience,
+            extraction_intent=(cap.ExtractionIntent.EXPLICIT
+                               if action is cap.GroupAction.EXTRACT
+                               else cap.ExtractionIntent.NOT_APPLICABLE),
+            group_action=action,
+            permitted_information_ref="ref-synthetic-g1")
+
+    def _snap(self):
+        policy = make_policy(
+            group_write=cap.GroupEligibility.DEFAULT_OFF_OPT_IN)
+        consent = make_consent(
+            operation_class=cap.OperationClass.GROUP_WRITE,
+            scopes=frozenset({cap.Scope.MEMORY_GROUP_WRITE,
+                              cap.Scope.MEMORY_WRITE,
+                              cap.Scope.MEMORY_EXTRACT}),
+            audience_id=None,
+            permitted_information_ref="ref-synthetic-g1")
+        return make_snapshot(
+            grants=(make_grant(cap.Scope.MEMORY_WRITE),
+                    make_grant(cap.Scope.MEMORY_EXTRACT),
+                    make_grant(cap.Scope.MEMORY_GROUP_WRITE)),
+            config=policy, decision_envelope=make_envelope(policy=policy),
+            consents=(consent,))
+
+    def test_private_group_write_refused_all_variants(self):
+        for action in (cap.GroupAction.WRITE, cap.GroupAction.EXTRACT):
+            for audience in (None, "group-synthetic-target"):
+                ev = make_eval(snapshot=self._snap())
+                with self.assertRaises(cap.ModelInputError,
+                                       msg=(action, audience)):
+                    ev.mint_model(make_proof(),  # PRIVATE identity
+                                  self._request(action, audience))
+
+
+class TestConsentStaging(unittest.TestCase):
+    """Residual r2-2: applicable-consent expiry/revocation are staged in
+    tiers 3/4, before absence; unrelated expired records never dominate."""
+
+    def _share_request(self, ref="ref-synthetic-1"):
+        return make_request(
+            operation_class=cap.OperationClass.SHARE,
+            required_scopes=frozenset({cap.Scope.DATA_SHARE}),
+            captured_epoch=None,
+            extraction_intent=cap.ExtractionIntent.NOT_APPLICABLE,
+            requested_audience_id="aud-synthetic-1",
+            permitted_information_ref=ref)
+
+    def _share_snap(self, consent=None, grants="default", consents=None,
+                    **snap_kw):
+        if grants == "default":
+            grants = (make_grant(cap.Scope.DATA_SHARE),)
+        if consents is None:
+            consents = () if consent is None else (consent,)
+        return make_snapshot(grants=grants, consents=consents, **snap_kw)
+
+    def _consent(self, **kw):
+        base = dict(
+            operation_class=cap.OperationClass.SHARE,
+            scopes=frozenset({cap.Scope.DATA_SHARE}),
+            audience_id="aud-synthetic-1",
+            permitted_information_ref="ref-synthetic-1",
+            issued_at=NOW - 10, expires_at=NOW + 600,
+            consent_generation=11)
+        base.update(kw)
+        return make_consent(**base)
+
+    def test_expired_consent_beats_lifetime_mismatch(self):
+        snap = self._share_snap(
+            consent=self._consent(expires_at=NOW - 1), lifetime_id=2)
+        ev = make_eval(snapshot=snap)
+        with self.assertRaises(cap.ExpiredRefused):
+            ev.mint_model(make_proof(), self._share_request())
+
+    def test_expired_consent_beats_stale_policy(self):
+        snap = self._share_snap(
+            consent=self._consent(expires_at=NOW - 1), policy_revision=9)
+        ev = make_eval(snapshot=snap)
+        with self.assertRaises(cap.ExpiredRefused):
+            ev.mint_model(make_proof(), self._share_request())
+
+    def test_expired_consent_beats_missing_scope(self):
+        snap = self._share_snap(
+            consent=self._consent(expires_at=NOW - 1), grants=())
+        ev = make_eval(snapshot=snap)
+        with self.assertRaises(cap.ExpiredRefused):
+            ev.mint_model(make_proof(), self._share_request())
+
+    def test_revoked_consent_beats_missing_scope(self):
+        snap = self._share_snap(
+            consent=self._consent(consent_generation=10), grants=())
+        ev = make_eval(snapshot=snap)
+        with self.assertRaises(cap.ConflictError) as ctx:
+            ev.mint_model(make_proof(), self._share_request())
+        self.assertIs(ctx.exception.code, cap.ModelCode.REVOKED)
+
+    def test_unrelated_expired_consent_does_not_dominate(self):
+        # wrong-ref expired record is not applicable: ABSENCE, not EXPIRED
+        snap = self._share_snap(
+            consent=self._consent(
+                permitted_information_ref="ref-synthetic-OTHER",
+                expires_at=NOW - 1))
+        ev = make_eval(snapshot=snap)
+        with self.assertRaises(cap.ConsentRefused) as ctx:
+            ev.mint_model(make_proof(), self._share_request())
+        self.assertIs(ctx.exception.code, cap.ModelCode.MISSING_CONSENT)
+
+    def test_not_yet_valid_consent_is_absence_not_expiry(self):
+        snap = self._share_snap(
+            consent=self._consent(issued_at=NOW + 100,
+                                  expires_at=NOW + 700))
+        ev = make_eval(snapshot=snap)
+        with self.assertRaises(cap.ConsentRefused) as ctx:
+            ev.mint_model(make_proof(), self._share_request())
+        self.assertIs(ctx.exception.code, cap.ModelCode.MISSING_CONSENT)
+
+    def test_second_valid_consent_rescues_expired_sibling(self):
+        # an applicable live candidate beside an expired one: no EXPIRED
+        expired = self._consent(expires_at=NOW - 1)
+        live = self._consent()
+        snap = self._share_snap(consent=None, consents=(expired, live))
+        ev = make_eval(snapshot=snap)
+        capability = ev.mint_model(make_proof(), self._share_request())
+        self.assertIs(capability.status, cap.ModelStatus.MODEL_ONLY)
+
+
 class TestSqliteStore(unittest.TestCase):
     def setUp(self):
         self.path = os.path.join(

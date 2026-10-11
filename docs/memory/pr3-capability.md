@@ -195,12 +195,16 @@ C. GROUP (never below default_off_opt_in; eligibility is not consent):
      says NEVER, however favorable the grants/consent (peer first-pass
      item 1, 2026-10-11). Under DEFAULT_OFF_OPT_IN the bound consent is
      still required.
-   - GROUP SOURCE BINDING: group-source writes/extracts and the
-     GROUP_WRITE class bind request AND consent (via exact consent
-     matching) to the identity's concrete source group ID; a None or
-     mismatched audience refuses MALFORMED. Group DISCLOSURE may name
-     a distinct destination audience, explicitly bound by the SHARE
-     request + consent, never inferred (peer first-pass item 2).
+   - GROUP SOURCE BINDING: the GROUP_WRITE class requires a GROUP
+     surface outright - a private identity has no group source and none
+     may be inferred (a separate private-entry group-target action
+     would need explicit reviewed target/audience semantics). On a
+     GROUP surface, group-source writes/extracts and GROUP_WRITE bind
+     request AND consent (via exact consent matching) to the identity's
+     concrete source group ID; a None or mismatched audience refuses
+     MALFORMED. Group DISCLOSURE may name a distinct destination
+     audience, explicitly bound by the SHARE request + consent, never
+     inferred (peer first-pass item 2 + residual r2-1).
    - The GROUP_WRITE class additionally requires eligibility: NEVER (in
      config OR envelope policy) refuses POLICY_REFUSED. Ours: NEVER
      (decision 2A).
@@ -218,22 +222,32 @@ mint_model and recheck_model run the SAME staged pipeline
 only in mint, before the store read. Production stubs refuse first,
 unconditionally. Stages:
 
-1. malformed input/snapshot (MALFORMED_INPUT: cross-owner snapshot,
-   envelope owner/window shape, derived-scope mismatch, group binding,
-   future-issued capability; never a successful decision)
+1. structural binding (MALFORMED_INPUT: cross-owner snapshot,
+   envelope owner/window shape, derived-scope mismatch, GROUP_WRITE
+   off the GROUP surface, group audience binding, future-issued
+   capability; never a successful decision)
 2. sensitive anywhere (TIER_DISABLED)
-3. expiry (EXPIRED: capability, envelope, required grants)
+3. expiry (EXPIRED: capability, envelope, required grants, APPLICABLE
+   consent candidates)
 4. revoked / stale / epoch / request drift - deterministic inner order:
    lifetime binding (REVOKED, no resurrection claim), envelope revision
    (STALE_POLICY), grants generation (REVOKED), policy revision
    (STALE_POLICY), decision revision (STALE_POLICY), consent
    generation (REVOKED), full request equality (REQUEST_DRIFT), epoch
-   (EPOCH)
-5. missing scope / consent or policy refusal (MISSING_SCOPE,
-   MISSING_CONSENT, POLICY_REFUSED). Within a single consent lookup the
-   deterministic inner order is: expired match (EXPIRED) before stale
-   generation (REVOKED) before missing (MISSING_CONSENT).
+   (EPOCH), applicable-consent revocation (REVOKED)
+5. absence (POLICY_REFUSED: missing envelope/config, extraction/group/
+   origin policy; MISSING_SCOPE: grant absence; MISSING_CONSENT:
+   consent absence)
 6. capacity (stage retained, UNTRIGGERED - see below)
+
+APPLICABLE consent = structurally bound to the request: exact owner,
+operation id/class, scope, audience, information ref. Expiry and
+revocation evaluate ONLY applicable candidates; evidence bound to a
+wrong operation/ref/audience is ABSENCE (MISSING_CONSENT), never
+EXPIRED/REVOKED - unrelated expired records do not dominate. A
+not-yet-valid candidate is absence, not expiry. A live applicable
+candidate beside an expired sibling rescues the operation (residual
+r2-2).
 
 Collision behavior is covered by dedicated collision tests (sensitive
 vs revoked, malformed vs sensitive, sensitive vs expiry, expiry vs
@@ -306,7 +320,11 @@ NO production reuse claim exists.
   typed, no raw TypeError; public errors ignore arbitrary prose across
   every error class.
 - precedence collisions: 10 collision probes through the shared
-  pipeline.
+  pipeline PLUS consent-staging collisions (expired consent vs
+  lifetime/stale/missing-scope, revoked consent vs missing-scope,
+  unrelated expired records, not-yet-valid absence, live sibling
+  rescue) and PRIVATE-surface GROUP_WRITE rejection (both underlying
+  actions, None and target audiences).
 - CapRefused resulting_count validation (bool/negative/str rejected).
 - immutability (frozen instances, frozenset scopes); error no-echo.
 - sqlite design store: roundtrip + evaluator integration; absent

@@ -708,20 +708,29 @@ class ModelOnlyEvaluator:
                   request: Request, now: int,
                   prior: Optional[Capability]) -> Tuple[FrozenSet[Scope], int]:
         """ONE shared deterministic staging pipeline for mint AND recheck
-        (contract sec 7, peer residual item 6):
-          1 auth/shape      (MISSING_IDENTITY in mint; MALFORMED_INPUT here)
-          2 sensitive       (TIER_DISABLED)
-          3 expiry          (EXPIRED)
-          4 revoked/stale/epoch/drift
-                            (REVOKED / STALE_POLICY / EPOCH / REQUEST_DRIFT)
-          5 missing scope/consent/policy
-                            (MISSING_SCOPE / MISSING_CONSENT / POLICY_REFUSED)
-          6 capacity        (stage retained; UNTRIGGERED - OPEN fixture shape)
-        Within tier 4 the deterministic order is: lifetime binding, envelope
-        revision, grants generation, policy revision, decision revision,
-        consent generation, request drift, epoch.
+        (contract sec 7; peer residual r2):
+          1 structural binding  (MALFORMED_INPUT)
+          2 sensitive         (TIER_DISABLED)
+          3 expiry            (EXPIRED: capability / envelope / required
+                               grants / APPLICABLE consent candidates)
+          4 revocation/staleness/drift
+                              (REVOKED / STALE_POLICY / EPOCH /
+                               REQUEST_DRIFT, incl. applicable-consent
+                               revocation)
+          5 absence           (POLICY_REFUSED / MISSING_SCOPE /
+                               MISSING_CONSENT: eligibility, grant
+                               absence, consent absence)
+          6 capacity          (stage retained; UNTRIGGERED - OPEN)
+        "Applicable" consent = STRUCTURALLY BOUND to the request: exact
+        owner, operation id/class, scope, audience, and information ref.
+        Unrelated expired records never dominate: evidence bound to a
+        wrong operation/ref/audience is ABSENCE (MISSING_CONSENT), not
+        expiry or revocation. Within tier 4 the deterministic order is:
+        lifetime binding, envelope revision, grants generation, policy
+        revision, decision revision, consent generation, request drift,
+        epoch, applicable-consent revocation.
         """
-        # ---- tier 1: malformed input/snapshot ----
+        # ---- tier 1: structural binding (malformed input/snapshot) ----
         if not isinstance(snapshot, Snapshot):
             raise ModelInputError()
         if snapshot.owner_uid != identity.owner_uid:
@@ -732,6 +741,13 @@ class ModelOnlyEvaluator:
         derived = derive_required_scopes(request, identity)
         if request.required_scopes != derived:
             raise ModelInputError()  # caller omission/widening rejected
+        if (request.operation_class is OperationClass.GROUP_WRITE
+                and identity.surface is not Surface.GROUP):
+            # GROUP_WRITE names a group-SOURCE operation: it requires a
+            # concrete group source. A private identity has none and none
+            # may be inferred; a separate private-entry group-target action
+            # would need explicit reviewed target/audience semantics.
+            raise ModelInputError()
         # group source binding: group-source writes/extracts (and the
         # GROUP_WRITE class) must bind the request - and through consent
         # matching the consent too - to the identity's CONCRETE source
@@ -746,12 +762,51 @@ class ModelOnlyEvaluator:
             if (request.requested_audience_id is None
                     or request.requested_audience_id != identity.audience_id):
                 raise ModelInputError()
+        if (Scope.MEMORY_GROUP_WRITE in derived
+                and request.permitted_information_ref is None):
+            # group-source consent requires the information ref (never
+            # inferred)
+            raise ModelInputError()
         envelope = snapshot.decision_envelope
         if envelope is not None:
             if envelope.owner_uid != identity.owner_uid:
                 raise ModelInputError()
             if now < envelope.issued_at:
                 raise ModelInputError()  # not-yet-valid window
+
+        # precomputation (NO refusals here): active grant per scope,
+        # consent-required scopes, applicable (structurally bound) consent
+        # candidates per required scope.
+        active_grants = {}
+        for scope in derived:
+            grant = next(
+                (g for g in snapshot.grants
+                 if g.scope is scope and g.is_active(now)),
+                None,
+            )
+            if grant is not None:
+                active_grants[scope] = grant
+        consent_required = set()
+        if Scope.DATA_SHARE in derived:
+            consent_required.add(Scope.DATA_SHARE)
+        if Scope.MEMORY_GROUP_WRITE in derived:
+            consent_required.add(Scope.MEMORY_GROUP_WRITE)
+        for scope, grant in active_grants.items():
+            if grant.per_op_required:
+                consent_required.add(scope)
+        applicable = {
+            scope: [
+                c for c in snapshot.consents
+                if c.owner_uid == identity.owner_uid
+                and c.operation_id == request.operation_id
+                and c.operation_class is request.operation_class
+                and scope in c.scopes
+                and c.audience_id == request.requested_audience_id
+                and c.permitted_information_ref
+                == request.permitted_information_ref
+            ]
+            for scope in consent_required
+        }
 
         # ---- tier 2: sensitive ----
         if (request.sensitive
@@ -769,8 +824,14 @@ class ModelOnlyEvaluator:
             matching = [g for g in snapshot.grants if g.scope is scope]
             if matching and all(g.is_expired(now) for g in matching):
                 raise ExpiredRefused()
+        # applicable-consent expiry: a not-yet-valid candidate is ABSENCE,
+        # not expiry; only candidates already in their window count
+        for scope in sorted(consent_required, key=lambda s: s.value):
+            windowed = [c for c in applicable[scope] if c.issued_at <= now]
+            if windowed and all(c.expires_at <= now for c in windowed):
+                raise ExpiredRefused()
 
-        # ---- tier 4: revoked / stale / epoch / drift ----
+        # ---- tier 4: revocation / staleness / epoch / drift ----
         if snapshot.lifetime_id != identity.lifetime_id:
             # lifetime binding mismatch: refuse without any resurrection claim
             raise ConflictError(ModelCode.REVOKED)
@@ -798,8 +859,16 @@ class ModelOnlyEvaluator:
                 raise ConflictError(ModelCode.EPOCH)
         elif request.captured_epoch != snapshot.current_epoch:
             raise ConflictError(ModelCode.EPOCH)
+        # applicable-consent revocation: a live-window candidate whose
+        # generation is not current is revoked evidence
+        for scope in sorted(consent_required, key=lambda s: s.value):
+            live = [c for c in applicable[scope]
+                    if c.issued_at <= now < c.expires_at]
+            if live and all(c.consent_generation
+                            != snapshot.consent_generation for c in live):
+                raise ConflictError(ModelCode.REVOKED)
 
-        # ---- tier 5: policy / scope / consent ----
+        # ---- tier 5: policy / scope / consent ABSENCE ----
         # missing envelope/config creates no consent: safest refusal
         if envelope is None or snapshot.config is None:
             raise PolicyRefused()
@@ -818,7 +887,7 @@ class ModelOnlyEvaluator:
         # group-SOURCE private write/extract (either underlying action),
         # regardless of which operation class names it, however favorable
         # the grants/consent. Under DEFAULT_OFF_OPT_IN a group-source write
-        # still needs its bound per-op consent (consent stage below).
+        # still needs its bound per-op consent (absence stage below).
         group_source = (
             identity.surface is Surface.GROUP
             and request.operation_class in (
@@ -838,38 +907,25 @@ class ModelOnlyEvaluator:
         if group_source and identity.origin in _AMBIGUOUS_ORIGINS:
             raise PolicyRefused()
 
-        # scope stage: active grant required for every derived scope
-        active_grants = []
+        # scope ABSENCE: an active grant is required for every derived scope
         for scope in derived:
-            grant = next(
-                (g for g in snapshot.grants
-                 if g.scope is scope and g.is_active(now)),
-                None,
-            )
-            if grant is None:
+            if scope not in active_grants:
                 raise ScopeRefused()
-            active_grants.append(grant)
 
-        # consent stage: data.share and memory.group_write ALWAYS need a
+        # consent ABSENCE: data.share and memory.group_write ALWAYS need a
         # bound per-operation consent; a standing grant alone never suffices;
-        # per_op_required grants additionally need consent for their scope.
-        # Group-source consent requires the information ref (never inferred).
-        consent_required = set()
-        if Scope.DATA_SHARE in derived:
-            consent_required.add(Scope.DATA_SHARE)
-        if Scope.MEMORY_GROUP_WRITE in derived:
-            consent_required.add(Scope.MEMORY_GROUP_WRITE)
-            if request.permitted_information_ref is None:
-                raise ModelInputError()
-        for grant in active_grants:
-            if grant.per_op_required:
-                consent_required.add(grant.scope)
-
+        # per_op_required grants additionally need consent for their scope
         matched_consents = []
         for scope in sorted(consent_required, key=lambda s: s.value):
-            matched_consents.append(
-                self._require_consent(snapshot, identity, request, scope, now)
+            matched = next(
+                (c for c in applicable[scope]
+                 if c.issued_at <= now < c.expires_at
+                 and c.consent_generation == snapshot.consent_generation),
+                None,
             )
+            if matched is None:
+                raise ConsentRefused()  # missing consent creates no consent
+            matched_consents.append(matched)
 
         # ---- tier 6: capacity - retained, UNTRIGGERED (OPEN fixture shape;
         # no count/limit source in the agreed shapes, no permissive default)
@@ -881,7 +937,7 @@ class ModelOnlyEvaluator:
         if self._ttl > BIGINT_MAX - now:
             raise ModelInputError()
         expiry = now + self._ttl
-        for grant in active_grants:
+        for grant in active_grants.values():
             if grant.expires_at is not None:
                 expiry = min(expiry, grant.expires_at)
         if envelope.expires_at is not None:
@@ -891,39 +947,6 @@ class ModelOnlyEvaluator:
         if expiry <= now:
             raise ExpiredRefused()
         return derived, expiry
-
-    def _require_consent(self, snapshot: Snapshot, identity: Identity,
-                         request: Request, scope: Scope,
-                         now: int) -> OperationConsent:
-        candidates = [
-            c for c in snapshot.consents
-            if c.owner_uid == identity.owner_uid
-            and c.operation_id == request.operation_id
-            and c.operation_class is request.operation_class
-            and scope in c.scopes
-            and c.audience_id == request.requested_audience_id
-            and c.permitted_information_ref
-            == request.permitted_information_ref
-        ]
-        if not candidates:
-            raise ConsentRefused()  # missing consent creates no consent
-        saw_expired = False
-        saw_revoked = False
-        for consent in candidates:
-            if now < consent.issued_at:
-                continue  # not yet valid: treated as missing
-            if now >= consent.expires_at:
-                saw_expired = True
-                continue
-            if consent.consent_generation != snapshot.consent_generation:
-                saw_revoked = True  # consent evidence is not current
-                continue
-            return consent
-        if saw_expired:
-            raise ExpiredRefused()  # expiry precedes revocation
-        if saw_revoked:
-            raise ConflictError(ModelCode.REVOKED)
-        raise ConsentRefused()
 
 
 # ---------------------------------------------------------------------------
