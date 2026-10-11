@@ -79,7 +79,7 @@ class Exploding:
 
 def make_identity(**kw):
     base = dict(
-        owner_uid=UID, channel=cap.Channel.WHATSAPP,
+        owner_uid=UID, channel=cap.Channel.WEB,
         surface=cap.Surface.PRIVATE, issuer_id="synthetic-issuer",
         session_binding="synthetic-session", audience_id=None,
         lifetime_id=1, origin=cap.Origin.DIRECT,
@@ -314,6 +314,18 @@ class TestSensitive(unittest.TestCase):
         ev = make_eval(snapshot=snap)
         with self.assertRaises(cap.SensitiveRefused):
             ev.mint_model(make_proof(), make_request(
+                operation_class=cap.OperationClass.SENSITIVE,
+                required_scopes=frozenset({cap.Scope.MEMORY_SENSITIVE}),
+                captured_epoch=None,
+                extraction_intent=cap.ExtractionIntent.NOT_APPLICABLE))
+
+    def test_sensitive_scope_with_mismatched_class_is_malformed(self):
+        # shared pipeline tier 1 (malformed) precedes tier 2 (sensitive):
+        # memory.sensitive in required_scopes with a non-SENSITIVE class
+        # fails derived-scope matching first - deterministic, documented
+        ev = make_eval()
+        with self.assertRaises(cap.ModelInputError):
+            ev.mint_model(make_proof(), make_request(
                 required_scopes=frozenset({cap.Scope.MEMORY_EXTRACT,
                                            cap.Scope.MEMORY_SENSITIVE})))
 
@@ -545,7 +557,8 @@ class TestExtractionAxis(unittest.TestCase):
 
 class TestGroupAxis(unittest.TestCase):
     def group_identity(self, origin=cap.Origin.DIRECT):
-        return make_identity(surface=cap.Surface.GROUP, origin=origin)
+        return make_identity(surface=cap.Surface.GROUP, origin=origin,
+                             audience_id="group-synthetic-1")
 
     def group_write_request(self, action=cap.GroupAction.WRITE):
         scopes = {cap.Scope.MEMORY_GROUP_WRITE}
@@ -554,6 +567,7 @@ class TestGroupAxis(unittest.TestCase):
         return make_request(
             operation_class=cap.OperationClass.GROUP_WRITE,
             required_scopes=frozenset(scopes),
+            requested_audience_id="group-synthetic-1",
             extraction_intent=(cap.ExtractionIntent.EXPLICIT
                                if action is cap.GroupAction.EXTRACT
                                else cap.ExtractionIntent.NOT_APPLICABLE),
@@ -564,6 +578,7 @@ class TestGroupAxis(unittest.TestCase):
         return make_request(
             required_scopes=frozenset({cap.Scope.MEMORY_WRITE,
                                        cap.Scope.MEMORY_GROUP_WRITE}),
+            requested_audience_id="group-synthetic-1",
             extraction_intent=cap.ExtractionIntent.NOT_APPLICABLE,
             operation_class=cap.OperationClass.WRITE,
             permitted_information_ref="ref-synthetic-g1")
@@ -577,7 +592,7 @@ class TestGroupAxis(unittest.TestCase):
                                         cap.Scope.MEMORY_WRITE})
         consent = make_consent(
             operation_class=consent_class, scopes=consent_scopes,
-            audience_id=None,
+            audience_id="group-synthetic-1",
             permitted_information_ref="ref-synthetic-g1")
         return make_snapshot(
             grants=(make_grant(cap.Scope.MEMORY_WRITE),
@@ -643,11 +658,40 @@ class TestGroupAxis(unittest.TestCase):
             ev.mint_model(make_proof(self.group_identity()),
                           self.group_source_request())
 
-    def test_eligibility_never_does_not_refuse_group_source(self):
-        # per addendum 3/4: eligibility never refuses group-source writes;
-        # bound consent still required (present here)
+    def test_eligibility_never_refuses_group_source_config(self):
+        # peer clarification on addendum 3/4: NEVER is the owner's hard NO
+        # surface-wide - a group-source write refuses regardless of which
+        # operation class names it
         snap = self.group_snapshot(
             eligibility=cap.GroupEligibility.NEVER,
+            consent_class=cap.OperationClass.WRITE)
+        ev = make_eval(identity=self.group_identity(), snapshot=snap)
+        with self.assertRaises(cap.PolicyRefused):
+            ev.mint_model(make_proof(self.group_identity()),
+                          self.group_source_request())
+
+    def test_eligibility_never_refuses_group_source_envelope(self):
+        policy = make_policy(group_write=cap.GroupEligibility.DEFAULT_OFF_OPT_IN)
+        env_policy = make_policy(group_write=cap.GroupEligibility.NEVER)
+        consent = make_consent(
+            operation_class=cap.OperationClass.WRITE,
+            scopes=frozenset({cap.Scope.MEMORY_GROUP_WRITE,
+                              cap.Scope.MEMORY_WRITE}),
+            audience_id="group-synthetic-1",
+            permitted_information_ref="ref-synthetic-g1")
+        snap = make_snapshot(
+            grants=(make_grant(cap.Scope.MEMORY_WRITE),
+                    make_grant(cap.Scope.MEMORY_GROUP_WRITE)),
+            config=policy, decision_envelope=make_envelope(policy=env_policy),
+            consents=(consent,))
+        ev = make_eval(identity=self.group_identity(), snapshot=snap)
+        with self.assertRaises(cap.PolicyRefused):
+            ev.mint_model(make_proof(self.group_identity()),
+                          self.group_source_request())
+
+    def test_group_source_allowed_under_default_off_opt_in(self):
+        snap = self.group_snapshot(
+            eligibility=cap.GroupEligibility.DEFAULT_OFF_OPT_IN,
             consent_class=cap.OperationClass.WRITE)
         ev = make_eval(identity=self.group_identity(), snapshot=snap)
         capability = ev.mint_model(make_proof(self.group_identity()),
@@ -729,7 +773,7 @@ class TestRecheck(unittest.TestCase):
                 ("permitted_information_ref", "ref-synthetic-9"),
                 ("extraction_intent", cap.ExtractionIntent.AUTOMATIC),
                 ("captured_epoch", 7),  # placeholder replaced below
-                ("sensitive", True)):
+        ):
             if field == "captured_epoch":
                 continue  # epoch drift has its own assertion below
             ev, capability = mint_ok()
@@ -746,13 +790,13 @@ class TestRecheck(unittest.TestCase):
             self.assertIs(ctx.exception.code, cap.ModelCode.REQUEST_DRIFT)
 
     def test_recheck_sensitive_drift(self):
-        # a drifted sensitive=True request is constructible but never equals
-        # the minted request; drift detection catches it BEFORE the sensitive
-        # check would apply (precedence: drift tier evaluated on recheck)
+        # shared staging pipeline: tier 2 (sensitive) precedes tier 4
+        # (drift), so a drifted sensitive=True request refuses TIER_DISABLED
+        # deterministically - never a successful decision
         ev, capability = mint_ok()
-        with self.assertRaises(cap.ConflictError) as ctx:
+        with self.assertRaises(cap.SensitiveRefused) as ctx:
             ev.recheck_model(capability, make_request(sensitive=True))
-        self.assertIs(ctx.exception.code, cap.ModelCode.REQUEST_DRIFT)
+        self.assertIs(ctx.exception.code, cap.ModelCode.TIER_DISABLED)
 
     def test_recheck_generation_drifts(self):
         cases = (
@@ -853,6 +897,323 @@ class TestImmutabilityAndNoEcho(unittest.TestCase):
             text = str(exc)
             for secret in secrets:
                 self.assertNotIn(secret, text)
+
+
+class TestGroupNeverVariants(unittest.TestCase):
+    """Item 1: NEVER refuses ALL group-source memory writes/extraction -
+    GROUP_WRITE with either underlying action AND Surface.GROUP WRITE/EXTRACT,
+    config OR envelope NEVER, even with favorable grants/consent."""
+
+    def _snap(self, config_elig, envelope_elig, consent_class, consent_scopes):
+        config_policy = make_policy(group_write=config_elig)
+        envelope_policy = make_policy(group_write=envelope_elig)
+        consent = make_consent(
+            operation_class=consent_class, scopes=consent_scopes,
+            audience_id="group-synthetic-1",
+            permitted_information_ref="ref-synthetic-g1")
+        return make_snapshot(
+            grants=(make_grant(cap.Scope.MEMORY_WRITE),
+                    make_grant(cap.Scope.MEMORY_EXTRACT),
+                    make_grant(cap.Scope.MEMORY_GROUP_WRITE)),
+            config=config_policy,
+            decision_envelope=make_envelope(policy=envelope_policy),
+            consents=(consent,))
+
+    N = cap.GroupEligibility.NEVER
+    O = cap.GroupEligibility.DEFAULT_OFF_OPT_IN
+    GW = frozenset({cap.Scope.MEMORY_GROUP_WRITE, cap.Scope.MEMORY_WRITE})
+    GX = frozenset({cap.Scope.MEMORY_GROUP_WRITE, cap.Scope.MEMORY_EXTRACT})
+
+    def _attempt(self, snap, request):
+        ident = TestGroupAxis().group_identity()
+        ev = make_eval(identity=ident, snapshot=snap)
+        return ev.mint_model(make_proof(ident), request)
+
+    def _gw_request(self, action):
+        return TestGroupAxis().group_write_request(action)
+
+    def _gs_request(self, underlying):
+        scope = (cap.Scope.MEMORY_WRITE if underlying == "write"
+                 else cap.Scope.MEMORY_EXTRACT)
+        return make_request(
+            operation_class=(cap.OperationClass.WRITE
+                             if underlying == "write"
+                             else cap.OperationClass.EXTRACT),
+            required_scopes=frozenset({scope, cap.Scope.MEMORY_GROUP_WRITE}),
+            requested_audience_id="group-synthetic-1",
+            extraction_intent=(cap.ExtractionIntent.NOT_APPLICABLE
+                               if underlying == "write"
+                               else cap.ExtractionIntent.EXPLICIT),
+            permitted_information_ref="ref-synthetic-g1")
+
+    def test_never_refuses_every_group_variant(self):
+        variants = []
+        for elig_side in ("config", "envelope", "both"):
+            cfg = self.N if elig_side in ("config", "both") else self.O
+            env = self.N if elig_side in ("envelope", "both") else self.O
+            variants.append((elig_side + "/group_write-write", cfg, env,
+                             cap.OperationClass.GROUP_WRITE, self.GW,
+                             self._gw_request(cap.GroupAction.WRITE)))
+            variants.append((elig_side + "/group_write-extract", cfg, env,
+                             cap.OperationClass.GROUP_WRITE, self.GX,
+                             self._gw_request(cap.GroupAction.EXTRACT)))
+            variants.append((elig_side + "/group-source-write", cfg, env,
+                             cap.OperationClass.WRITE, self.GW,
+                             self._gs_request("write")))
+            variants.append((elig_side + "/group-source-extract", cfg, env,
+                             cap.OperationClass.EXTRACT, self.GX,
+                             self._gs_request("extract")))
+        self.assertEqual(len(variants), 12)
+        for name, cfg, env, consent_class, consent_scopes, request in variants:
+            snap = self._snap(cfg, env, consent_class, consent_scopes)
+            with self.assertRaises(cap.PolicyRefused, msg=name):
+                self._attempt(snap, request)
+
+    def test_opt_in_allows_every_group_variant_with_consent(self):
+        variants = (
+            (cap.OperationClass.GROUP_WRITE, self.GW,
+             self._gw_request(cap.GroupAction.WRITE)),
+            (cap.OperationClass.GROUP_WRITE, self.GX,
+             self._gw_request(cap.GroupAction.EXTRACT)),
+            (cap.OperationClass.WRITE, self.GW, self._gs_request("write")),
+            (cap.OperationClass.EXTRACT, self.GX, self._gs_request("extract")),
+        )
+        names = ("gw-write", "gw-extract", "gs-write", "gs-extract")
+        for name, (consent_class, consent_scopes, request) in zip(
+                names, variants):
+            snap = self._snap(self.O, self.O, consent_class, consent_scopes)
+            capability = self._attempt(snap, request)
+            self.assertIs(capability.status, cap.ModelStatus.MODEL_ONLY,
+                          msg=name)
+
+
+class TestGroupAudienceBinding(unittest.TestCase):
+    """Item 2: group operations bind to the identity's concrete source
+    group; None/mismatch refuses; disclosure destination may be distinct
+    but is explicitly bound, never inferred."""
+
+    def _group_identity(self, **kw):
+        base = dict(surface=cap.Surface.GROUP,
+                    audience_id="group-synthetic-1")
+        base.update(kw)
+        return make_identity(**base)
+
+    def _group_snap(self):
+        return TestGroupAxis().group_snapshot(
+            consent_class=cap.OperationClass.WRITE)
+
+    def _request(self, audience):
+        req = TestGroupAxis().group_source_request()
+        return make_request(
+            operation_class=req.operation_class,
+            required_scopes=req.required_scopes,
+            requested_audience_id=audience,
+            captured_epoch=req.captured_epoch,
+            extraction_intent=req.extraction_intent,
+            permitted_information_ref="ref-synthetic-g1")
+
+    def test_group_surface_identity_requires_source_id(self):
+        with self.assertRaises(cap.AuthError):
+            make_identity(surface=cap.Surface.GROUP, audience_id=None)
+
+    def test_group_write_none_audience_refused(self):
+        ident = self._group_identity()
+        ev = make_eval(identity=ident, snapshot=self._group_snap())
+        with self.assertRaises(cap.ModelInputError):
+            ev.mint_model(make_proof(ident), self._request(None))
+
+    def test_group_write_mismatched_audience_refused(self):
+        ident = self._group_identity()  # group-synthetic-1
+        ev = make_eval(identity=ident, snapshot=self._group_snap())
+        with self.assertRaises(cap.ModelInputError):
+            ev.mint_model(make_proof(ident),
+                          self._request("group-synthetic-OTHER"))
+
+    def test_group_write_bound_audience_allowed(self):
+        ident = self._group_identity()
+        ev = make_eval(identity=ident, snapshot=self._group_snap())
+        capability = ev.mint_model(make_proof(ident),
+                                   self._request("group-synthetic-1"))
+        self.assertIs(capability.status, cap.ModelStatus.MODEL_ONLY)
+
+    def test_group_disclosure_distinct_destination_allowed(self):
+        # SHARE from a group source names a distinct, explicitly bound
+        # destination audience; the consent binds to that destination
+        ident = self._group_identity()
+        snap = make_snapshot(
+            grants=(make_grant(cap.Scope.DATA_SHARE),),
+            consents=(make_consent(
+                operation_class=cap.OperationClass.SHARE,
+                scopes=frozenset({cap.Scope.DATA_SHARE}),
+                audience_id="aud-synthetic-dest",
+                permitted_information_ref="ref-synthetic-1"),))
+        ev = make_eval(identity=ident, snapshot=snap)
+        request = make_request(
+            operation_class=cap.OperationClass.SHARE,
+            required_scopes=frozenset({cap.Scope.DATA_SHARE}),
+            captured_epoch=None,
+            extraction_intent=cap.ExtractionIntent.NOT_APPLICABLE,
+            requested_audience_id="aud-synthetic-dest",
+            permitted_information_ref="ref-synthetic-1")
+        capability = ev.mint_model(make_proof(ident), request)
+        self.assertIs(capability.status, cap.ModelStatus.MODEL_ONLY)
+
+
+class TestClockAndTtlGuards(unittest.TestCase):
+    """Item 3: future-issued caps refused; exact signed BIGINT clock/TTL;
+    typed expiry-addition overflow refuses before construction."""
+
+    def test_future_issued_capability_refused(self):
+        ev, capability = mint_ok()
+        ev._clock = FakeClock(NOW - 1)  # now < cap.issued_at
+        with self.assertRaises(cap.ModelInputError):
+            ev.recheck_model(capability, make_request())
+
+    def test_invalid_ttl_values(self):
+        for bad in (0, -1, True, 1.5, "300", cap.BIGINT_MAX + 1):
+            with self.assertRaises(cap.ModelInputError, msg=repr(bad)):
+                cap.ModelOnlyEvaluator(FakeVerifier(make_identity()),
+                                       FakeStore(make_snapshot()),
+                                       FakeClock(NOW), bad)
+
+    def test_invalid_clock_values(self):
+        for bad in (True, -1, 1.5, "now", cap.BIGINT_MAX + 1):
+            ev = make_eval(now=NOW)
+            ev._clock = FakeClock(bad)
+            with self.assertRaises(cap.ModelInputError, msg=repr(bad)):
+                ev.mint_model(make_proof(), make_request())
+
+    def test_expiry_addition_overflow_refused(self):
+        ev = make_eval(now=cap.BIGINT_MAX - 10)
+        ev._ttl = 300
+        with self.assertRaises(cap.ModelInputError):
+            ev.mint_model(make_proof(), make_request(captured_epoch=7))
+
+
+class TestTypedShapeGuards(unittest.TestCase):
+    """Item 4: typed collection guards before frozenset/tuple; no raw
+    TypeError; public errors ignore arbitrary prose."""
+
+    def test_none_collections_refused_typed(self):
+        with self.assertRaises(cap.ModelInputError):
+            make_request(required_scopes=None)
+        with self.assertRaises(cap.ModelInputError):
+            make_consent(scopes=None)
+        with self.assertRaises(cap.ModelInputError):
+            make_snapshot(grants=None)
+        with self.assertRaises(cap.ModelInputError):
+            make_snapshot(consents=None)
+        ev, capability = mint_ok()
+        with self.assertRaises(cap.ModelInputError):
+            cap.Capability(
+                status=cap.ModelStatus.MODEL_ONLY,
+                identity=capability.identity, request=capability.request,
+                granted_scopes=None, grants_generation=5, policy_revision=2,
+                decision_revision=3, consent_generation=11,
+                issued_at=NOW, expires_at=NOW + TTL)
+
+    def test_string_collections_refused_typed(self):
+        with self.assertRaises(cap.ModelInputError):
+            make_request(required_scopes="memory.extract")
+        with self.assertRaises(cap.ModelInputError):
+            make_snapshot(grants="grant")
+
+    def test_public_errors_ignore_arbitrary_prose(self):
+        secret = "secret-text-fixture-content"
+        cases = [
+            cap.AuthError(secret), cap.ModelInputError(secret),
+            cap.SensitiveRefused(secret), cap.ExpiredRefused(secret),
+            cap.ScopeRefused(secret), cap.ConsentRefused(secret),
+            cap.PolicyRefused(secret), cap.CapRefused(0),
+            cap.ProductionStubRefused(secret),
+        ]
+        for code in (cap.ModelCode.REVOKED, cap.ModelCode.STALE_POLICY,
+                     cap.ModelCode.EPOCH, cap.ModelCode.REQUEST_DRIFT):
+            cases.append(cap.ConflictError(code))
+        for err in cases:
+            text = str(err)
+            self.assertNotIn(secret, text, msg=type(err).__name__)
+            self.assertTrue(text, msg=type(err).__name__)
+            self.assertIsNotNone(err.code, msg=type(err).__name__)
+        # conflict messages carry only the closed code value
+        err = cap.ConflictError(cap.ModelCode.REVOKED)
+        self.assertEqual(str(err), "conflict: REVOKED")
+        with self.assertRaises(cap.ModelInputError):
+            cap.ConflictError(cap.ModelCode.MODEL_ALLOWED)
+
+
+class TestPrecedenceCollisions(unittest.TestCase):
+    """Item 6: collision probes through the shared staging pipeline -
+    not just isolated errors."""
+
+    def test_sensitive_beats_lifetime_revoked(self):
+        ev = make_eval(snapshot=make_snapshot(lifetime_id=2))
+        with self.assertRaises(cap.SensitiveRefused):
+            ev.mint_model(make_proof(), make_request(sensitive=True))
+
+    def test_malformed_envelope_owner_beats_sensitive(self):
+        ev = make_eval(snapshot=make_snapshot(
+            decision_envelope=make_envelope(owner_uid=UID + 1)))
+        with self.assertRaises(cap.ModelInputError):
+            ev.mint_model(make_proof(), make_request(sensitive=True))
+
+    def test_sensitive_beats_expired_envelope(self):
+        ev = make_eval(snapshot=make_snapshot(
+            decision_envelope=make_envelope(expires_at=NOW - 1)))
+        with self.assertRaises(cap.SensitiveRefused):
+            ev.mint_model(make_proof(), make_request(sensitive=True))
+
+    def test_expired_envelope_beats_stale_revision(self):
+        ev = make_eval(snapshot=make_snapshot(
+            decision_envelope=make_envelope(expires_at=NOW - 1,
+                                            revision=99)))
+        with self.assertRaises(cap.ExpiredRefused):
+            ev.mint_model(make_proof(), make_request())
+
+    def test_expired_envelope_beats_missing_scope(self):
+        snap = make_snapshot(grants=(),
+                             decision_envelope=make_envelope(
+                                 expires_at=NOW - 1))
+        ev = make_eval(snapshot=snap)
+        with self.assertRaises(cap.ExpiredRefused):
+            ev.mint_model(make_proof(), make_request())
+
+    def test_stale_revision_beats_missing_scope(self):
+        snap = make_snapshot(grants=(),
+                             decision_envelope=make_envelope(revision=99))
+        ev = make_eval(snapshot=snap)
+        with self.assertRaises(cap.ConflictError) as ctx:
+            ev.mint_model(make_proof(), make_request())
+        self.assertIs(ctx.exception.code, cap.ModelCode.STALE_POLICY)
+
+    def test_epoch_drift_beats_missing_scope(self):
+        snap = make_snapshot(grants=())
+        ev = make_eval(snapshot=snap)
+        with self.assertRaises(cap.ConflictError) as ctx:
+            ev.mint_model(make_proof(), make_request(captured_epoch=9))
+        self.assertIs(ctx.exception.code, cap.ModelCode.EPOCH)
+
+    def test_recheck_expired_beats_drift(self):
+        ev, capability = mint_ok()
+        ev._clock = FakeClock(NOW + TTL)
+        with self.assertRaises(cap.ExpiredRefused):
+            ev.recheck_model(capability, make_request(operation_id="op-x"))
+
+    def test_recheck_stale_beats_drift(self):
+        store = FakeStore(make_snapshot())
+        ev = cap.ModelOnlyEvaluator(FakeVerifier(make_identity()),
+                                    store, FakeClock(NOW), TTL)
+        capability = ev.mint_model(make_proof(), make_request())
+        store.snapshot = make_snapshot(policy_revision=9)
+        with self.assertRaises(cap.ConflictError) as ctx:
+            ev.recheck_model(capability, make_request(operation_id="op-x"))
+        self.assertIs(ctx.exception.code, cap.ModelCode.STALE_POLICY)
+
+    def test_policy_refusal_beats_missing_scope(self):
+        snap = make_snapshot(grants=(), decision_envelope=None)
+        ev = make_eval(snapshot=snap)
+        with self.assertRaises(cap.PolicyRefused):
+            ev.mint_model(make_proof(), make_request())
 
 
 class TestSqliteStore(unittest.TestCase):

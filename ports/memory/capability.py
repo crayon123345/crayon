@@ -1,5 +1,7 @@
 """PR-3: capability + policy evaluation - MODEL ONLY, SYNTHETIC, NON-AUTHORITATIVE.
 
+Every shape below is a SYNTHETIC MODEL_ONLY fixture - NOT runtime authority.
+
 Contract: docs/memory/pr3-capability.md (v4 = v3 + peer controlling addendum
 1/4-4/4, DRAFT-READY verdict 2026-10-11). Basis: plan v1 PR-3, seam prep v4.1,
 contract v6, owner decisions record v1.
@@ -26,9 +28,11 @@ the later store-integrated layer and is never produced by this model.
 
 CAPACITY: the precedence chain retains a final capacity stage and CapRefused
 carries a validated exact resulting_count, but NO capacity count/limit source
-shape exists in the agreed contracts - capacity evaluation stays at the PR-1
-owner_counters layer and the model fixture shape is an OPEN item needing
-exact cross-side agreement. No model path in this file triggers capacity.
+shape exists in the agreed contracts and capacity enforcement is NOT
+implemented anywhere in the merged tree (PR-1 owner_counters allocates
+monotone epochs only - it counts nothing). The fixture shape is an OPEN item
+needing exact cross-side agreement. No model path in this file triggers
+capacity.
 """
 
 from __future__ import annotations
@@ -66,9 +70,10 @@ class OperationClass(Enum):
 
 
 class Channel(Enum):
-    # Chosen initial membership for the synthetic model (exact-head review
-    # covers this constant set); new members require amendment.
-    WHATSAPP = "whatsapp"
+    # Peer-agreed membership for this model slice (2026-10-11). WHATSAPP is
+    # DEFERRED: it joins only via a later contract amendment after a surface
+    # audit. New members require amendment.
+    WEB = "web"
     TELEGRAM = "telegram"
 
 
@@ -143,7 +148,11 @@ class CapabilityModelError(Exception):
     _MSG = "capability model refusal"
 
     def __init__(self, message: Optional[str] = None) -> None:
-        super().__init__(message if message is not None else self._MSG)
+        # Arbitrary prose is IGNORED by design: only fixed safe messages and
+        # whitelisted metadata (ConflictError's closed code, CapRefused's
+        # validated count) may leave the model - no caller-supplied text,
+        # so no secret/fixture content can leak through an error string.
+        super().__init__(self._MSG)
 
 
 class AuthError(CapabilityModelError):
@@ -178,9 +187,10 @@ class ConflictError(CapabilityModelError):
 
     def __init__(self, code: ModelCode) -> None:
         if code not in self._ALLOWED:
-            raise ModelInputError("invalid conflict code")
+            raise ModelInputError()
         self.code = code
-        super().__init__("conflict: %s" % code.value)
+        # message carries only the closed code value (whitelisted metadata)
+        Exception.__init__(self, "conflict: %s" % code.value)
 
 
 class ScopeRefused(CapabilityModelError):
@@ -204,9 +214,9 @@ class CapRefused(CapabilityModelError):
 
     def __init__(self, resulting_count: int) -> None:
         if type(resulting_count) is not int or resulting_count < 0:
-            raise ModelInputError("resulting_count must be an exact int >= 0")
+            raise ModelInputError()
         self.resulting_count = resulting_count
-        super().__init__(self._MSG)
+        super().__init__()
 
 
 class ProductionStubRefused(CapabilityModelError):
@@ -244,6 +254,25 @@ def _req_bool(value) -> None:
         raise ModelInputError()
 
 
+def _as_frozenset(value) -> FrozenSet:
+    # typed shape guard: None / non-iterable -> MALFORMED, never raw TypeError
+    if value is None or isinstance(value, (str, bytes)):
+        raise ModelInputError()
+    try:
+        return frozenset(value)
+    except TypeError:
+        raise ModelInputError()
+
+
+def _as_tuple(value) -> Tuple:
+    if value is None or isinstance(value, (str, bytes)):
+        raise ModelInputError()
+    try:
+        return tuple(value)
+    except TypeError:
+        raise ModelInputError()
+
+
 # ---------------------------------------------------------------------------
 # Immutable shapes (frozen dataclasses; construction-time validation makes
 # malformed shapes UNREPRESENTABLE - the shape classes themselves are the
@@ -252,6 +281,11 @@ def _req_bool(value) -> None:
 
 @dataclass(frozen=True)
 class Identity:
+    """SYNTHETIC MODEL_ONLY identity fixture - NOT runtime authority.
+
+    Normal constructors reject malformed fields; object tricks and
+    subclasses remain OUTSIDE the model guarantee.
+    """
     owner_uid: int
     channel: Channel
     surface: Surface
@@ -271,6 +305,10 @@ class Identity:
             _req_opt_nonblank(self.audience_id)
             _req_int(self.lifetime_id, 1)
             _req_enum(self.origin, Origin)
+            if self.surface is Surface.GROUP and self.audience_id is None:
+                # a group-surface identity must carry its concrete source
+                # group ID - never an inferred unknown audience
+                raise ModelInputError()
         except ModelInputError:
             # an invalid identity must never yield a successful scope decision
             raise AuthError()
@@ -291,6 +329,11 @@ class ModelProof:
 
 @dataclass(frozen=True)
 class Request:
+    """SYNTHETIC MODEL_ONLY request fixture - NOT runtime authority.
+
+    Normal constructors reject malformed fields; object tricks and
+    subclasses remain OUTSIDE the model guarantee.
+    """
     operation_id: str
     operation_class: OperationClass
     required_scopes: FrozenSet[Scope]
@@ -304,7 +347,7 @@ class Request:
     def __post_init__(self) -> None:
         _req_nonblank(self.operation_id)
         _req_enum(self.operation_class, OperationClass)
-        object.__setattr__(self, "required_scopes", frozenset(self.required_scopes))
+        object.__setattr__(self, "required_scopes", _as_frozenset(self.required_scopes))
         for scope in self.required_scopes:
             _req_enum(scope, Scope)
         if not self.required_scopes:
@@ -345,6 +388,7 @@ class Request:
 
 @dataclass(frozen=True)
 class Grant:
+    """SYNTHETIC MODEL_ONLY grant fixture - NOT runtime authority."""
     scope: Scope
     granted_at: int
     expires_at: Optional[int]
@@ -370,6 +414,7 @@ class Grant:
 
 @dataclass(frozen=True)
 class Policy:
+    """SYNTHETIC MODEL_ONLY policy fixture - NOT runtime authority."""
     extraction: ExtractionPolicy
     sharing: SharingPolicy
     group_write: GroupEligibility
@@ -382,6 +427,7 @@ class Policy:
 
 @dataclass(frozen=True)
 class DecisionEnvelope:
+    """SYNTHETIC MODEL_ONLY envelope fixture - NOT runtime authority."""
     owner_uid: int
     policy: Policy
     issued_at: int
@@ -402,6 +448,7 @@ class DecisionEnvelope:
 
 @dataclass(frozen=True)
 class OperationConsent:
+    """SYNTHETIC MODEL_ONLY consent fixture - NOT runtime authority."""
     owner_uid: int
     operation_id: str
     operation_class: OperationClass
@@ -416,7 +463,7 @@ class OperationConsent:
         _req_int(self.owner_uid, 0)
         _req_nonblank(self.operation_id)
         _req_enum(self.operation_class, OperationClass)
-        object.__setattr__(self, "scopes", frozenset(self.scopes))
+        object.__setattr__(self, "scopes", _as_frozenset(self.scopes))
         if not self.scopes:
             raise ModelInputError()
         for scope in self.scopes:
@@ -451,7 +498,7 @@ class Snapshot:
         _req_int(self.lifetime_id, 1)
         _req_int(self.current_epoch, 1)
         _req_int(self.grants_generation, 0)
-        object.__setattr__(self, "grants", tuple(self.grants))
+        object.__setattr__(self, "grants", _as_tuple(self.grants))
         seen = set()
         for grant in self.grants:
             if not isinstance(grant, Grant):
@@ -467,7 +514,7 @@ class Snapshot:
                 and not isinstance(self.decision_envelope, DecisionEnvelope)):
             raise ModelInputError()
         _req_int(self.consent_generation, 0)
-        object.__setattr__(self, "consents", tuple(self.consents))
+        object.__setattr__(self, "consents", _as_tuple(self.consents))
         for consent in self.consents:
             if not isinstance(consent, OperationConsent):
                 raise ModelInputError()
@@ -495,7 +542,7 @@ class Capability:
             raise ModelInputError()
         if not isinstance(self.request, Request):
             raise ModelInputError()
-        object.__setattr__(self, "granted_scopes", frozenset(self.granted_scopes))
+        object.__setattr__(self, "granted_scopes", _as_frozenset(self.granted_scopes))
         for scope in self.granted_scopes:
             _req_enum(scope, Scope)
         _req_int(self.grants_generation, 0)
@@ -588,6 +635,8 @@ def derive_required_scopes(request: Request, identity: Identity) -> FrozenSet[Sc
 # ---------------------------------------------------------------------------
 
 class ModelOnlyEvaluator:
+    """SYNTHETIC MODEL_ONLY evaluator - NOT runtime authority."""
+
     def __init__(self, verifier: ModelOnlyVerifier,
                  snapshot_store: ModelOnlySnapshotStore,
                  clock: ModelOnlyClock, model_ttl_seconds: int) -> None:
@@ -597,7 +646,8 @@ class ModelOnlyEvaluator:
             raise ModelInputError()
         if not callable(getattr(clock, "now", None)):
             raise ModelInputError()
-        if type(model_ttl_seconds) is not int or model_ttl_seconds < 1:
+        if (type(model_ttl_seconds) is not int
+                or not 1 <= model_ttl_seconds <= BIGINT_MAX):
             raise ModelInputError()
         self._verifier = verifier
         self._store = snapshot_store
@@ -607,6 +657,9 @@ class ModelOnlyEvaluator:
     # -- public API ---------------------------------------------------------
 
     def mint_model(self, proof: ModelProof, request: Request) -> Capability:
+        # tier 0 (auth): identity verification happens ONLY here, before the
+        # shared pipeline; recheck operates on an already-minted synthetic
+        # capability and re-verifies nothing.
         if not isinstance(proof, ModelProof):
             raise AuthError()
         identity = self._verifier.verify(proof)
@@ -616,7 +669,7 @@ class ModelOnlyEvaluator:
             raise ModelInputError()
         snapshot = self._store.read(identity.owner_uid)  # ONE atomic read
         now = self._now()
-        derived, expiry = self._evaluate(snapshot, identity, request, now)
+        derived, expiry = self._evaluate(snapshot, identity, request, now, None)
         return Capability(
             status=ModelStatus.MODEL_ONLY,
             identity=identity,
@@ -635,25 +688,9 @@ class ModelOnlyEvaluator:
             raise ModelInputError()
         if not isinstance(request, Request):
             raise ModelInputError()
-        # Final request must EXACTLY match the capability's immutable
-        # operation/class/scopes/epoch/audience/ref/intent/action/sensitivity;
-        # any drift refuses. Same reviewed operation: idempotent recheck only.
-        if request != cap.request:
-            raise ConflictError(ModelCode.REQUEST_DRIFT)
         now = self._now()
-        if now >= cap.expires_at:
-            raise ExpiredRefused()
         snapshot = self._store.read(cap.identity.owner_uid)  # ONE atomic read
-        self._check_snapshot_binding(snapshot, cap.identity)
-        if snapshot.grants_generation != cap.grants_generation:
-            raise ConflictError(ModelCode.REVOKED)
-        if snapshot.policy_revision != cap.policy_revision:
-            raise ConflictError(ModelCode.STALE_POLICY)
-        if snapshot.decision_revision != cap.decision_revision:
-            raise ConflictError(ModelCode.STALE_POLICY)
-        if snapshot.consent_generation != cap.consent_generation:
-            raise ConflictError(ModelCode.REVOKED)
-        self._evaluate(snapshot, cap.identity, request, now)
+        self._evaluate(snapshot, cap.identity, request, now, cap)
         return Decision(
             status=ModelStatus.MODEL_ONLY, allowed=True,
             code=ModelCode.MODEL_ALLOWED,
@@ -663,64 +700,106 @@ class ModelOnlyEvaluator:
 
     def _now(self) -> int:
         now = self._clock.now()
-        if type(now) is not int or now < 0:
+        if type(now) is not int or not 0 <= now <= BIGINT_MAX:
             raise ModelInputError()
         return now
 
-    def _check_snapshot_binding(self, snapshot: Snapshot,
-                                identity: Identity) -> None:
+    def _evaluate(self, snapshot: Snapshot, identity: Identity,
+                  request: Request, now: int,
+                  prior: Optional[Capability]) -> Tuple[FrozenSet[Scope], int]:
+        """ONE shared deterministic staging pipeline for mint AND recheck
+        (contract sec 7, peer residual item 6):
+          1 auth/shape      (MISSING_IDENTITY in mint; MALFORMED_INPUT here)
+          2 sensitive       (TIER_DISABLED)
+          3 expiry          (EXPIRED)
+          4 revoked/stale/epoch/drift
+                            (REVOKED / STALE_POLICY / EPOCH / REQUEST_DRIFT)
+          5 missing scope/consent/policy
+                            (MISSING_SCOPE / MISSING_CONSENT / POLICY_REFUSED)
+          6 capacity        (stage retained; UNTRIGGERED - OPEN fixture shape)
+        Within tier 4 the deterministic order is: lifetime binding, envelope
+        revision, grants generation, policy revision, decision revision,
+        consent generation, request drift, epoch.
+        """
+        # ---- tier 1: malformed input/snapshot ----
         if not isinstance(snapshot, Snapshot):
             raise ModelInputError()
         if snapshot.owner_uid != identity.owner_uid:
             raise ModelInputError()  # cross-owner snapshot is malformed here
-        if snapshot.lifetime_id != identity.lifetime_id:
-            # lifetime binding mismatch: refuse without any resurrection claim
-            raise ConflictError(ModelCode.REVOKED)
-
-    def _evaluate(self, snapshot: Snapshot, identity: Identity,
-                  request: Request, now: int) -> Tuple[FrozenSet[Scope], int]:
-        """Deterministic refusal precedence (contract sec 7 + addendum 4/4):
-        identity (caller) -> malformed input/snapshot -> sensitive -> expiry
-        -> revoked/stale/epoch/drift -> missing scope/consent/policy ->
-        capacity (stage retained; NO model trigger - OPEN fixture shape)."""
-        self._check_snapshot_binding(snapshot, identity)
-
-        # sensitive: ANY sensitive operation/scope/flag is always refused
-        if (request.sensitive
-                or request.operation_class is OperationClass.SENSITIVE
-                or Scope.MEMORY_SENSITIVE in request.required_scopes):
-            raise SensitiveRefused()
-
+        if prior is not None and now < prior.issued_at:
+            # future-issued synthetic capability: malformed, never honored
+            raise ModelInputError()
         derived = derive_required_scopes(request, identity)
         if request.required_scopes != derived:
             raise ModelInputError()  # caller omission/widening rejected
-
+        # group source binding: group-source writes/extracts (and the
+        # GROUP_WRITE class) must bind the request - and through consent
+        # matching the consent too - to the identity's CONCRETE source
+        # group. None or a mismatched audience refuses. Group DISCLOSURE
+        # (SHARE) may name a distinct destination, explicitly bound by the
+        # SHARE request/consent rules, never inferred.
+        if (identity.surface is Surface.GROUP
+                and request.operation_class in (
+                    OperationClass.WRITE, OperationClass.EXTRACT,
+                    OperationClass.GROUP_WRITE,
+                )):
+            if (request.requested_audience_id is None
+                    or request.requested_audience_id != identity.audience_id):
+                raise ModelInputError()
         envelope = snapshot.decision_envelope
         if envelope is not None:
             if envelope.owner_uid != identity.owner_uid:
                 raise ModelInputError()
             if now < envelope.issued_at:
                 raise ModelInputError()  # not-yet-valid window
-            # expiry precedes staleness
-            if envelope.expires_at is not None and now >= envelope.expires_at:
-                raise ExpiredRefused()
-            if envelope.revision != snapshot.decision_revision:
-                raise ConflictError(ModelCode.STALE_POLICY)
 
-        # expiry of required grants precedes any missing-scope determination
+        # ---- tier 2: sensitive ----
+        if (request.sensitive
+                or request.operation_class is OperationClass.SENSITIVE
+                or Scope.MEMORY_SENSITIVE in request.required_scopes):
+            raise SensitiveRefused()
+
+        # ---- tier 3: expiry ----
+        if prior is not None and now >= prior.expires_at:
+            raise ExpiredRefused()
+        if (envelope is not None and envelope.expires_at is not None
+                and now >= envelope.expires_at):
+            raise ExpiredRefused()
         for scope in derived:
             matching = [g for g in snapshot.grants if g.scope is scope]
             if matching and all(g.is_expired(now) for g in matching):
                 raise ExpiredRefused()
 
-        # epoch: mutations require a captured epoch matching current; READ and
-        # SHARE may explicitly omit it; a provided epoch must always match
+        # ---- tier 4: revoked / stale / epoch / drift ----
+        if snapshot.lifetime_id != identity.lifetime_id:
+            # lifetime binding mismatch: refuse without any resurrection claim
+            raise ConflictError(ModelCode.REVOKED)
+        if (envelope is not None
+                and envelope.revision != snapshot.decision_revision):
+            raise ConflictError(ModelCode.STALE_POLICY)
+        if prior is not None:
+            if snapshot.grants_generation != prior.grants_generation:
+                raise ConflictError(ModelCode.REVOKED)
+            if snapshot.policy_revision != prior.policy_revision:
+                raise ConflictError(ModelCode.STALE_POLICY)
+            if snapshot.decision_revision != prior.decision_revision:
+                raise ConflictError(ModelCode.STALE_POLICY)
+            if snapshot.consent_generation != prior.consent_generation:
+                raise ConflictError(ModelCode.REVOKED)
+            # Final request must EXACTLY match the capability's immutable
+            # operation/class/scopes/epoch/audience/ref/intent/action/
+            # sensitivity. Same reviewed operation: idempotent recheck only.
+            if request != prior.request:
+                raise ConflictError(ModelCode.REQUEST_DRIFT)
+        # epoch: mutations require a captured epoch matching current; READ
+        # and SHARE may explicitly omit it; a provided epoch must match
         if request.captured_epoch is None:
             if request.operation_class in _MUTATION_CLASSES:
                 raise ConflictError(ModelCode.EPOCH)
         elif request.captured_epoch != snapshot.current_epoch:
             raise ConflictError(ModelCode.EPOCH)
 
+        # ---- tier 5: policy / scope / consent ----
         # missing envelope/config creates no consent: safest refusal
         if envelope is None or snapshot.config is None:
             raise PolicyRefused()
@@ -734,10 +813,20 @@ class ModelOnlyEvaluator:
         # EXPLICIT intent is allowed under both extraction policies;
         # sharing is ALWAYS per-op regardless of the extraction axis.
 
-        # policy axis C: group. Group eligibility NEVER refuses the
-        # GROUP_WRITE class; group-SOURCE private write/extract is governed
-        # by consent+scopes below and is never refused by eligibility.
-        if request.operation_class is OperationClass.GROUP_WRITE:
+        # policy axis C: group. Eligibility NEVER is the owner's hard NO and
+        # applies surface-wide: it refuses the GROUP_WRITE class AND any
+        # group-SOURCE private write/extract (either underlying action),
+        # regardless of which operation class names it, however favorable
+        # the grants/consent. Under DEFAULT_OFF_OPT_IN a group-source write
+        # still needs its bound per-op consent (consent stage below).
+        group_source = (
+            identity.surface is Surface.GROUP
+            and request.operation_class in (
+                OperationClass.WRITE, OperationClass.EXTRACT,
+            )
+        )
+        if (request.operation_class is OperationClass.GROUP_WRITE
+                or group_source):
             if (snapshot.config.group_write is GroupEligibility.NEVER
                     or envelope.policy.group_write is GroupEligibility.NEVER):
                 raise PolicyRefused()
@@ -746,10 +835,7 @@ class ModelOnlyEvaluator:
             OperationClass.SHARE, OperationClass.GROUP_WRITE,
         ) and identity.origin in _AMBIGUOUS_ORIGINS:
             raise PolicyRefused()
-        if (identity.surface is Surface.GROUP
-                and request.operation_class in (
-                    OperationClass.WRITE, OperationClass.EXTRACT,
-                ) and identity.origin in _AMBIGUOUS_ORIGINS):
+        if group_source and identity.origin in _AMBIGUOUS_ORIGINS:
             raise PolicyRefused()
 
         # scope stage: active grant required for every derived scope
@@ -785,7 +871,15 @@ class ModelOnlyEvaluator:
                 self._require_consent(snapshot, identity, request, scope, now)
             )
 
-        # capability expiry: <= issued+TTL AND earliest relevant expiry
+        # ---- tier 6: capacity - retained, UNTRIGGERED (OPEN fixture shape;
+        # no count/limit source in the agreed shapes, no permissive default)
+
+        if prior is not None:
+            return derived, prior.expires_at
+        # capability expiry: <= issued+TTL AND earliest relevant expiry;
+        # typed overflow of the expiry addition refuses BEFORE construction
+        if self._ttl > BIGINT_MAX - now:
+            raise ModelInputError()
         expiry = now + self._ttl
         for grant in active_grants:
             if grant.expires_at is not None:

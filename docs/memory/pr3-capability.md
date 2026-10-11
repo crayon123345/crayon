@@ -45,9 +45,10 @@ Controlling paths (all NEW, no existing edits):
 - OperationClass: READ, WRITE, ERASE, EXTRACT, SHARE, GROUP_WRITE,
   SENSITIVE. Base scope mapping is 1:1 by name
   (READ->memory.read, ..., SENSITIVE->memory.sensitive).
-- Channel: {WHATSAPP, TELEGRAM}; Surface: {PRIVATE, GROUP} - chosen
-  initial membership for the synthetic model, covered by exact-head
-  review; new members require amendment.
+- Channel: {WEB, TELEGRAM} - peer-agreed membership for this model
+  slice (2026-10-11). WHATSAPP is DEFERRED: it joins only via a later
+  contract amendment after a surface audit. Surface: {PRIVATE, GROUP}.
+  New members of any enum require amendment.
 - Origin: {DIRECT, ANONYMOUS, SENDER_CHAT, FORWARDED_AMBIGUOUS}.
 - ExtractionIntent: {NOT_APPLICABLE, EXPLICIT, AUTOMATIC}.
 - GroupAction: {WRITE, EXTRACT}.
@@ -66,9 +67,12 @@ New members of any enum require a contract amendment.
 - Identity(owner_uid:int, channel, surface, issuer_id:str,
   session_binding:str|None, audience_id:str|None, lifetime_id:int,
   origin). Session binding is a synthetic label only, never verified.
-  Malformed identity fields raise AuthError at construction: an invalid
-  identity is UNREPRESENTABLE and can never yield a successful scope
-  decision.
+  Malformed identity fields raise AuthError at construction: the NORMAL
+  CONSTRUCTOR rejects them, so an invalid identity can never yield a
+  successful scope decision through the normal path; object tricks and
+  subclasses remain OUTSIDE the model guarantee (no Python
+  invincibility claim). A group-surface identity must carry its
+  concrete source group ID in audience_id.
 - ModelProof(identity, proof_label:str) - exact frozen synthetic
   fixture; fabricated fixtures are ONLY synthetic data.
 - Request(operation_id:str, operation_class, required_scopes:
@@ -143,6 +147,10 @@ valid windows reject.
   from ONE snapshot; no caller-authoritative arguments. Capability
   expiry <= issued_at + model_ttl_seconds AND the earliest relevant
   grant/envelope/consent expiry; an expiry <= now refuses (EXPIRED).
+  Clock values and the TTL are exact signed BIGINTs (type(v) is int,
+  bool rejected); a future-issued capability rechecks as MALFORMED; the
+  expiry addition is overflow-checked BEFORE capability construction
+  and refuses (MALFORMED).
 - production_mint/export/load/authorize(*args, **kwargs) -> NoReturn:
   ProductionStubRefused BEFORE any verifier/store/clock access.
 
@@ -180,9 +188,19 @@ B. SHARING (explicit-grant, per-operation END-USER consent every time;
    accidentally disabled.
 C. GROUP (never below default_off_opt_in; eligibility is not consent):
    - GROUP-SOURCE private write/extract requires memory.group_write
-     PLUS the underlying scope PLUS a bound per-op consent. Group
-     ELIGIBILITY never refuses group-source writes; eligibility still
-     needs bound consent.
+     PLUS the underlying scope PLUS a bound per-op consent. Eligibility
+     NEVER is the owner's hard NO and applies SURFACE-WIDE: it refuses
+     the GROUP_WRITE class (either underlying action) AND any
+     group-source WRITE/EXTRACT, whenever config OR envelope policy
+     says NEVER, however favorable the grants/consent (peer first-pass
+     item 1, 2026-10-11). Under DEFAULT_OFF_OPT_IN the bound consent is
+     still required.
+   - GROUP SOURCE BINDING: group-source writes/extracts and the
+     GROUP_WRITE class bind request AND consent (via exact consent
+     matching) to the identity's concrete source group ID; a None or
+     mismatched audience refuses MALFORMED. Group DISCLOSURE may name
+     a distinct destination audience, explicitly bound by the SHARE
+     request + consent, never inferred (peer first-pass item 2).
    - The GROUP_WRITE class additionally requires eligibility: NEVER (in
      config OR envelope policy) refuses POLICY_REFUSED. Ours: NEVER
      (decision 2A).
@@ -193,25 +211,43 @@ C. GROUP (never below default_off_opt_in; eligibility is not consent):
 Owner FIXTURES illustrate policies in tests; there are NO OUR/THEIR
 lookup constants in the model.
 
-## 7. Deterministic refusal precedence
+## 7. Deterministic refusal precedence (ONE shared staging pipeline)
 
-0. Production stubs: first, unconditional.
-1. identity/auth failure (MISSING_IDENTITY)
-2. malformed input/snapshot (MALFORMED_INPUT; an unreadable malformed
-   shape may precede sensitive; never a successful decision)
-3. sensitive anywhere (TIER_DISABLED)
-4. expiry (EXPIRED)
-5. revoked / stale / epoch / request drift (REVOKED, STALE_POLICY,
-   EPOCH, REQUEST_DRIFT)
-6. missing scope / consent or policy refusal (MISSING_SCOPE,
-   MISSING_CONSENT, POLICY_REFUSED)
-7. capacity (CapRefused, exact non-bool resulting_count >= 0)
+mint_model and recheck_model run the SAME staged pipeline
+(_evaluate); identity verification (tier 0, MISSING_IDENTITY) happens
+only in mint, before the store read. Production stubs refuse first,
+unconditionally. Stages:
+
+1. malformed input/snapshot (MALFORMED_INPUT: cross-owner snapshot,
+   envelope owner/window shape, derived-scope mismatch, group binding,
+   future-issued capability; never a successful decision)
+2. sensitive anywhere (TIER_DISABLED)
+3. expiry (EXPIRED: capability, envelope, required grants)
+4. revoked / stale / epoch / request drift - deterministic inner order:
+   lifetime binding (REVOKED, no resurrection claim), envelope revision
+   (STALE_POLICY), grants generation (REVOKED), policy revision
+   (STALE_POLICY), decision revision (STALE_POLICY), consent
+   generation (REVOKED), full request equality (REQUEST_DRIFT), epoch
+   (EPOCH)
+5. missing scope / consent or policy refusal (MISSING_SCOPE,
+   MISSING_CONSENT, POLICY_REFUSED). Within a single consent lookup the
+   deterministic inner order is: expired match (EXPIRED) before stale
+   generation (REVOKED) before missing (MISSING_CONSENT).
+6. capacity (stage retained, UNTRIGGERED - see below)
+
+Collision behavior is covered by dedicated collision tests (sensitive
+vs revoked, malformed vs sensitive, sensitive vs expiry, expiry vs
+stale/missing-scope, stale vs missing-scope, epoch vs missing-scope,
+recheck expiry vs drift, recheck stale vs drift, policy vs
+missing-scope). Invalid final requests always refuse with the
+documented deterministic code.
 
 CAPACITY STAGE IS RETAINED BUT NOT TRIGGERED BY THIS MODEL: the agreed
 shapes carry no capacity count/limit source; inventing one is a shape
-change requiring exact cross-side agreement. Capacity enforcement
-remains at the PR-1 owner_counters layer; the model fixture shape is
-OPEN. EPOCH/CAS/ERASED/RESURRECTED semantics beyond the epoch check are
+change requiring exact cross-side agreement. Capacity enforcement is
+NOT implemented anywhere in the merged tree (PR-1 owner_counters
+allocates monotone epochs only); the fixture shape is OPEN and
+unattributed. EPOCH/CAS/ERASED/RESURRECTED semantics beyond the epoch check are
 later-store conflict TYPES ONLY - no detection claim without
 store/lifetime binding. Real DB failures propagate, distinct from every
 refusal.
@@ -258,6 +294,19 @@ NO production reuse claim exists.
   idempotent same-operation recheck.
 - production stubs refuse before any dependency (exploding fixtures)
   and refuse a valid-looking synthetic capability; no permissive load.
+- group NEVER matrix: 12 refusal variants (config/envelope/both x
+  GROUP_WRITE-WRITE/GROUP_WRITE-EXTRACT/group-source WRITE/EXTRACT)
+  plus allowed variants under DEFAULT_OFF_OPT_IN.
+- group audience binding: group-surface identity requires source ID;
+  None/mismatched request audience refuses; bound audience allowed;
+  distinct disclosure destination explicitly bound.
+- clock/TTL: future-issued capability; invalid TTL/clock values;
+  expiry-addition overflow.
+- typed collection guards: None/str/non-iterable collections refused
+  typed, no raw TypeError; public errors ignore arbitrary prose across
+  every error class.
+- precedence collisions: 10 collision probes through the shared
+  pipeline.
 - CapRefused resulting_count validation (bool/negative/str rejected).
 - immutability (frozen instances, frozenset scopes); error no-echo.
 - sqlite design store: roundtrip + evaluator integration; absent
@@ -269,7 +318,7 @@ NO production reuse claim exists.
 - Production trust binding (verifier/store/clock/envelope persistence/
   key/consent gates): OPEN, unreachable.
 - Capacity count/limit fixture shape for the evaluator: OPEN (exact
-  agreement required); enforcement stays at PR-1 owner_counters.
+  agreement required); no capacity enforcement exists anywhere yet.
 - One-use consumption / idempotent commit store: OPEN.
 - Real immutable-content binding for permitted_information_ref: OPEN.
 - CAS/ERASED/RESURRECTED integration detections: later-store types only.
