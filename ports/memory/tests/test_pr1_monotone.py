@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ports"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import owner_counters
 import grants
