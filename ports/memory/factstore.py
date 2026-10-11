@@ -3335,50 +3335,83 @@ def _evidence_target_source_ok(queryable, projection, anchor_uid: int,
     return False
 
 
-def _verify_insertion_event_coupling(q, event) -> None:
+def _verify_insertion_event_coupling(q, event) -> int:
     """LEDGER VALIDATION (v80 1254-1308: actual, ONE-TO-ONE, PER-CLASS),
     RE-VERIFIED at replay/readback: the event's ledger rows (count ==
     inserted_count) EACH join: class 'evidence_entries' -> the evidence
     row EXISTS with insertion_event_id == the event (event equality
     lives on the EVIDENCE row, never on the anchor) AND subject
     (subject_evidence_ref == 'evidence:' + entry_id) -> its recovery_id
-    -> the anchor (resolved_accounting OR blocked_records) whose uid /
-    lifetime_id / operation_id / hash (commitment|binding_hash) EQUAL
-    the event's anchor identity, PLUS the expected source association
-    (the evidence kind == the event source). A dangling row, wrong
-    class, wrong owner/triple, wrong event, wrong anchor, wrong source,
-    a missing destination, or a count mismatch = integrity REFUSAL -
-    NEVER an incoherent default success."""
+    -> the anchor (resolved_accounting) whose uid / lifetime_id /
+    operation_id / hash EQUAL the event's anchor identity, PLUS the
+    expected source association (the evidence kind == the event source),
+    PLUS the INSERTION-IDENTITY/COUNT proof (v80 960-965): the evidence
+    row's INSERTING triple (inserting_uid / inserting_lifetime_id /
+    inserting_operation_id) EQUALS the event's inserting identity, and
+    the event's new_retained EQUALS the CANONICAL count RECOMPUTED from
+    the durable rows the event created (the joined evidence rows + the
+    event row itself + the ledger rows = 2*inserted_count + 1) - the
+    event's own new_retained claim is NEVER trusted. An insertion event
+    with NO resolved anchor is INCOHERENT (blocked arrivals carry NO
+    events) - the canonical count source is never defaulted. A dangling row,
+    wrong class, wrong owner/triple, wrong event, wrong anchor, wrong
+    source, wrong inserting identity, or a count mismatch = integrity
+    REFUSAL - NEVER an incoherent default success. RETURNS the
+    CANONICAL new_retained (callers report the anchor's count, NEVER
+    the event's own claim)."""
     rows = q.q("SELECT class_name, entry_id FROM"
                " resolution_event_ledger WHERE resolution_event_id=%s",
                (event["event_id"],), "all")
     if len(rows) != event["inserted_count"]:
         raise EvidenceIntegrityError()  # the count, from the ledger ALONE
+    canonical_new_retained = None
     for row in rows:
         if row["class_name"] != "evidence_entries":
             raise EvidenceIntegrityError()  # wrong class
         if event["subject_evidence_ref"] != "evidence:" + row["entry_id"]:
             raise EvidenceIntegrityError()  # wrong subject
-        ev = q.q("SELECT recovery_id, kind, insertion_event_id FROM"
-                 " evidence_entries WHERE evidence_id=%s",
-                 (row["entry_id"],), "one")
+        ev = q.q("SELECT recovery_id, kind, insertion_event_id,"
+                 " inserting_uid, inserting_lifetime_id,"
+                 " inserting_operation_id FROM evidence_entries WHERE"
+                 " evidence_id=%s", (row["entry_id"],), "one")
         if ev is None:
             raise EvidenceIntegrityError()  # a missing destination row
         if ev["insertion_event_id"] != event["event_id"]:
             raise EvidenceIntegrityError()  # wrong event
         if ev["recovery_id"] != event["recovery_id"]:
             raise EvidenceIntegrityError()
+        # v80 960-965: the INSERTING triple equality, re-verified at
+        # readback (a mismatch = integrity refusal, on the LATE branch
+        # AND the forced-fence loser branch alike)
+        if ev["inserting_uid"] != event["inserting_uid"] \
+                or ev["inserting_lifetime_id"] \
+                != event["inserting_lifetime_id"] \
+                or ev["inserting_operation_id"] \
+                != event["inserting_operation_id"]:
+            raise EvidenceIntegrityError()  # wrong inserting identity
         anchor = q.q("SELECT uid, lifetime_id, operation_id, commitment"
                      " AS h FROM resolved_accounting WHERE recovery_id=%s",
                      (event["recovery_id"],), "one")
         if anchor is None:
-            anchor = q.q("SELECT uid, lifetime_id, operation_id,"
-                         " binding_hash AS h FROM blocked_records WHERE"
-                         " recovery_id=%s", (event["recovery_id"],), "one")
-        if anchor is None                 or anchor["uid"] != event["uid"]                 or anchor["lifetime_id"] != event["lifetime_id"]                 or anchor["operation_id"] != event["operation_id"]                 or anchor["h"] != event["commitment"]:
+            # NO canonical anchor: the new_retained source is MISSING
+            # (a blocked-only anchor never carries an insertion event)
+            raise EvidenceIntegrityError()
+        if anchor["uid"] != event["uid"] \
+                or anchor["lifetime_id"] != event["lifetime_id"] \
+                or anchor["operation_id"] != event["operation_id"] \
+                or anchor["h"] != event["commitment"]:
             raise EvidenceIntegrityError()  # wrong anchor/triple/owner
         if ev["kind"] != event["source"]:
             raise EvidenceIntegrityError()  # the expected source assoc
+    # the CANONICAL new_retained, RECOMPUTED from durable state: every
+    # ledger row joins exactly ONE evidence row (proven above), the
+    # event row itself is retained, and the ledger rows are retained -
+    # the event's own new_retained CLAIM is verified against this, and
+    # THIS is what replay/loser results report (never the claim)
+    canonical_new_retained = 2 * len(rows) + 1
+    if event["new_retained"] != canonical_new_retained:
+        raise EvidenceIntegrityError()  # wrong canonical count
+    return canonical_new_retained
 
 
 @dataclass(frozen=True)
@@ -6939,12 +6972,14 @@ class _Historical:
                           (winner["insertion_event_id"],), "one")
         if event is None:
             raise EvidenceIntegrityError()
-        # v80 1254-1308: the loser re-verifies the FULL coupling too
-        _verify_insertion_event_coupling(self._q, event)
+        # v80 1254-1308 + 960-965: the loser re-verifies the FULL
+        # coupling + inserting triple + canonical count too; the
+        # result reports the CANONICAL anchor count
+        canonical_nr = _verify_insertion_event_coupling(self._q, event)
         return InsertionEventResult(
             kind="replayed", contribution=0,
             event_id=winner["insertion_event_id"],
-            stored_new_retained=event["new_retained"])
+            stored_new_retained=canonical_nr)
 
     def insert_evidence(self, owner_uid: int, lifetime_id: int,
                         read_operation_id: str,
@@ -6985,6 +7020,15 @@ class _Historical:
                                     supplied, capability.handle)
         if expected != capability.binding_hash:
             raise cap.AuthError()  # the setup is NOT bound to this input
+        # v80 1050-1074 WRITE leg (ENFORCED, never trusting the
+        # read_operation_id argument): the capability's OWN request op
+        # == the registered original binding's op == the supplied READ
+        # op - the inserted event's inserting_operation_id records ONLY
+        # this verified-equal identity
+        if inner.request.operation_id != read_operation_id \
+                or context.original_binding.operation_id \
+                != read_operation_id:
+            raise cap.AuthError()
         # SUBJECT hash-owner-accounting scope: the projection binds to
         # THIS owner accounting (a forged uid/lifetime NEVER lands)
         if projection.uid != owner_uid \
@@ -7046,9 +7090,13 @@ class _Historical:
                     conn.execute("ROLLBACK")
                     raise EvidenceIntegrityError()
                 try:
-                    # v80 1254-1308: the FULL one-to-one per-class
-                    # coupling RE-VERIFIED at replay - never a default
-                    _verify_insertion_event_coupling(q, event)
+                    # v80 1254-1308 + 960-965: the FULL one-to-one
+                    # per-class coupling + inserting-triple + canonical
+                    # count RE-VERIFIED at replay - never a default;
+                    # the result reports the CANONICAL anchor count,
+                    # never the event's own new_retained claim
+                    canonical_nr = _verify_insertion_event_coupling(
+                        q, event)
                 except EvidenceIntegrityError:
                     conn.execute("ROLLBACK")
                     raise
@@ -7056,7 +7104,7 @@ class _Historical:
                 return InsertionEventResult(
                     kind="replayed", contribution=0,
                     event_id=existing["insertion_event_id"],
-                    stored_new_retained=event["new_retained"])
+                    stored_new_retained=canonical_nr)
             evidence_id = secrets.token_hex(16)
             # classify by the CURRENT op state: unresolved = blocked
             # branch (row ONLY, NO event); resolved = late branch (one

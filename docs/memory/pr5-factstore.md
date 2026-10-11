@@ -27,7 +27,7 @@ cd ports/memory
 python3 -m unittest tests.test_pr5_factstore
 ```
 
-Expected: 113 tests, OK (~55-59s; file-backed exclusive-fixture DBs). No pytest dependency; stdlib unittest.
+Expected: 115 tests, OK (~60-66s; file-backed exclusive-fixture DBs). No pytest dependency; stdlib unittest.
 
 ## Shape
 
@@ -59,7 +59,7 @@ Expected: 113 tests, OK (~55-59s; file-backed exclusive-fixture DBs). No pytest 
 
 ## Test-vector coverage (honest)
 
-Covered by the suite (113 tests):
+Covered by the suite (115 tests):
 
 - V01-V10 put/supersede classification incl. normalization collision,
   oversize and string rejections, N-to-1, duplicate old_fids, non-target
@@ -121,7 +121,15 @@ Covered by the suite (113 tests):
   delivered commit (no rollback, no uncertainty, NO redelivery) and
   records NOTHING; a CLEARED scrub records completion AFTER the hook's
   proof with NO state change to the commit; the SAME hook runs
-  standalone at teardown and records nothing on its own.
+  standalone at teardown and records nothing on its own. W2 composes
+  the hook with a FACTSTORE erase/readback outcome + REVISION proof on
+  a known locked commit: a known put commits at store_revision R with
+  an applied readback outcome; REFUSED preserves BOTH the delivered
+  certainty AND revision R with no re-execute; the FactStore WIPE
+  erase lands an applied outcome with the live row gone on readback at
+  a FRESH revision R' > R; CLEARED post-erase records completion with
+  the erased revision/outcome untouched; teardown runs the same hook
+  standalone. A standalone scrub_log row is NOT integration proof.
   PENDING RESTART (unacked rows redelivered with the SAME token), LOST
   RECEIVER ACK (row stays pending; same-token redelivery replays
   receiver-side, no double-count), LOST DELIVERED-STATE UPDATE
@@ -220,7 +228,18 @@ Covered by the suite (113 tests):
   subject, event, destination, triple, anchor, source) - a
   missing/wrong ledger/class/subject/triple/anchor/source/count is a
   typed EvidenceIntegrityError on BOTH paths, never an incoherent
-  default success.
+  default success. W1 adds the INSERTION-IDENTITY/COUNT proof (v80
+  960-965): each joined evidence row's inserting uid/lifetime/op
+  EQUALS the event's inserting identity (mutations on EITHER the
+  evidence row OR the event row refuse typed on BOTH paths), and
+  new_retained is RECOMPUTED from the durable rows the event created
+  (2*inserted_count + 1: evidence + event + ledger) - the event's own
+  new_retained claim is verified, and replay/loser results report the
+  CANONICAL count, never the claim. The WRITE leg (v80 1050-1074) is
+  ENFORCED at insert: the capability's own request op == the
+  registered original binding's op == the supplied READ op, typed
+  refusal otherwise - the read_operation_id argument is never trusted
+  (negative: minted-for-b3 called with b4 refuses, nothing inserted).
 - The exclusive cross-instance isolation fixture: a second opener of the
   same path refuses; a file-backed connection WITHOUT the exclusive
   marker refuses; close releases the lock; :memory: remains allowed.

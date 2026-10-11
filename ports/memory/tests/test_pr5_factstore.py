@@ -2207,6 +2207,21 @@ class V34bHarnessVectors(unittest.TestCase):
                 + "'",
             "wrong_source":
                 "UPDATE insertion_events SET source='forged'",
+            # W1 (v80 960-965): the INSERTING identity/count legs
+            "wrong_inserting_uid_evidence":
+                "UPDATE evidence_entries SET inserting_uid=999",
+            "wrong_inserting_lifetime_evidence":
+                "UPDATE evidence_entries SET inserting_lifetime_id=999",
+            "wrong_inserting_op_evidence":
+                "UPDATE evidence_entries SET inserting_operation_id='"
+                + "ff" * 16 + "'",
+            "wrong_inserting_uid_event":
+                "UPDATE insertion_events SET inserting_uid=999",
+            "wrong_inserting_op_event":
+                "UPDATE insertion_events SET inserting_operation_id='"
+                + "ff" * 16 + "'",
+            "wrong_new_retained":
+                "UPDATE insertion_events SET new_retained=99",
         }
         for name, sql in mutations.items():
             with self.subTest(mutation=name):
@@ -2223,6 +2238,124 @@ class V34bHarnessVectors(unittest.TestCase):
                         evidence(store, rid, req.operation_id, "d" * 32)
                 finally:
                     store._q.q = orig_q
+
+    def test_w1_write_leg_enforces_inserting_op_equality(self):
+        # v80 1050-1074 WRITE leg: the inserting operation identity is
+        # ENFORCED - cap.request.operation_id == the registered
+        # original_binding.operation_id == the supplied READ op. The
+        # read_operation_id argument is NEVER trusted on its own
+        store, conn = mkstore()
+        req, b, rid = blocked_op(store, op="aa" * 16)
+        resolve_op(store, req, b)
+        row = store._q.q("SELECT commitment AS c FROM"
+                         " resolved_accounting WHERE recovery_id=%s",
+                         (rid,), "one")
+        proj = f.SafeEvidenceProjection(
+            recovery_id=rid, uid=1, lifetime_id=1,
+            operation_id=req.operation_id, commitment=row["c"],
+            kind=f.EvidenceKind.RECEIPT,
+            target=f.RecoveryBoundRef(recovery_id=rid,
+                                      source=f.EvidenceKind.RECEIPT),
+            source=f.EvidenceKind.RECEIPT,
+            accounting_scope=f.Lifetime(uid=1, lifetime_id=1))
+        # minted for op b3... but CALLED with op b4: typed refusal,
+        # NOTHING inserted (the argument does not override the minted
+        # identity)
+        w, ctx = store.mint_read_fixtures(
+            1, 1, "b3" * 16, f.ReadMethod.READBACK,
+            {"projection": proj.to_dict(), "token": "d" * 32})
+        with self.assertRaises(cap.AuthError):
+            store.insert_evidence(1, 1, "b4" * 16, proj, "d" * 32,
+                                  w, ctx)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM evidence_entries").fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM insertion_events").fetchone()[0], 0)
+        # the COHERENT call (all three op identities equal) inserts
+        r = store.insert_evidence(1, 1, "b3" * 16, proj, "d" * 32,
+                                  w, ctx)
+        self.assertEqual(r.kind, "inserted")
+        self.assertEqual(r.contribution, 3)
+        # the recorded event carries the VERIFIED inserting identity
+        ev = conn.execute(
+            "SELECT inserting_operation_id, inserting_uid,"
+            " inserting_lifetime_id FROM insertion_events").fetchone()
+        self.assertEqual(ev[0], "b3" * 16)
+        self.assertEqual((ev[1], ev[2]), (1, 1))
+
+    def test_w2_scrub_factstore_erase_readback_revision(self):
+        # W2 (v80 2060-2137 + the FactStore erase/readback gate): the
+        # scrub hook composed with a KNOWN FactStore mutation commit +
+        # erase/readback outcome + REVISION proof - a standalone
+        # scrub_log row is NOT integration proof, and outbox-state
+        # preservation alone is NOT the chosen locked post-erase gate
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        # the KNOWN mutation commit + its readback outcome/revision
+        r1, _ = run(store, put_req("9e" * 16, key="w2key"))
+        self.assertEqual(r1.result.outcome.result_code, "applied")
+        self.assertIsNotNone(r1.result.outcome.readback.fact_id)
+        rev_committed = store._store_revision(1)
+        self.assertGreaterEqual(rev_committed, 1)
+        # the chosen known-commit side (harness delivery committed)
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        harness.send(comp.token)
+        d = provider.deliver({"projection": proj, "token": comp.token})
+        self.assertEqual(harness.ack(d["ack"]).kind, "delivered")
+
+        class Stuck:
+            pass  # raw cannot be discarded -> REFUSED
+
+        # REFUSED: the locked commit's certainty AND the FactStore
+        # revision are BOTH preserved; NO re-execute, NOTHING recorded
+        out = harness.scrub(comp.token, {
+            "raw_ref_handle": Stuck(), "comparison_buffer": None})
+        self.assertEqual(out["kind"], "refused")
+        self.assertEqual(harness.outbox_state(comp.token), "delivered")
+        self.assertEqual(store._store_revision(1), rev_committed)
+        self.assertEqual(harness.redeliver_pending()["redelivered"], [])
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
+
+        # the FactStore ERASE of the known mutation: applied outcome,
+        # the live row GONE on readback, a FRESH revision
+        rw, _ = run(store, wipe_req("0f" * 16))
+        self.assertEqual(rw.result.outcome.result_code, "applied")
+        rev_erased = store._store_revision(1)
+        self.assertGreater(rev_erased, rev_committed)
+        self.assertEqual(store._q.q(
+            "SELECT count(*) AS n FROM facts", (), "one")["n"], 0)
+
+        class OwnedHandle:
+            def __init__(self):
+                self._raw = b"secret"
+
+            def clear(self):
+                self._raw = None
+
+            def live_raw(self):
+                return self._raw is not None
+
+        # CLEARED post-erase: the step records completion; the erased
+        # revision/outcome is UNTOUCHED (no re-execute, no rollback)
+        out2 = harness.scrub(comp.token, {
+            "raw_ref_handle": OwnedHandle(),
+            "comparison_buffer": OwnedHandle()})
+        self.assertEqual(out2["kind"], "cleared")
+        self.assertEqual(store._store_revision(1), rev_erased)
+        self.assertEqual(store._q.q(
+            "SELECT count(*) AS n FROM facts", (), "one")["n"], 0)
+        self.assertEqual(harness.outbox_state(comp.token), "delivered")
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log WHERE token=?",
+            (comp.token,)).fetchone()[0], 1)
+        # TEARDOWN: the SAME hook standalone - cleared, records NOTHING
+        outcome = harness.scrub_hook({
+            "raw_ref_handle": OwnedHandle(),
+            "comparison_buffer": OwnedHandle()})
+        self.assertEqual(outcome["kind"], "cleared")
+        self.assertEqual(store._store_revision(1), rev_erased)
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 1)
 
     def test_unrelated_same_owner_target_refused(self):
         # the R1 repro (v80 795-812, 3948-3951 UNRELATED SAME-OWNER
