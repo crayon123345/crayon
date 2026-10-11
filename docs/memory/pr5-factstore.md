@@ -27,7 +27,7 @@ cd ports/memory
 python3 -m unittest tests.test_pr5_factstore
 ```
 
-Expected: 96 tests, OK (~52s; file-backed exclusive-fixture DBs). No pytest dependency; stdlib unittest.
+Expected: 113 tests, OK (~55-59s; file-backed exclusive-fixture DBs). No pytest dependency; stdlib unittest.
 
 ## Shape
 
@@ -59,7 +59,7 @@ Expected: 96 tests, OK (~52s; file-backed exclusive-fixture DBs). No pytest depe
 
 ## Test-vector coverage (honest)
 
-Covered by the suite (111 tests):
+Covered by the suite (113 tests):
 
 - V01-V10 put/supersede classification incl. normalization collision,
   oversize and string rejections, N-to-1, duplicate old_fids, non-target
@@ -75,13 +75,18 @@ Covered by the suite (111 tests):
   prior-lifetime and cross-owner replay refusals, valid-capability replay,
   Phase-A-before-drift precedence (incl. EXPIRED first), REVOKED before
   replay, reseal/registry re-claim refusal.
-- V34 fault injection at the ENTRY of every declared step boundary (the
-  hooked method is replaced, so the hooked step body never runs; the
-  proven EXECUTED boundary is "all prior steps complete": entry(1a)=after
-  step 1, entry(2-3a)=after 1a, entry(4)=after 2-3a, entry(5)=after 4,
-  entry(6)=after 5, entry(7)=after 6, entry(8)=after 7, entry(9)=after 8;
-  steps 2/3a are ONE hooked seam - no literal after-2/after-3 boundary is
-  claimed; the post-apply boundary is the commit-guard abort/lost-commit
+- V34 fault injection literally AFTER EACH declared pipeline step (v80
+  3928): every "post" hook runs the REAL step body FIRST (its writes land
+  in-txn), THEN raises, so the proven boundary is post-step, not a
+  pre-step entry hook. Boundary map: after_1a footprint (post-body),
+  after_2 current checks + Phase A (the step-2 block is complete at the
+  entry of the adjacent 3a seam - the two steps run back-to-back in
+  _execute_current_checks, so the 3a-seam entry hook IS the literal
+  after-2 point), after_3a association/equality (post-body), after_4
+  Phase-B readback, after_5 tombstone, after_6 CAS, after_7 classify,
+  after_9 apply+record (all post-body), after_8 monotone allocation =
+  the post-allocation CRASH (wipe path), and the post-apply boundary is
+  the commit-guard abort/lost-commit
   pair): the attempt rolls back ENTIRELY (no partial effects, no claim
   leak), an unchanged retry is permitted, NO blind retry. RESTART leg per
   boundary: a real file close/reopen after the injected fault - NO
@@ -96,9 +101,13 @@ Covered by the suite (111 tests):
   stored_new_retained 1/3), DUPLICATE TOKENS IN ONE BATCH (late 3 not 6,
   blocked 1 not 2).
 - V34b issuer-harness vectors: LIVE ERASE - SCRUB INTERFACE (exact):
-  the actual shape is scrub(token, refs) -> ScrubOutcome, the v80
-  scrub(refs: OwnedContainers) hook under the harness TOKEN WRAPPER that
-  binds the hook to the erase step's completion record: refs IS the
+  the actual shape is scrub(token, refs) -> ScrubOutcome, the harness
+  TOKEN WRAPPER over the SEPARATELY DECLARED v80 hook scrub_hook(refs:
+  OwnedContainers) -> ScrubOutcome (the exact v80 2060-2137 hook shape,
+  ALSO invoked standalone at teardown): the hook owns the refs checks +
+  discard + live-absence check + typed outcome ONLY (NO recording, NO
+  token); the wrapper binds 'cleared' to the erase step's completion
+  record: refs IS the
   OwnedContainers closed enumeration {raw_ref_handle, comparison_buffer};
   the token keys the scrub_log completion row, written ONLY AFTER
   'cleared' is emitted (kind='cleared' AND raw_found=false STRICT AND ALL
@@ -106,7 +115,13 @@ Covered by the suite (111 tests):
   raw_found is the CLOSED bool: True when raw was found OR absence is
   UNPROVEN (a None/0/empty/non-bool/failed/missing probe = conservative
   True); False ONLY on a COMPLETE strict literal-False probe set (the
-  strict literal-False proven-empty is required BEFORE 'cleared').
+  strict literal-False proven-empty is required BEFORE 'cleared'). The
+  FULL WORKFLOW is proven on the CHOSEN KNOWN-COMMIT side (compose ->
+  send -> deliver -> ack=delivered): a REFUSED scrub preserves the
+  delivered commit (no rollback, no uncertainty, NO redelivery) and
+  records NOTHING; a CLEARED scrub records completion AFTER the hook's
+  proof with NO state change to the commit; the SAME hook runs
+  standalone at teardown and records nothing on its own.
   PENDING RESTART (unacked rows redelivered with the SAME token), LOST
   RECEIVER ACK (row stays pending; same-token redelivery replays
   receiver-side, no double-count), LOST DELIVERED-STATE UPDATE
@@ -197,9 +212,15 @@ Covered by the suite (111 tests):
   -> winner compare -> replay or typed drift refusal); a stored
   evidence row with a MISSING insertion event is a typed integrity
   refusal (never a defaulted count); V34 fault injection covers each
-  execute step INDIVIDUALLY (1a footprint, 2-3a current checks, 4
-  Phase-B readback, 5 tombstone, 6 CAS, 7 classify, 8 allocation, 9
-  apply+record).
+  execute step INDIVIDUALLY with a LITERAL post-step fault (1a
+  footprint, 2 current checks via the 3a-seam entry, 3a association,
+  4 Phase-B readback, 5 tombstone, 6 CAS, 7 classify, 8 allocation,
+  9 apply+record) AND the replay + forced-fence loser RE-VERIFY the
+  ONE-TO-ONE PER-CLASS ledger coupling (v80 1254-1308: count, class,
+  subject, event, destination, triple, anchor, source) - a
+  missing/wrong ledger/class/subject/triple/anchor/source/count is a
+  typed EvidenceIntegrityError on BOTH paths, never an incoherent
+  default success.
 - The exclusive cross-instance isolation fixture: a second opener of the
   same path refuses; a file-backed connection WITHOUT the exclusive
   marker refuses; close releases the lock; :memory: remains allowed.

@@ -3335,6 +3335,52 @@ def _evidence_target_source_ok(queryable, projection, anchor_uid: int,
     return False
 
 
+def _verify_insertion_event_coupling(q, event) -> None:
+    """LEDGER VALIDATION (v80 1254-1308: actual, ONE-TO-ONE, PER-CLASS),
+    RE-VERIFIED at replay/readback: the event's ledger rows (count ==
+    inserted_count) EACH join: class 'evidence_entries' -> the evidence
+    row EXISTS with insertion_event_id == the event (event equality
+    lives on the EVIDENCE row, never on the anchor) AND subject
+    (subject_evidence_ref == 'evidence:' + entry_id) -> its recovery_id
+    -> the anchor (resolved_accounting OR blocked_records) whose uid /
+    lifetime_id / operation_id / hash (commitment|binding_hash) EQUAL
+    the event's anchor identity, PLUS the expected source association
+    (the evidence kind == the event source). A dangling row, wrong
+    class, wrong owner/triple, wrong event, wrong anchor, wrong source,
+    a missing destination, or a count mismatch = integrity REFUSAL -
+    NEVER an incoherent default success."""
+    rows = q.q("SELECT class_name, entry_id FROM"
+               " resolution_event_ledger WHERE resolution_event_id=%s",
+               (event["event_id"],), "all")
+    if len(rows) != event["inserted_count"]:
+        raise EvidenceIntegrityError()  # the count, from the ledger ALONE
+    for row in rows:
+        if row["class_name"] != "evidence_entries":
+            raise EvidenceIntegrityError()  # wrong class
+        if event["subject_evidence_ref"] != "evidence:" + row["entry_id"]:
+            raise EvidenceIntegrityError()  # wrong subject
+        ev = q.q("SELECT recovery_id, kind, insertion_event_id FROM"
+                 " evidence_entries WHERE evidence_id=%s",
+                 (row["entry_id"],), "one")
+        if ev is None:
+            raise EvidenceIntegrityError()  # a missing destination row
+        if ev["insertion_event_id"] != event["event_id"]:
+            raise EvidenceIntegrityError()  # wrong event
+        if ev["recovery_id"] != event["recovery_id"]:
+            raise EvidenceIntegrityError()
+        anchor = q.q("SELECT uid, lifetime_id, operation_id, commitment"
+                     " AS h FROM resolved_accounting WHERE recovery_id=%s",
+                     (event["recovery_id"],), "one")
+        if anchor is None:
+            anchor = q.q("SELECT uid, lifetime_id, operation_id,"
+                         " binding_hash AS h FROM blocked_records WHERE"
+                         " recovery_id=%s", (event["recovery_id"],), "one")
+        if anchor is None                 or anchor["uid"] != event["uid"]                 or anchor["lifetime_id"] != event["lifetime_id"]                 or anchor["operation_id"] != event["operation_id"]                 or anchor["h"] != event["commitment"]:
+            raise EvidenceIntegrityError()  # wrong anchor/triple/owner
+        if ev["kind"] != event["source"]:
+            raise EvidenceIntegrityError()  # the expected source assoc
+
+
 @dataclass(frozen=True)
 class SafeEvidenceProjection:
     """The DURABLE CLOSED comparison structure (sec 5)."""
@@ -3815,26 +3861,15 @@ class IssuerHarness:
 
     _SCRUB_CONTAINERS = ("raw_ref_handle", "comparison_buffer")
 
-    def scrub(self, token: str, refs) -> dict:
-        """VOLATILE ERASURE (v80 2060-2137, EXACT): scrub(refs:
-        OwnedContainers) -> ScrubOutcome. OwnedContainers = the CLOSED
-        enumeration {raw_ref_handle, comparison_buffer} - the ONLY
-        volatile containers holding erased detail. ScrubOutcome =
-        {kind: 'cleared'|'refused', ref_ids: SAFE OPAQUE handle LABELS
-        ONLY (NEVER raw/live reference objects), live_check:
-        {checked_at, containers, raw_found}}. ORDER: the raw refs are
-        DISCARDED FIRST, THEN the live check verifies ABSENCE;
-        'cleared' is emitted IFF the check is COMPLETE (BOTH
-        containers), PASSING, and raw_found=false - BEFORE the outcome
-        is emitted and BEFORE completion is recorded. A 'cleared'
-        outcome with raw_found=true is a CONTRADICTION = REFUSAL; an
-        unknown/incomplete/failed check = 'refused' with safe IDs.
-        raw_found is the CLOSED bool: True when raw was found OR
-        absence is UNPROVEN (a None/0/empty/non-bool/failed/missing
-        probe = conservative True); False ONLY on a COMPLETE strict
-        literal-False probe set. NOTHING is recorded and NO state
-        changes on 'refused'."""
-        _req_hex(token, 32)
+    def scrub_hook(self, refs) -> dict:
+        """The EXACT v80 HOOK SHAPE (v80 2060-2137): scrub(refs:
+        OwnedContainers) -> ScrubOutcome - DISCARD FIRST, THEN the
+        live ABSENCE check; the TYPED CLOSED witness
+        'cleared'|'refused' with SAFE OPAQUE handle LABELS ONLY.
+        NO recording, NO stage verification, NO token: the token
+        wrapper (scrub) owns the completion record; this hook is
+        ALSO the teardown hook (the SAME hook shape the fixture
+        invokes post-known-commit AND at teardown)."""
         if not isinstance(refs, dict):
             raise cap.ModelInputError()
         if set(refs.keys()) != set(self._SCRUB_CONTAINERS):
@@ -3908,9 +3943,33 @@ class IssuerHarness:
         outcome = {"kind": kind,
                    "ref_ids": list(self._SCRUB_CONTAINERS),
                    "live_check": live_check}
-        if kind != "cleared":
+        return outcome
+
+    def scrub(self, token: str, refs) -> dict:
+        """VOLATILE ERASURE (v80 2060-2137, EXACT): scrub(refs:
+        OwnedContainers) -> ScrubOutcome. OwnedContainers = the CLOSED
+        enumeration {raw_ref_handle, comparison_buffer} - the ONLY
+        volatile containers holding erased detail. ScrubOutcome =
+        {kind: 'cleared'|'refused', ref_ids: SAFE OPAQUE handle LABELS
+        ONLY (NEVER raw/live reference objects), live_check:
+        {checked_at, containers, raw_found}}. ORDER: the raw refs are
+        DISCARDED FIRST, THEN the live check verifies ABSENCE;
+        'cleared' is emitted IFF the check is COMPLETE (BOTH
+        containers), PASSING, and raw_found=false - BEFORE the outcome
+        is emitted and BEFORE completion is recorded. A 'cleared'
+        outcome with raw_found=true is a CONTRADICTION = REFUSAL; an
+        unknown/incomplete/failed check = 'refused' with safe IDs.
+        raw_found is the CLOSED bool: True when raw was found OR
+        absence is UNPROVEN (a None/0/empty/non-bool/failed/missing
+        probe = conservative True); False ONLY on a COMPLETE strict
+        literal-False probe set. NOTHING is recorded and NO state
+        changes on 'refused'."""
+        _req_hex(token, 32)
+        outcome = self.scrub_hook(refs)
+        if outcome["kind"] != "cleared":
             return outcome  # REFUSAL: nothing recorded, no state change
         self._verify_stage("scrub", token)  # re-verified AFTER the raw
+        now = _clock_now(self._clock)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             self._conn.execute(
@@ -4676,10 +4735,23 @@ class FactStore:
                 or context.current_consent_generation \
                 != snap.consent_generation:
             raise cap.ConflictError(cap.ModelCode.STALE_POLICY)
-        # (step 3a) association/equality re-checks (EVERY path) - the
-        # three-bundle hash agreement runs AFTER Phase A: the real PR-3
-        # precedence is A-before-B, so expired/epoch-stale/revoked refuses
-        # in Phase A FIRST (V31 - NO universal DRIFT-over-EPOCH)
+        # (step 3a) association/equality re-checks run as their OWN
+        # declared seam: the post-step-2/post-step-3a fault boundary is
+        # EXACT (v80 3928 after-each-step coverage)
+        self._execute_association_checks(
+            owner_uid, request, capability, claim, binding, binding_hash,
+            wrapper_cap_hash, wrapper_claim_hash, wrapper_capture_hash)
+
+    def _execute_association_checks(self, owner_uid, request, capability,
+                                    claim, binding, binding_hash,
+                                    wrapper_cap_hash, wrapper_claim_hash,
+                                    wrapper_capture_hash):
+        """(step 3a) association/equality re-checks (EVERY path) - the
+        three-bundle hash agreement runs AFTER Phase A: the real PR-3
+        precedence is A-before-B, so expired/epoch-stale/revoked refuses
+        in Phase A FIRST (V31 - NO universal DRIFT-over-EPOCH)."""
+        q = self._q
+        uid, lid = owner_uid, request.lifetime_id
         if binding_hash != wrapper_cap_hash \
                 or binding_hash != wrapper_claim_hash \
                 or binding_hash != wrapper_capture_hash:
@@ -6862,11 +6934,13 @@ class _Historical:
                 kind="blocked_replay_no_event", contribution=0,
                 evidence_id=winner["evidence_id"], stored_new_retained=1,
                 resolution_event_id=winner["resolution_event_id"])
-        event = self._q.q("SELECT event_id, new_retained FROM"
-                          " insertion_events WHERE event_id=%s",
+        event = self._q.q("SELECT * FROM insertion_events WHERE"
+                          " event_id=%s",
                           (winner["insertion_event_id"],), "one")
         if event is None:
             raise EvidenceIntegrityError()
+        # v80 1254-1308: the loser re-verifies the FULL coupling too
+        _verify_insertion_event_coupling(self._q, event)
         return InsertionEventResult(
             kind="replayed", contribution=0,
             event_id=winner["insertion_event_id"],
@@ -6965,12 +7039,19 @@ class _Historical:
                         stored_new_retained=1,
                         resolution_event_id=
                         existing["resolution_event_id"])
-                event = q.q("SELECT event_id, new_retained FROM"
-                            " insertion_events WHERE event_id=%s",
+                event = q.q("SELECT * FROM insertion_events WHERE"
+                            " event_id=%s",
                             (existing["insertion_event_id"],), "one")
                 if event is None:
                     conn.execute("ROLLBACK")
                     raise EvidenceIntegrityError()
+                try:
+                    # v80 1254-1308: the FULL one-to-one per-class
+                    # coupling RE-VERIFIED at replay - never a default
+                    _verify_insertion_event_coupling(q, event)
+                except EvidenceIntegrityError:
+                    conn.execute("ROLLBACK")
+                    raise
                 conn.execute("COMMIT")
                 return InsertionEventResult(
                     kind="replayed", contribution=0,

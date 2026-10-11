@@ -1594,40 +1594,54 @@ class V34StepFaultsAndRestart(unittest.TestCase):
                            store._clock, rctx)
 
 
-    def test_fault_at_each_step_entry_rolls_back(self):
-        # v80 3928: fault injection at the ENTRY of each declared step
-        # (the hooked method is REPLACED - the hooked step body NEVER
-        # runs), so each hook proves the EXECUTED boundary "all steps
-        # BEFORE the hooked step complete": entry(2-3a)=after 1a,
-        # entry(4)=after 2-3a, entry(5)=after 4, entry(6)=after 5,
-        # entry(7)=after 6, entry(9)=after 8. Steps 2 and 3a are ONE
-        # hooked block (_execute_current_checks is the smallest
-        # injectable seam) - NO literal after-2/after-3 boundary is
-        # claimed; entry(1a) and entry(8) are the separate footprint/
-        # monotone-allocation tests below; the post-apply boundary is
-        # the commit-guard/lost-commit pair above. The attempt rolls
-        # back ENTIRELY (no partial effects, no claim leak) and an
-        # UNCHANGED retry stays permitted (pre-commit refusal, NO
-        # blind retry, an absent row is never treated as rollback
-        # proof)
+    def test_fault_after_each_pipeline_step_rolls_back(self):
+        # v80 3928: fault injection AFTER EACH declared pipeline step -
+        # every "post" hook runs the REAL step body FIRST (its writes
+        # land in-txn), THEN raises: the proven boundary is LITERALLY
+        # post-step (NOT an entry hook). Declared pipeline (docs
+        # Shape): 1a footprint -> 2 current checks + the real PR-3
+        # Phase A -> 3a association/equality -> 4 Phase B readback ->
+        # 5 tombstone -> 6 CAS -> 7 classify -> 8 monotone allocation
+        # -> 9 apply+record. after_2 fires at the ENTRY of the 3a seam
+        # (the step-2 block is COMPLETE at that exact point - the two
+        # steps are adjacent in _execute_current_checks); every other
+        # hook is post-body. after_1a is the footprint test below;
+        # after_8 (post-allocation CRASH) is the wipe-path test below;
+        # the post-commit boundary is the commit-guard/lost-commit
+        # pair above. The attempt rolls back ENTIRELY (no partial
+        # effects, no claim leak) and an UNCHANGED retry stays
+        # permitted (pre-commit refusal, NO blind retry, an absent row
+        # is never treated as rollback proof)
         injectables = [
-            ("entry_2_3a_current_checks", "_execute_current_checks"),
-            ("entry_4_phase_b_readback", "_phase_b_lookup"),
-            ("entry_5_tombstone", "_tombstone_check"),
-            ("entry_6_cas", "_cas_check"),
-            ("entry_7_classify", "_classify"),
-            ("entry_9_apply_record", "_apply_and_record"),
+            ("after_2_current_checks", "_execute_association_checks",
+             "entry"),
+            ("after_3a_association", "_execute_association_checks",
+             "post"),
+            ("after_4_phase_b_readback", "_phase_b_lookup", "post"),
+            ("after_5_tombstone", "_tombstone_check", "post"),
+            ("after_6_cas", "_cas_check", "post"),
+            ("after_7_classify", "_classify", "post"),
+            ("after_9_apply_record", "_apply_and_record", "post"),
         ]
-        for name, attr in injectables:
+        for name, attr, mode in injectables:
             with self.subTest(boundary=name):
                 store, conn = mkstore()
                 req = put_req("a1" * 16)
                 c, l, p, b, ctx = mint(store, req)
                 orig = getattr(store, attr)
 
-                def boom(*a, _name=name, **k):
-                    raise sqlite3.OperationalError(
-                        "injected fault: " + _name)
+                if mode == "entry":
+                    def boom(*a, _name=name, **k):
+                        # the step-2 block is COMPLETE; the fault fires
+                        # BEFORE any 3a work = LITERALLY after step 2
+                        raise sqlite3.OperationalError(
+                            "injected post-step fault: " + _name)
+                else:
+                    def boom(*a, _orig=orig, _name=name, **k):
+                        _orig(*a, **k)  # the REAL step COMPLETES
+                        # (its writes land in-txn), THEN the fault
+                        raise sqlite3.OperationalError(
+                            "injected post-step fault: " + _name)
                 setattr(store, attr, boom)
                 try:
                     with self.assertRaises(sqlite3.OperationalError):
@@ -1650,17 +1664,17 @@ class V34StepFaultsAndRestart(unittest.TestCase):
                     "SELECT count(*) FROM facts").fetchone()[0], 1)
 
     def test_fault_step1a_footprint_rolls_back(self):
-        # v80 3928: a fault at the ENTRY of step 1a (the declared-
-        # footprint step; the step body never runs, so the executed
-        # boundary is step 1) rolls the attempt back ENTIRELY; an
-        # unchanged retry works
+        # v80 3928: a fault literally AFTER step 1a (the declared-
+        # footprint step's REAL body runs FIRST, then the fault) rolls
+        # the attempt back ENTIRELY; an unchanged retry works
         store, conn = mkstore()
         req = put_req("a1" * 16)
         c, l, p, b, ctx = mint(store, req)
         orig = f._footprint
 
         def boom(*a, **k):
-            raise sqlite3.OperationalError("injected step-1a fault")
+            orig(*a, **k)  # the REAL step 1a COMPLETES (in-txn), THEN
+            raise sqlite3.OperationalError("injected post-1a fault")
         f._footprint = boom
         try:
             with self.assertRaises(sqlite3.OperationalError):
@@ -1678,17 +1692,19 @@ class V34StepFaultsAndRestart(unittest.TestCase):
         self.assertEqual(r.kind, "executed")
 
     def test_fault_step8_monotone_allocation_rolls_back(self):
-        # v80 3928: a fault at the ENTRY of step 8 (the monotone
-        # epoch allocation; the step body never runs, so the executed
-        # boundary is step 7) rolls the (epoch-setting) attempt back
-        # ENTIRELY; retry works
+        # v80 3928: a post-allocation CRASH (the REAL monotone epoch
+        # allocation runs FIRST, then the fault) rolls the
+        # (epoch-setting) attempt back ENTIRELY - the allocated epoch
+        # is never left half-committed; retry works
         store, conn = mkstore()
         req = wipe_req("0a" * 16)
         c, l, p, b, ctx = mint(store, req)
         orig = f.owner_counters.allocate_next_epoch
 
         def boom(*a, **k):
-            raise sqlite3.OperationalError("injected step-8 fault")
+            orig(*a, **k)  # the REAL allocation COMPLETES (in-txn) -
+            raise sqlite3.OperationalError("injected post-allocation"
+                                           " crash")
         f.owner_counters.allocate_next_epoch = boom
         try:
             with self.assertRaises(sqlite3.OperationalError):
@@ -1704,31 +1720,42 @@ class V34StepFaultsAndRestart(unittest.TestCase):
         self.assertEqual(r.kind, "executed")
 
     def test_fault_boundaries_restart_clean(self):
-        # V34 (v80 3928) RESTART leg PER BOUNDARY: a fault injected at
-        # each step ENTRY, then a REAL file close/reopen - NO partial
+        # V34 (v80 3928) RESTART leg PER BOUNDARY: a fault injected
+        # literally AFTER each pipeline step (the REAL step body runs
+        # first; after_2 = the entry of the adjacent 3a seam), then a
+        # REAL file close/reopen - NO partial
         # attempt survives the restart (no facts, no armed witness, no
         # registry row) and a FRESH mint on the reopened store
         # executes normally (old-session claims refuse after reopen -
         # test_v34/test_restart_reopen above - an absent row is never
         # rollback proof, NO blind retry)
         injectables = [
-            ("entry_2_3a_current_checks", "_execute_current_checks"),
-            ("entry_4_phase_b_readback", "_phase_b_lookup"),
-            ("entry_5_tombstone", "_tombstone_check"),
-            ("entry_6_cas", "_cas_check"),
-            ("entry_7_classify", "_classify"),
-            ("entry_9_apply_record", "_apply_and_record"),
+            ("after_2_current_checks", "_execute_association_checks",
+             "entry"),
+            ("after_3a_association", "_execute_association_checks",
+             "post"),
+            ("after_4_phase_b_readback", "_phase_b_lookup", "post"),
+            ("after_5_tombstone", "_tombstone_check", "post"),
+            ("after_6_cas", "_cas_check", "post"),
+            ("after_7_classify", "_classify", "post"),
+            ("after_9_apply_record", "_apply_and_record", "post"),
         ]
-        for name, attr in injectables:
+        for name, attr, mode in injectables:
             with self.subTest(boundary=name):
                 store, conn, path = mkstore_path()
                 req = put_req("a1" * 16)
                 c, l, p, b, ctx = mint(store, req)
                 orig = getattr(store, attr)
 
-                def boom(*a, _name=name, **k):
-                    raise sqlite3.OperationalError(
-                        "injected fault: " + _name)
+                if mode == "entry":
+                    def boom(*a, _name=name, **k):
+                        raise sqlite3.OperationalError(
+                            "injected post-step fault: " + _name)
+                else:
+                    def boom(*a, _orig=orig, _name=name, **k):
+                        _orig(*a, **k)  # the REAL step COMPLETES first
+                        raise sqlite3.OperationalError(
+                            "injected post-step fault: " + _name)
                 setattr(store, attr, boom)
                 try:
                     with self.assertRaises(sqlite3.OperationalError):
@@ -2127,6 +2154,76 @@ class V34bHarnessVectors(unittest.TestCase):
         finally:
             store._q.q = orig_q
 
+    def test_v1_replay_revalidates_full_event_coupling(self):
+        # V1 (v80 1254-1308): the replay AND the forced-fence loser
+        # RE-VERIFY the ONE-TO-ONE PER-CLASS coupling - ledger count/
+        # class/subject/event/destination/triple/anchor/source - NOT
+        # just event existence. A missing/wrong ledger row, class,
+        # subject, triple, anchor, source, or count = typed
+        # EvidenceIntegrityError, NEVER an incoherent default success
+        def rig_and_insert():
+            store, conn = mkstore()
+            req, b, rid = blocked_op(store, op="aa" * 16)
+            resolve_op(store, req, b)
+            r1, _ = evidence(store, rid, req.operation_id, "d" * 32)
+            assert r1.kind == "inserted" and r1.contribution == 3
+            return store, conn, req, rid
+
+        # POSITIVE: valid original + valid replay + valid loser with
+        # the coupling INTACT
+        store, conn, req, rid = rig_and_insert()
+        r2, _ = evidence(store, rid, req.operation_id, "d" * 32)
+        self.assertEqual(r2.kind, "replayed")
+        self.assertEqual(r2.stored_new_retained, 3)
+        orig_q = force_real_unique_conflict(store)
+        try:
+            r3, _ = evidence(store, rid, req.operation_id, "d" * 32)
+            self.assertEqual(r3.kind, "replayed")
+            self.assertEqual(r3.stored_new_retained, 3)
+        finally:
+            store._q.q = orig_q
+
+        mutations = {
+            # the peer's exact probe: delete ONLY the matching ledger
+            "missing_ledger":
+                "DELETE FROM resolution_event_ledger",
+            "wrong_class":
+                "UPDATE resolution_event_ledger SET class_name='facts'",
+            "wrong_destination":
+                "UPDATE resolution_event_ledger SET entry_id='deadbeef'",
+            "wrong_count":
+                "INSERT INTO resolution_event_ledger"
+                "(resolution_event_id, class_name, entry_id, inserted_at)"
+                " SELECT resolution_event_id, 'evidence_entries',"
+                " 'extra01', inserted_at FROM resolution_event_ledger",
+            "wrong_subject":
+                "UPDATE insertion_events SET"
+                " subject_evidence_ref='evidence:deadbeef'",
+            "wrong_triple":
+                "UPDATE insertion_events SET operation_id='" + "ff" * 16
+                + "'",
+            "wrong_anchor":
+                "UPDATE insertion_events SET commitment='" + "ff" * 32
+                + "'",
+            "wrong_source":
+                "UPDATE insertion_events SET source='forged'",
+        }
+        for name, sql in mutations.items():
+            with self.subTest(mutation=name):
+                store, conn, req, rid = rig_and_insert()
+                conn.execute(sql)
+                conn.commit()
+                # the NORMAL replay path refuses typed
+                with self.assertRaises(f.EvidenceIntegrityError):
+                    evidence(store, rid, req.operation_id, "d" * 32)
+                # the forced-fence LOSER path refuses typed
+                orig_q = force_real_unique_conflict(store)
+                try:
+                    with self.assertRaises(f.EvidenceIntegrityError):
+                        evidence(store, rid, req.operation_id, "d" * 32)
+                finally:
+                    store._q.q = orig_q
+
     def test_unrelated_same_owner_target_refused(self):
         # the R1 repro (v80 795-812, 3948-3951 UNRELATED SAME-OWNER
         # TARGET): a VALID recovery/hash with an UNRELATED same-owner
@@ -2501,6 +2598,64 @@ class V34bHarnessVectors(unittest.TestCase):
         # the CLOSED enumeration is exact: missing/extra keys refuse
         with self.assertRaises(cap.ModelInputError):
             harness.scrub(comp.token, {"raw_ref_handle": RawHandle(None)})
+
+    def test_u3_scrub_hook_full_workflow_commit_side(self):
+        # v80 2060-2137: the SEPARATELY DECLARED scrub(refs) HOOK
+        # (IssuerHarness.scrub_hook) invoked on the CHOSEN KNOWN-COMMIT
+        # side of the erase/readback step: 'cleared' lets the step
+        # record completion; 'refused' PRESERVES the known commit
+        # (NEVER rolls back, NEVER marks uncertain, NEVER re-executes)
+        # and records NOTHING; the SAME hook shape runs at teardown
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        harness.send(comp.token)
+        d = provider.deliver({"projection": proj, "token": comp.token})
+        ar = harness.ack(d["ack"])
+        self.assertEqual(ar.kind, "delivered")  # the CHOSEN KNOWN COMMIT
+
+        class Stuck:
+            pass  # no destroy/clear/probe: the raw cannot be discarded
+
+        # REFUSED on the post-commit side: the commit STAYS CERTAIN
+        out = harness.scrub(comp.token, {
+            "raw_ref_handle": Stuck(), "comparison_buffer": None})
+        self.assertEqual(out["kind"], "refused")
+        self.assertEqual(harness.outbox_state(comp.token), "delivered")
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log WHERE token=?",
+            (comp.token,)).fetchone()[0], 0)
+        # NO re-execute: the delivered token is never redispatched
+        self.assertEqual(harness.redeliver_pending()["redelivered"], [])
+
+        class OwnedHandle:
+            def __init__(self):
+                self._raw = b"secret"
+
+            def clear(self):
+                self._raw = None
+
+            def live_raw(self):
+                return self._raw is not None
+
+        # CLEARED: the step records completion AFTER the hook's proof;
+        # the known commit stays certain (no state change to the row)
+        out2 = harness.scrub(comp.token, {
+            "raw_ref_handle": OwnedHandle(),
+            "comparison_buffer": OwnedHandle()})
+        self.assertEqual(out2["kind"], "cleared")
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log WHERE token=?",
+            (comp.token,)).fetchone()[0], 1)
+        self.assertEqual(harness.outbox_state(comp.token), "delivered")
+        # TEARDOWN: the SAME hook shape runs standalone (no token
+        # wrapper) and records NOTHING on its own
+        outcome = harness.scrub_hook({
+            "raw_ref_handle": OwnedHandle(),
+            "comparison_buffer": OwnedHandle()})
+        self.assertEqual(outcome["kind"], "cleared")
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log WHERE token=?",
+            (comp.token,)).fetchone()[0], 1)  # unchanged: no record
 
     def test_forged_result_or_ref_never_delivered(self):
         store, req, b, rid, provider, harness, proj, oconn = self._rig()
