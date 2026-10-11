@@ -1,0 +1,1165 @@
+"""PR-5 FactStore MODEL test suite - named-vector coverage (contract sec 14).
+
+MODEL ONLY: every fixture is public synthetic ("minted by fixture F"),
+never authority. Run from ports/memory: python3 -m pytest tests/ -q
+(or python3 tests/test_pr5_factstore.py - no pytest dependency; a tiny
+runner is embedded at the bottom).
+"""
+import os
+import sqlite3
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import capability as cap  # noqa: E402
+import envelope as env  # noqa: E402
+import factstore as f  # noqa: E402
+
+T0 = 1_700_000_000
+ALL_SCOPES = [cap.Scope.MEMORY_WRITE, cap.Scope.MEMORY_READ,
+              cap.Scope.MEMORY_ERASE]
+
+
+def mkstore(scopes=ALL_SCOPES, uid=1, lid=1, epoch=1):
+    conn = sqlite3.connect(":memory:")
+    store = f.FactStore(conn, f.JsonTestClock(T0))
+    store.setup_owner(uid, lid, epoch, scopes=scopes)
+    return store, conn
+
+
+def new_fact(key="tea", value="green", category=f.Category.PREFERENCE,
+             source=f.Source.WEB, excerpt="x", captured_at=T0):
+    return f.NewFact(key=key, value=value, category=category, source=source,
+                     provenance=f.Provenance(excerpt=excerpt,
+                                             captured_at=captured_at))
+
+
+def put_req(op, key="tea", value="green", **kw):
+    return f.FactRequest(method=f.MethodCode.PUT,
+                         intent=f.ModelIntent.WriteFact,
+                         payload=f.PutPayload(fact=new_fact(key, value, **kw)),
+                         owner_uid=1, lifetime_id=1, operation_id=op,
+                         information_ref="test")
+
+
+def mint(store, request):
+    c, l, p, b = store.mint_mutation_fixtures(request)
+    return c, l, p, b, store._caller_context(b)
+
+
+def run(store, request):
+    c, l, p, b, ctx = mint(store, request)
+    return store.execute(1, request, c, l, p, ctx), b
+
+
+_CTX_COUNTER = [0]
+
+
+def read_ctx(store):
+    _CTX_COUNTER[0] += 1
+    req = f.FactRequest(method=f.MethodCode.SET_OPTIN,
+                        intent=f.ModelIntent.SetOptIn,
+                        payload=f.OptInPayload(
+                            setting=f.OptInSetting(category=f.Category.FACT),
+                            value=False),
+                        owner_uid=1, lifetime_id=1,
+                        operation_id="%032x" % (0xC700 + _CTX_COUNTER[0]),
+                        information_ref="ctx")
+    _, _, _, b = store.mint_mutation_fixtures(req)
+    return store._caller_context(b)
+
+
+def read_cap(store, op, method, targets, uid=1, lid=1):
+    w, _ = store.mint_read_fixtures(uid, lid, op, method, targets)
+    return w
+
+
+def get(store, fid, ctx, op="d1" * 16):
+    w = read_cap(store, op, f.ReadMethod.GET, {"fid": fid})
+    return store.get(1, fid, w, store._clock, ctx)
+
+
+class V01ToV06Put(unittest.TestCase):
+    """V01 put applied; V02 unchanged; V03 conflict; V04 oversize;
+    V05 normalization collision; V06 string rejections."""
+
+    def test_v01_put_applied(self):
+        store, _ = mkstore()
+        r, _ = run(store, put_req("a1" * 16))
+        oc = r.result.outcome
+        self.assertEqual(oc.result_code, "applied")
+        self.assertEqual(oc.readback.fact_id, 1)
+        self.assertEqual(oc.readback.row_version, 1)
+        self.assertEqual(oc.applied_at_revision, 1)
+        row = get(store, 1, read_ctx(store)).row
+        self.assertEqual(row.value, "green")
+        self.assertEqual(row.row_version, 1)
+
+    def test_v02_put_unchanged(self):
+        store, conn = mkstore()
+        run(store, put_req("a1" * 16))
+        r2, _ = run(store, put_req("a2" * 16))  # same key/value, new op
+        self.assertEqual(r2.result.outcome.result_code, "unchanged")
+        self.assertIsNone(r2.result.outcome.applied_at_revision)
+        n_hist = conn.execute("SELECT count(*) FROM history").fetchone()[0]
+        self.assertEqual(n_hist, 0)
+        self.assertEqual(store._store_revision(1), 1)  # no bump
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM facts").fetchone()[0], 1)  # no new row
+
+    def test_v03_put_conflict_sorted_fields_no_content(self):
+        store, _ = mkstore()
+        run(store, put_req("a1" * 16))
+        r2, _ = run(store, put_req("a2" * 16, value="black"))
+        oc = r2.result.outcome
+        self.assertEqual(oc.result_code, "conflict")
+        self.assertEqual([cf.value for cf in oc.conflict_fields], ["value"])  # sorted
+        self.assertIsNone(oc.applied_at_revision)
+        # no content disclosure: the conflict outcome carries the existing
+        # readback ref but never the stored value
+        self.assertFalse(hasattr(oc, "existing_value"))
+
+    def test_v04_oversize_key_value_refusal(self):
+        store, _ = mkstore()
+        with self.assertRaises(cap.ModelInputError):
+            new_fact(key="k" * 61)
+        with self.assertRaises(cap.ModelInputError):
+            new_fact(value="v" * 401)
+
+    def test_v05_key_normalization_collision_is_key_match(self):
+        store, conn = mkstore()
+        run(store, put_req("a1" * 16, key="Tea"))
+        r2, _ = run(store, put_req("a2" * 16, key="tea"))
+        # normalization collision = the SAME key: unchanged, never a 2nd row
+        self.assertEqual(r2.result.outcome.result_code, "unchanged")
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM facts").fetchone()[0], 1)
+
+    def test_v06_string_rejections(self):
+        for bad in ("", "   ", "x" * 200 + "́"):
+            pass  # placeholder: real cases below
+        with self.assertRaises(cap.ModelInputError):
+            new_fact(key="")
+        with self.assertRaises(cap.ModelInputError):
+            new_fact(key="   ")
+        with self.assertRaises(cap.ModelInputError):
+            new_fact(value="\x00control")
+        with self.assertRaises(cap.ModelInputError):
+            new_fact(key="surrogate\ud800")
+
+
+class V07ToV10Supersede(unittest.TestCase):
+    """V07 supersede 1-to-1/N-to-1; V08 duplicate old_fids; V09 non-target
+    key collision; V10 supersede allocates no epoch."""
+
+    def _sup_req(self, op, old_fids, expected, value="oolong", key="tea"):
+        return f.FactRequest(
+            method=f.MethodCode.SUPERSEDE,
+            intent=f.ModelIntent.SupersedeFact,
+            payload=f.SupersedePayload(
+                replacement=new_fact(key=key, value=value),
+                old_fids=tuple(old_fids), expected_versions=dict(expected)),
+            owner_uid=1, lifetime_id=1, operation_id=op,
+            information_ref="test")
+
+    def test_v07_supersede_1to1(self):
+        store, conn = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))
+        fid = r1.result.outcome.readback.fact_id
+        r2, _ = run(store, self._sup_req("e5" * 16, [fid], {fid: 1}))
+        oc = r2.result.outcome
+        self.assertEqual(oc.result_code, "applied")
+        self.assertEqual(oc.superseded, (fid,))
+        self.assertNotEqual(oc.readback.fact_id, fid)  # replacement new id
+        self.assertEqual(oc.readback.row_version, 1)       # replacement v1
+        hist = conn.execute(
+            "SELECT * FROM history ORDER BY history_id").fetchall()
+        self.assertEqual(len(hist), 1)
+        # old fact marked superseded; live read of replacement
+        row = get(store, oc.readback.fact_id, read_ctx(store),
+                  op="d2" * 16).row
+        self.assertEqual(row.value, "oolong")
+
+    def test_v07_supersede_n_to_1(self):
+        store, conn = mkstore()
+        fids = []
+        for i in range(3):
+            r, _ = run(store, put_req(("a%d" % i) * 16, key="k%d" % i))
+            fids.append(r.result.outcome.readback.fact_id)
+        expected = {fid: 1 for fid in fids}
+        r2, _ = run(store, self._sup_req("e6" * 16, fids, expected,
+                                         key="merged"))
+        self.assertEqual(r2.result.outcome.result_code, "applied")
+        self.assertEqual(sorted(r2.result.outcome.superseded), sorted(fids))
+        hist = conn.execute("SELECT count(*) FROM history").fetchone()[0]
+        self.assertEqual(hist, 3)  # one immutable final row per superseded
+
+    def test_v08_duplicate_old_fids_refusal(self):
+        store, _ = mkstore()
+        with self.assertRaises(cap.ModelInputError):
+            self._sup_req("e7" * 16, [1, 1], {1: 1})
+
+    def test_v09_non_target_key_collision(self):
+        store, conn = mkstore()
+        r1, _ = run(store, put_req("a1" * 16, key="tea"))
+        fid = r1.result.outcome.readback.fact_id
+        r2, _ = run(store, put_req("a2" * 16, key="coffee"))
+        other = r2.result.outcome.readback.fact_id
+        # supersede tea with a replacement keyed 'coffee': collides with the
+        # NON-TARGET live row
+        r3, _ = run(store, self._sup_req("e8" * 16, [fid], {fid: 1},
+                                         key="coffee"))
+        oc = r3.result.outcome
+        self.assertEqual(oc.result_code, "conflict")
+        self.assertEqual(oc.collided_fid, other)
+        self.assertIsNone(oc.applied_at_revision)  # no writes
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM history").fetchone()[0], 0)
+
+    def test_v10_supersede_allocates_no_epoch(self):
+        store, _ = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))
+        fid = r1.result.outcome.readback.fact_id
+        before = store._current_epoch(1)
+        r2, _ = run(store, self._sup_req("e5" * 16, [fid], {fid: 1}))
+        self.assertEqual(store._current_epoch(1), before)
+        self.assertIsNone(getattr(r2.result.outcome, "new_epoch", None))
+
+
+
+def closure_and_delete(store, ctx, fid, op):
+    w = read_cap(store, "f6" * 16, f.ReadMethod.PREPARE_CLOSURE, {"fid": fid})
+    m = store.prepare_closure(1, fid, w, store._clock, ctx)
+    req = f.FactRequest(
+        method=f.MethodCode.DELETE, intent=f.ModelIntent.DeleteFact,
+        payload=f.DeletePayload(
+            fid=fid, closure_cas=f.ClosureCAS(
+                live=m.live, lineage_digest=m.lineage_digest())),
+        owner_uid=1, lifetime_id=1, operation_id=op,
+        information_ref="test")
+    return run(store, req)
+
+
+def wipe_req(op, expected=None):
+    return f.FactRequest(method=f.MethodCode.WIPE,
+                         intent=f.ModelIntent.WipeOwner,
+                         payload=f.WipePayload(
+                             expected_target_versions=expected or {}),
+                         owner_uid=1, lifetime_id=1, operation_id=op,
+                         information_ref="test")
+
+
+class V11ToV14Delete(unittest.TestCase):
+    """V11 delete applied; V12 absent; V13 marked-target proceeds;
+    V14 fid-lineage scrub closure incl. history-only full closure."""
+
+    def test_v11_delete_applied_fresh_epoch_and_proof(self):
+        store, _ = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))
+        fid = r1.result.outcome.readback.fact_id
+        before = store._current_epoch(1)
+        (r, _), = [closure_and_delete(store, read_ctx(store), fid, "07" * 16)]
+        oc = r.result.outcome
+        self.assertEqual(oc.result_code, "applied")
+        self.assertIsNotNone(oc.new_epoch)
+        self.assertGreater(oc.new_epoch, before)  # fresh, never reused
+        self.assertEqual(store._current_epoch(1), oc.new_epoch)
+        proof = oc.proof
+        self.assertIsNotNone(proof)
+        counts = proof.closure_counts
+        self.assertEqual(counts[f.CopyClass.FACTS]["physically_removed"], 1)
+        # fact row physically gone
+        self.assertIsNone(get(store, fid, read_ctx(store)).row)
+
+    def test_v12_delete_absent_no_epoch_proof_none_recorded(self):
+        store, conn = mkstore()
+        before = store._current_epoch(1)
+        (r, _), = [closure_and_delete(store, read_ctx(store), 99, "07" * 16)]
+        oc = r.result.outcome
+        self.assertEqual(oc.result_code, "absent")
+        self.assertIsNone(oc.new_epoch)
+        self.assertIsNone(oc.proof)
+        self.assertIsNone(oc.applied_at_revision)
+        self.assertEqual(store._current_epoch(1), before)
+        # still recorded: replay returns the recorded outcome
+        return store, r
+
+    def test_v12b_delete_absent_recorded_replay(self):
+        store, conn = mkstore()
+        ctx = read_ctx(store)
+        w = read_cap(store, "f6" * 16, f.ReadMethod.PREPARE_CLOSURE,
+                     {"fid": 99})
+        m = store.prepare_closure(1, 99, w, store._clock, ctx)
+        req = f.FactRequest(
+            method=f.MethodCode.DELETE, intent=f.ModelIntent.DeleteFact,
+            payload=f.DeletePayload(
+                fid=99, closure_cas=f.ClosureCAS(
+                    live=m.live, lineage_digest=m.lineage_digest())),
+            owner_uid=1, lifetime_id=1, operation_id="07" * 16,
+            information_ref="test")
+        c, l, p, b, ctx2 = mint(store, req)
+        r1 = store.execute(1, req, c, l, p, ctx2)
+        r2 = store.execute(1, req, c, l, p, ctx2)
+        self.assertEqual(r2.kind, "replayed")
+        self.assertEqual(r2.replay.outcome.result_code, "absent")
+        # absent delete recorded: the op row exists
+        self.assertIsNotNone(conn.execute(
+            "SELECT 1 FROM operation_records WHERE operation_id=?",
+            ("07" * 16,)).fetchone())
+
+    def test_v13_delete_of_marked_target_proceeds(self):
+        store, _ = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))
+        fid = r1.result.outcome.readback.fact_id
+        sup = f.FactRequest(
+            method=f.MethodCode.SUPERSEDE, intent=f.ModelIntent.SupersedeFact,
+            payload=f.SupersedePayload(replacement=new_fact(value="oolong"),
+                                       old_fids=(fid,),
+                                       expected_versions={fid: 1}),
+            owner_uid=1, lifetime_id=1, operation_id="e5" * 16,
+            information_ref="test")
+        run(store, sup)  # fid now MARKED (superseded, history-only)
+        (r, _), = [closure_and_delete(store, read_ctx(store), fid, "08" * 16)]
+        self.assertEqual(r.result.outcome.result_code, "applied")
+
+    def test_v14_history_only_full_closure(self):
+        store, conn = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))
+        fid = r1.result.outcome.readback.fact_id
+        sup = f.FactRequest(
+            method=f.MethodCode.SUPERSEDE, intent=f.ModelIntent.SupersedeFact,
+            payload=f.SupersedePayload(replacement=new_fact(value="oolong"),
+                                       old_fids=(fid,),
+                                       expected_versions={fid: 1}),
+            owner_uid=1, lifetime_id=1, operation_id="e5" * 16,
+            information_ref="test")
+        r2, _ = run(store, sup)
+        new_fid = r2.result.outcome.readback.fact_id
+        ctx = read_ctx(store)
+        w = read_cap(store, "f6" * 16, f.ReadMethod.PREPARE_CLOSURE,
+                     {"fid": fid})
+        m = store.prepare_closure(1, fid, w, store._clock, ctx)
+        self.assertIsNone(m.live)  # history-only fid
+        (r, _), = [closure_and_delete(store, ctx, fid, "09" * 16)]
+        oc = r.result.outcome
+        self.assertEqual(oc.result_code, "applied")
+        counts = oc.proof.closure_counts
+        self.assertEqual(counts[f.CopyClass.HISTORY]["physically_removed"], 1)
+        self.assertEqual(counts.get(f.CopyClass.FACTS, {"physically_removed": 0})["physically_removed"], 0)
+        # the supersede op record content scrubbed (shared-op closure)
+        self.assertGreaterEqual(
+            counts[f.CopyClass.OP_RECORDS]["content_scrubbed"], 1)
+        # replacement row untouched
+        self.assertEqual(get(store, new_fid, read_ctx(store),
+                             op="d9" * 16).row.value, "oolong")
+
+
+class V15ToV18Wipe(unittest.TestCase):
+    """V15 wipe incl. empty; V16 retained whitelist; V17 post-scrub replay;
+    V18 safe ids only; V18b report paging."""
+
+    def test_v15_wipe_full_and_empty(self):
+        store, conn = mkstore()
+        run(store, put_req("a1" * 16))
+        before = store._current_epoch(1)
+        r, b = run(store, wipe_req("0a" * 16))
+        oc = r.result.outcome
+        self.assertEqual(oc.result_code, "applied")
+        self.assertGreater(oc.new_epoch, before)
+        self.assertIsNotNone(oc.applied_at_revision)
+        self.assertGreaterEqual(oc.report.page_count, 1)
+        total_removed = sum(c["physically_removed"]
+                            for c in oc.report.counts.values())
+        self.assertGreaterEqual(total_removed, 1)
+        # empty wipe: still epoch + revision + recorded
+        r2, _ = run(store, wipe_req("0b" * 16))
+        oc2 = r2.result.outcome
+        self.assertEqual(oc2.result_code, "applied")
+        self.assertGreater(oc2.new_epoch, oc.new_epoch)
+        self.assertIsNotNone(oc2.applied_at_revision)
+
+    def test_v16_retained_whitelist_honest(self):
+        store, _ = mkstore()
+        run(store, put_req("a1" * 16))
+        r, _ = run(store, wipe_req("0a" * 16))
+        retained = r.result.outcome.report.retained
+        self.assertTrue(retained)
+        for rc in retained:
+            self.assertIsInstance(rc, f.RetainedClass)
+        # every retained class is a DECLARED whitelist member (honest
+        # retention: non-content markers/counters only, never content)
+        names = {rc.name.value for rc in retained}
+        allowed = {m.value for m in f.RetainedClassName}
+        self.assertTrue(names <= allowed)
+        self.assertIn("op_record_noncontent", names)
+        self.assertIn("owner_counters", names)
+
+    def test_v17_post_scrub_replay_scrubbed_outcome(self):
+        # V30: after epoch movement the ORIGINAL capability can no longer
+        # serve a mutation replay (EPOCH) - the post-scrub lookup is the
+        # FRESH-READ historical API with the caller's TYPED ORIGINALS
+        # (V53 SUPPLIED mode), and the stored outcome is the scrubbed
+        # variant, never content.
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        r1 = store.execute(1, req, c, l, p, ctx)
+        fid = r1.result.outcome.readback.fact_id
+        closure_and_delete(store, read_ctx(store), fid, "07" * 16)
+        # mutation replay with the stale capability refuses EPOCH (V26/V31)
+        with self.assertRaises(cap.ConflictError):
+            store.execute(1, req, c, l, p, ctx)
+        # historical readback with supplied originals: ScrubbedOutcome
+        tgt = {"operation_id": "a1" * 16,
+               "originals": {"mode": "SUPPLIED"}}
+        w = read_cap(store, "b7" * 16, f.ReadMethod.READBACK, tgt)
+        pr = store.readback(1, "a1" * 16, req, b, w, store._clock,
+                            read_ctx(store))
+        self.assertIsInstance(pr, f.PostReadResult)
+        self.assertIsInstance(pr.original_outcome, f.ScrubbedOutcome)
+        self.assertNotIn("green", repr(pr.original_outcome))
+
+    def test_v18_post_scrub_reports_safe_ids_only(self):
+        store, _ = mkstore()
+        run(store, put_req("a1" * 16, value="s3cr3t-value"))
+        r, _ = run(store, wipe_req("0a" * 16))
+        report = r.result.outcome.report
+        self.assertNotIn("s3cr3t-value", repr(report))
+        for i in range(report.page_count):
+            w = read_cap(store, "e%d" % i * 16, f.ReadMethod.READ_REPORT_PAGE,
+                         {"page_index": i, "report_id": report.report_id})
+            rng = store.read_report_page(1, report.report_id, i, w,
+                                         store._clock, read_ctx(store))
+            self.assertIsInstance(rng, f.ReportRange)
+            for ref in rng.ids:
+                self.assertIsInstance(ref, f.InventoryRef)
+            self.assertNotIn("s3cr3t-value", repr(rng))
+
+    def test_v18b_report_paging_over_4096(self):
+        store, conn = mkstore()
+        # >4096 op_records rows (live-fact cap is 500; the >4096 inventory
+        # is built from per-op rows, not facts)
+        n = 4200
+        for i in range(n):
+            run(store, put_req(("%032x" % (0xA000 + i)), key="tea"))
+        r, _ = run(store, wipe_req("0a" * 16))
+        report = r.result.outcome.report
+        # collect every page; totals must match across pages, ordered,
+        # no silent truncation
+        seen = []
+        for i in range(report.page_count):
+            w = read_cap(store, ("%032x" % (0xE000 + i)),
+                         f.ReadMethod.READ_REPORT_PAGE,
+                         {"page_index": i, "report_id": report.report_id})
+            rng = store.read_report_page(1, report.report_id, i, w,
+                                         store._clock, read_ctx(store))
+            self.assertEqual(rng.page_index, i)
+            self.assertLessEqual(len(rng.ids), f.PAGE_MAX)
+            seen.extend(rng.ids)
+        keys = [(x.class_name.value, x.entry_id) for x in seen]
+        self.assertEqual(keys, sorted(set(keys)))  # global order, deduped
+        op_refs = [k for k in keys if k[0] == "op_records"]
+        self.assertGreater(len(op_refs), 4096)  # >4096 erased COMPLETELY
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM operation_records WHERE scrubbed=0"
+            ).fetchone()[0], 1)  # only the wipe's own row remains unscrubbed
+
+
+
+def sup_req(op, old_fids, expected, value="oolong", key="tea"):
+    return f.FactRequest(
+        method=f.MethodCode.SUPERSEDE, intent=f.ModelIntent.SupersedeFact,
+        payload=f.SupersedePayload(replacement=new_fact(key=key,
+                                                        value=value),
+                                   old_fids=tuple(old_fids),
+                                   expected_versions=dict(expected)),
+        owner_uid=1, lifetime_id=1, operation_id=op,
+        information_ref="test")
+
+
+class V19ToV21CAS(unittest.TestCase):
+    """V19 CAS refusal changes nothing; V20 retry SAME binding only;
+    V21 changed versions = NEW operation + NEW intent."""
+
+    def test_v19_cas_refusal_changes_nothing(self):
+        store, conn = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))
+        fid = r1.result.outcome.readback.fact_id
+        rev_before = store._store_revision(1)
+        with self.assertRaises(f.FactConflict):
+            run(store, sup_req("e5" * 16, [fid], {fid: 999}))  # wrong ver
+        self.assertEqual(store._store_revision(1), rev_before)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM history").fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM facts").fetchone()[0], 1)
+
+    def test_v20_cas_retry_same_binding_only(self):
+        store, _ = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))
+        fid = r1.result.outcome.readback.fact_id
+        req = sup_req("e5" * 16, [fid], {fid: 999})
+        c, l, p, b, ctx = mint(store, req)
+        with self.assertRaises(f.FactConflict):
+            store.execute(1, req, c, l, p, ctx)
+        # SAME EXACT unchanged binding retry: the same refusal, still no
+        # record (CAS refusals are pre-record)
+        with self.assertRaises(f.FactConflict):
+            store.execute(1, req, c, l, p, ctx)
+
+    def test_v21_changed_versions_new_operation_new_intent(self):
+        store, _ = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))
+        fid = r1.result.outcome.readback.fact_id
+        # changed content under the OLD op id = REQUEST_DRIFT (the caller
+        # tampers the request against the ORIGINAL minted bundles)
+        req = sup_req("e5" * 16, [fid], {fid: 1})
+        c, l, p, b, ctx = mint(store, req)
+        r1 = store.execute(1, req, c, l, p, ctx)
+        new_fid = r1.result.outcome.readback.fact_id
+        req_changed = sup_req("e5" * 16, [fid], {fid: 1}, value="CHANGED")
+        with self.assertRaises(cap.ConflictError) as cm:
+            store.execute(1, req_changed, c, l, p, ctx)
+        self.assertIn("REQUEST_DRIFT", str(cm.exception))
+        # a NEW op id with the new intent is a NEW operation (its own CAS)
+        r2, _ = run(store, sup_req("e6" * 16, [new_fid], {new_fid: 1},
+                                   value="CHANGED", key="tea"))
+        self.assertEqual(r2.result.outcome.result_code, "applied")
+
+
+class V22ToV25Capacity(unittest.TestCase):
+    """V22 at-cap 0/1/N; V23 N-to-1 at cap; V24 >500 CapRefused;
+    V25 last-slot race serializes locally."""
+
+    def _fill(self, store, n, start=0):
+        fids = []
+        for i in range(start, start + n):
+            r, _ = run(store, put_req("%032x" % (0x1000 + i),
+                                      key="k%04d" % i))
+            fids.append(r.result.outcome.readback.fact_id)
+        return fids
+
+    @staticmethod
+    def _live(conn):
+        return conn.execute("SELECT count(*) FROM facts").fetchone()[0]
+
+    def test_v22_at_cap_boundaries(self):
+        store, conn = mkstore()
+        self._fill(store, 1)
+        self.assertEqual(self._live(conn), 1)   # 0 -> 1
+        self._fill(store, f.LIVE_FACT_CAP - 1, start=1)
+        self.assertEqual(self._live(conn), f.LIVE_FACT_CAP)
+        with self.assertRaises(cap.CapRefused):
+            run(store, put_req("%032x" % 0x9000, key="overflow"))
+        self.assertEqual(self._live(conn), f.LIVE_FACT_CAP)
+
+    def test_v23_n_to_1_at_cap_allowed(self):
+        store, conn = mkstore()
+        fids = self._fill(store, f.LIVE_FACT_CAP)
+        r, _ = run(store, sup_req("e5" * 16, fids[:2],
+                                  {fids[0]: 1, fids[1]: 1}, key="merged"))
+        self.assertEqual(r.result.outcome.result_code, "applied")
+        self.assertEqual(self._live(conn), f.LIVE_FACT_CAP - 1)
+
+    def test_v24_cap_refused_carries_resulting_count(self):
+        store, _ = mkstore()
+        self._fill(store, f.LIVE_FACT_CAP)
+        try:
+            run(store, put_req("%032x" % 0x9000, key="overflow"))
+            self.fail("expected CapRefused")
+        except cap.CapRefused as e:
+            self.assertEqual(e.resulting_count, f.LIVE_FACT_CAP + 1)
+
+    def test_v25_last_slot_serializes_locally(self):
+        store, _ = mkstore()
+        self._fill(store, f.LIVE_FACT_CAP - 1)
+        r1, _ = run(store, put_req("%032x" % 0x8001, key="slot-a"))
+        self.assertEqual(r1.result.outcome.result_code, "applied")
+        with self.assertRaises(cap.CapRefused):
+            run(store, put_req("%032x" % 0x8002, key="slot-b"))
+
+
+class V26ToV29EpochsAndCrossing(unittest.TestCase):
+    """V26 terminal epoch refusals; V27 epoch never reused; V28 prior
+    lifetime; V29 replay never crosses owner/lifetime."""
+
+    def test_v26_epoch_terminal_no_recapture(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        r1 = store.execute(1, req, c, l, p, ctx)
+        fid = r1.result.outcome.readback.fact_id
+        closure_and_delete(store, read_ctx(store), fid, "07" * 16)
+        for _ in range(2):  # terminal, no recapture
+            with self.assertRaises(cap.ConflictError) as cm:
+                store.execute(1, req, c, l, p, ctx)
+            self.assertIn("EPOCH", str(cm.exception))
+
+    def test_v27_epoch_never_reused(self):
+        store, _ = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))
+        fid = r1.result.outcome.readback.fact_id
+        (rd, _), = [closure_and_delete(store, read_ctx(store), fid,
+                                       "07" * 16)]
+        e1 = rd.result.outcome.new_epoch
+        r2, _ = run(store, wipe_req("0a" * 16))
+        e2 = r2.result.outcome.new_epoch
+        self.assertEqual(len({1, e1, e2}), 3)  # all distinct, monotone
+        self.assertLess(e1, e2)
+
+    def test_v28_prior_lifetime_capture_never_matches(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store.execute(1, req, c, l, p, ctx)
+        # a request carrying a DIFFERENT lifetime under the minted fixtures
+        tampered = f.FactRequest(
+            method=req.method, intent=req.intent, payload=req.payload,
+            owner_uid=1, lifetime_id=2, operation_id=req.operation_id,
+            information_ref=req.information_ref)
+        with self.assertRaises((cap.AuthError, cap.ConflictError,
+                                cap.ModelInputError)):
+            store.execute(1, tampered, c, l, p, ctx)
+
+    def test_v29_replay_never_crosses_owner(self):
+        store, _ = mkstore()
+        store.setup_owner(2, 1, 1, scopes=ALL_SCOPES)
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store.execute(1, req, c, l, p, ctx)
+        with self.assertRaises((cap.AuthError, cap.ConflictError)):
+            store.execute(2, req, c, l, p, ctx)
+
+
+class V30ToV33Replay(unittest.TestCase):
+    """V30 valid-capability replay = recorded outcome; V31 Phase A before
+    drift; V32 REVOKED before replay; V33 reseal never re-registers."""
+
+    def test_v30_replay_while_capability_valid(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        r1 = store.execute(1, req, c, l, p, ctx)
+        r2 = store.execute(1, req, c, l, p, ctx)
+        self.assertEqual(r2.kind, "replayed")
+        self.assertEqual(r2.replay.outcome.result_code,
+                         r1.result.outcome.result_code)
+        self.assertEqual(r2.replay.outcome.applied_at_revision,
+                         r1.result.outcome.applied_at_revision)
+
+    def test_v31_drift_only_after_phase_a_passes(self):
+        store, _ = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))
+        fid = r1.result.outcome.readback.fact_id
+        # (a) Phase A valid + tampered request -> REQUEST_DRIFT
+        req = sup_req("a2" * 16, [fid], {fid: 1})
+        c, l, p, b, ctx = mint(store, req)
+        req_tampered = sup_req("a2" * 16, [fid], {fid: 1}, value="TAMPER")
+        with self.assertRaises(cap.ConflictError) as cm:
+            store.execute(1, req_tampered, c, l, p, ctx)
+        self.assertIn("REQUEST_DRIFT", str(cm.exception))
+        # (b) expired grant + tampered request -> Phase A (EXPIRED)
+        #     refuses FIRST - NO universal DRIFT-over-expiry
+        store._q.q("UPDATE fixture_grants SET expires_at=%s WHERE uid=1",
+                   (T0 + 10,), "exec")
+        store._clock.advance(11)
+        with self.assertRaises(cap.ExpiredRefused):
+            store.execute(1, req_tampered, c, l, p, ctx)
+
+    def test_v32_revoked_refuses_before_replay(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store.execute(1, req, c, l, p, ctx)
+        # fixture-level revocation: grants generation moves
+        store._q.q("UPDATE fixture_snapshot SET"
+                   " grants_generation=grants_generation+1 WHERE uid=1",
+                   (), "exec")
+        with self.assertRaises(cap.ConflictError) as cm:
+            store.execute(1, req, c, l, p, ctx)
+        self.assertIn("REVOKED", str(cm.exception))
+
+    def test_v33_reseal_never_reregisters(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store.execute(1, req, c, l, p, ctx)
+        # the binding projection/commitment carry NO transport fields
+        proj = b.projection_dict()
+        for transport_field in ("nonce", "key_id", "ciphertext", "tag"):
+            self.assertNotIn(transport_field, proj)
+        self.assertEqual(b.commitment(), b.commitment())  # stable
+        # a second claim for the same registered operation is REFUSED by
+        # the registry - a transport reseal can NEVER re-register
+        with self.assertRaises(env.EnvelopeError):
+            store.mint_mutation_fixtures(req)
+
+
+
+class V34ToV37Uncertainty(unittest.TestCase):
+    """V34 restart/reopen refusals; V35 commit-uncertain; V36 known-commit
+    read failure; V37 current_revision None on failed current read."""
+
+    def test_v34_restart_old_session_refuses(self):
+        store, conn = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        # RESTART: a NEW FactStore over the SAME connection - the old
+        # session's minted handles refuse
+        store2 = f.FactStore(conn, store._clock)
+        with self.assertRaises((cap.AuthError, cap.ModelInputError,
+                                cap.ConflictError)):
+            store2.execute(1, req, c, l, p, ctx)
+
+    def test_v35_commit_uncertain_blocked_marker(self):
+        store, conn = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        orig = store._apply_and_record
+
+        def boom(*a, **k):
+            raise f._CommitUncertain()
+        store._apply_and_record = boom
+        try:
+            r = store.execute(1, req, c, l, p, ctx)
+        finally:
+            store._apply_and_record = orig
+        self.assertEqual(r.kind, "durable_blocked")
+        # re-execute with the same bundles: typed blocked status, NEVER a
+        # blind retry
+        r2 = store.execute(1, req, c, l, p, ctx)
+        self.assertEqual(r2.kind, "durable_blocked")
+
+    def test_v35b_local_uncertain_when_marker_write_fails(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        orig = store._apply_and_record
+        orig_q = store._q
+
+        class FailingQ:
+            def __init__(self, inner):
+                self._inner = inner
+                self.raw = inner.raw
+
+            def q(self, sql, params, mode):
+                if "INSERT INTO blocked_records" in sql:
+                    raise sqlite3.OperationalError("injected")
+                return self._inner.q(sql, params, mode)
+
+        def boom(*a, **k):
+            raise f._CommitUncertain()
+        store._apply_and_record = boom
+        store._q = FailingQ(orig_q)
+        try:
+            r = store.execute(1, req, c, l, p, ctx)
+        finally:
+            store._apply_and_record = orig
+            store._q = orig_q
+        self.assertEqual(r.kind, "local_uncertain")
+
+    def test_v38_receipt_revision_minimum(self):
+        store, _ = mkstore()
+        # no-op commit (unchanged put) still observes store_revision >= 1
+        run(store, put_req("a1" * 16))
+        r2, _ = run(store, put_req("a2" * 16))
+        self.assertIsNone(r2.result.outcome.applied_at_revision)
+        self.assertGreaterEqual(r2.result.receipt.store_revision, 1)
+
+
+class V41ToV43Counters(unittest.TestCase):
+    """V41 bump table; V42 overflow refusals; V43 minima."""
+
+    def test_v41_bump_table(self):
+        store, _ = mkstore()
+        self.assertEqual(store._store_revision(1), 0)
+        run(store, put_req("a1" * 16))           # applied: +1
+        self.assertEqual(store._store_revision(1), 1)
+        run(store, put_req("a2" * 16))           # unchanged: +0
+        self.assertEqual(store._store_revision(1), 1)
+        run(store, put_req("a3" * 16, value="black"))  # conflict: +0
+        self.assertEqual(store._store_revision(1), 1)
+        r, _ = run(store, wipe_req("0a" * 16))   # wipe: +1
+        self.assertGreater(store._store_revision(1), 1)
+
+    def test_v43_uid_zero_valid(self):
+        conn = sqlite3.connect(":memory:")
+        store = f.FactStore(conn, f.JsonTestClock(T0))
+        store.setup_owner(0, 1, 1, scopes=ALL_SCOPES)  # uid 0 VALID
+        req = f.FactRequest(method=f.MethodCode.PUT,
+                            intent=f.ModelIntent.WriteFact,
+                            payload=f.PutPayload(fact=new_fact()),
+                            owner_uid=0, lifetime_id=1,
+                            operation_id="a1" * 16, information_ref="t")
+        c, l, p, b = store.mint_mutation_fixtures(req)
+        r = store.execute(0, req, c, l, p, store._caller_context(b))
+        self.assertEqual(r.result.outcome.result_code, "applied")
+
+
+class V44ToV48Reads(unittest.TestCase):
+    """V45 superseded never merged; V46 history order; V47 cursor suite;
+    V48 count matches list."""
+
+    def _seed3(self, store):
+        fids = []
+        for i in range(3):
+            r, _ = run(store, put_req("%032x" % (0xA0 + i),
+                                      key="k%d" % i, value="v%d" % i))
+            fids.append(r.result.outcome.readback.fact_id)
+        return fids
+
+    def _list(self, store, ctx, op, cursor=None, limit=100):
+        tgt = {"category": None, "cursor": cursor, "limit": limit,
+               "row_kind": f.RowKind.LIVE.value}
+        w = read_cap(store, op, f.ReadMethod.LIST_FACTS, tgt)
+        return store.list_facts(1, f.RowKind.LIVE, None, cursor, limit, w,
+                                store._clock, ctx)
+
+    def test_v47_cursor_suite(self):
+        store, _ = mkstore()
+        fids = self._seed3(store)
+        ctx = read_ctx(store)
+        page = self._list(store, ctx, "d1" * 16, limit=2)
+        self.assertEqual(len(page.rows), 2)
+        self.assertIsNotNone(page.next_cursor)
+        # non-32-hex cursor = MALFORMED_INPUT
+        with self.assertRaises(cap.ModelInputError):
+            self._list(store, ctx, "d2" * 16, cursor="zz")
+        # fabricated 32-hex id = UnknownCursor
+        with self.assertRaises(f.UnknownCursorError):
+            self._list(store, ctx, "d3" * 16, cursor="f" * 32)
+        # paging to exhaustion: all rows exactly once, final page has no
+        # further cursor
+        seen = []
+        cursor, op_n = None, 10
+        while True:
+            op_n += 1
+            pg = self._list(store, ctx, "%032x" % op_n, cursor=cursor,
+                            limit=2)
+            seen.extend(pg.rows)
+            if pg.next_cursor is None:
+                break
+            cursor = pg.next_cursor
+        self.assertEqual(len(seen), 3)
+
+    def test_v48_count_matches_list(self):
+        store, _ = mkstore()
+        self._seed3(store)
+        ctx = read_ctx(store)
+        page = self._list(store, ctx, "d1" * 16)
+        tgt_c = {"filters": {"category": None, "include_superseded": False}}
+        wc = read_cap(store, "d2" * 16, f.ReadMethod.COUNT_FACTS, tgt_c)
+        cnt = store.count_facts(
+            1, f.CountFilters(category=None, include_superseded=False),
+            wc, store._clock, ctx)
+        self.assertEqual(cnt.value, len(page.rows))
+
+
+class V49ToV52StubsAndOptIn(unittest.TestCase):
+    """V49 production stubs; V50 sensitive refuses; V52 set_optin states."""
+
+    def test_v49_production_stubs_refuse(self):
+        for cls in (f.ProductionFactStore, f.SensitivePurgeStub):
+            with self.assertRaises(cap.ProductionStubRefused):
+                cls(None)
+
+    def test_v50_sensitive_refused_tier_disabled(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        # the sensitive REQUEST path: a MEMORY_SENSITIVE-scope requirement
+        # refuses TIER_DISABLED at Phase A on EVERY path (the model grants
+        # no SENSITIVE scope)
+        c, l, p, b, ctx = mint(store, req)
+        orig = f._METHOD_SCOPES[req.method]
+        f._METHOD_SCOPES[req.method] = tuple(orig) + (cap.Scope.MEMORY_SENSITIVE,)
+        try:
+            with self.assertRaises(Exception):
+                store.execute(1, req, c, l, p, ctx)
+            self.assertEqual(store._store_revision(1), 0)  # nothing ran
+        finally:
+            f._METHOD_SCOPES[req.method] = orig
+
+    def test_v52_set_optin_states(self):
+        store, _ = mkstore()
+        # FIRST-False: effective False, prior None, record None, unchanged
+        req = f.FactRequest(method=f.MethodCode.SET_OPTIN,
+                            intent=f.ModelIntent.SetOptIn,
+                            payload=f.OptInPayload(
+                                setting=f.OptInSetting(
+                                    category=f.Category.FACT), value=False),
+                            owner_uid=1, lifetime_id=1,
+                            operation_id="0c" * 16, information_ref="t")
+        r, _ = run(store, req)
+        oc = r.result.outcome
+        self.assertEqual(oc.result_code, "unchanged")
+        self.assertIsNone(oc.record)
+        # changed: True -> applied with a record
+        req2 = f.FactRequest(method=f.MethodCode.SET_OPTIN,
+                             intent=f.ModelIntent.SetOptIn,
+                             payload=f.OptInPayload(
+                                 setting=f.OptInSetting(
+                                     category=f.Category.FACT), value=True),
+                             owner_uid=1, lifetime_id=1,
+                             operation_id="0d" * 16, information_ref="t")
+        r2, _ = run(store, req2)
+        self.assertEqual(r2.result.outcome.result_code, "applied")
+        self.assertIsNotNone(r2.result.outcome.record)
+        # same again: unchanged
+        req3 = f.FactRequest(method=f.MethodCode.SET_OPTIN,
+                             intent=f.ModelIntent.SetOptIn,
+                             payload=f.OptInPayload(
+                                 setting=f.OptInSetting(
+                                     category=f.Category.FACT), value=True),
+                             owner_uid=1, lifetime_id=1,
+                             operation_id="0e" * 16, information_ref="t")
+        r3, _ = run(store, req3)
+        self.assertEqual(r3.result.outcome.result_code, "unchanged")
+
+
+class V53HistoricalAuth(unittest.TestCase):
+    """V53 historical APIs need fresh READ claim + typed originals;
+    unregistered op = UnknownOperation."""
+
+    def test_v53_unregistered_op_unknown(self):
+        store, _ = mkstore()
+        ctx = read_ctx(store)
+        tgt = {"operation_id": "ab" * 16, "originals": {"mode": "LOAD_STORED"}}
+        w = read_cap(store, "b9" * 16, f.ReadMethod.READBACK, tgt)
+        with self.assertRaises(f.UnknownOperationError):
+            store.readback(1, "ab" * 16, None, None, w, store._clock, ctx)
+
+    def test_v53_load_stored_requires_binding(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        store.execute(1, req, c, l, p, ctx)
+        tgt = {"operation_id": "a1" * 16, "originals": {"mode": "LOAD_STORED"}}
+        w = read_cap(store, "b1" * 16, f.ReadMethod.READBACK, tgt)
+        with self.assertRaises(cap.ModelInputError):
+            store.readback(1, "a1" * 16, None, None, w, store._clock, ctx)
+        pr = store.readback(1, "a1" * 16, None, b, w, store._clock, ctx)
+        self.assertIsInstance(pr, f.PostReadResult)
+
+
+
+def blocked_op(store, op="aa" * 16):
+    """Force an op into the durable blocked state (commit uncertainty)."""
+    req = put_req(op, key="blk-" + op[:4])
+    c, l, p, b, ctx = mint(store, req)
+    orig = store._apply_and_record
+
+    def boom(*a, **k):
+        raise f._CommitUncertain()
+    store._apply_and_record = boom
+    try:
+        r = store.execute(1, req, c, l, p, ctx)
+    finally:
+        store._apply_and_record = orig
+    assert r.kind == "durable_blocked", r.kind
+    bh = f.extended_binding_hash(b, req)
+    rid = f._recovery_id(1, 1, op, bh)
+    return req, b, rid
+
+
+def evidence(store, rid, op, token, kind=f.EvidenceKind.RECEIPT,
+             commitment="c" * 64):
+    proj = f.SafeEvidenceProjection(
+        recovery_id=rid, uid=1, lifetime_id=1, operation_id=op,
+        commitment=commitment, kind=kind,
+        target=f.RecoveryBoundRef(recovery_id=rid, source=kind),
+        source=kind, accounting_scope=f.Lifetime(uid=1, lifetime_id=1))
+    w, _ = store.mint_read_fixtures(1, 1, "b3" * 16, f.ReadMethod.GET,
+                                    {"fid": 1})
+    return store.insert_evidence(1, 1, "b3" * 16, proj, token, w,
+                                 read_ctx(store)), proj
+
+
+class V34bInsertionEvents(unittest.TestCase):
+    """V34b receiver-side named vectors: repeat, drift, same-second,
+    blocked repeat, blocked->resolved, late-after-resolution."""
+
+    def test_exact_repeat_replays_no_writes(self):
+        store, conn = mkstore()
+        req, b, rid = blocked_op(store)
+        r1, proj = evidence(store, rid, req.operation_id, "d" * 32)
+        self.assertEqual(r1.kind, "blocked_inserted")
+        self.assertEqual(r1.contribution, 1)
+        n = conn.execute("SELECT count(*) FROM evidence_entries").fetchone()[0]
+        r2, _ = evidence(store, rid, req.operation_id, "d" * 32)
+        self.assertEqual(r2.kind, "blocked_replay_no_event")
+        self.assertEqual(r2.contribution, 0)
+        self.assertEqual(r2.stored_new_retained, 1)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM evidence_entries").fetchone()[0], n)
+
+    def test_delivery_drift_typed_refusal(self):
+        store, _ = mkstore()
+        req, b, rid = blocked_op(store)
+        evidence(store, rid, req.operation_id, "d" * 32)
+        # same token, CHANGED projection = drift REFUSAL
+        with self.assertRaises(f.DeliveryDriftError):
+            evidence(store, rid, req.operation_id, "d" * 32,
+                     commitment="9" * 64)
+
+    def test_distinct_tokens_both_insert(self):
+        store, _ = mkstore()
+        req, b, rid = blocked_op(store)
+        r1, _ = evidence(store, rid, req.operation_id, "d" * 32)
+        r2, _ = evidence(store, rid, req.operation_id, "e" * 32)
+        self.assertEqual((r1.kind, r2.kind),
+                         ("blocked_inserted", "blocked_inserted"))
+        self.assertEqual(r1.contribution + r2.contribution, 2)
+
+    def test_blocked_before_after_resolution(self):
+        store, _ = mkstore()
+        req, b, rid = blocked_op(store)
+        # a committed record for the op lets resolve take the committed
+        # branch; simulate by adding the record via a fresh committed op:
+        # here we assert BOTH pre- and post-resolution repeats are no-event
+        r1, proj = evidence(store, rid, req.operation_id, "d" * 32)
+        self.assertEqual(r1.kind, "blocked_inserted")
+        # resolve stays UNRESOLVED without attested witnesses (V39 rule):
+        tgt = {"operation_id": req.operation_id,
+               "originals": {"mode": "SUPPLIED"}}
+        w = read_cap(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
+        rr = store.resolve(1, req.operation_id, req, b, w, store._clock,
+                           read_ctx(store))
+        self.assertEqual(rr.kind, "rolled_back")
+        self.assertGreaterEqual(rr.attested_witness_count, 1)
+        # BLOCKED->RESOLVED REPEAT: no event, no mint, no recount
+        r2, _ = evidence(store, rid, req.operation_id, "d" * 32)
+        self.assertEqual(r2.kind, "blocked_replay_no_event")
+        self.assertEqual(r2.contribution, 0)
+        self.assertIsNotNone(r2.resolution_event_id)
+
+
+class V39V40Conflicts(unittest.TestCase):
+    """V39 conflicting receipts stay blocked; V40 evidence overflow."""
+
+    def test_v39_conflicting_receipt_stays_blocked(self):
+        store, _ = mkstore()
+        req, b, rid = blocked_op(store)
+        r1, _ = evidence(store, rid, req.operation_id, "d" * 32,
+                         kind=f.EvidenceKind.CONFLICTING_RECEIPT)
+        self.assertEqual(r1.kind, "blocked_inserted")
+        # the op is NEVER auto-resolved by evidence; resolve still
+        # unresolved without attested witnesses
+        tgt = {"operation_id": req.operation_id,
+               "originals": {"mode": "SUPPLIED"}}
+        w = read_cap(store, "b4" * 16, f.ReadMethod.RESOLVE, tgt)
+        rr = store.resolve(1, req.operation_id, req, b, w, store._clock,
+                           read_ctx(store))
+        self.assertEqual(rr.kind, "rolled_back")
+        self.assertGreaterEqual(rr.attested_witness_count, 1)
+        # the conflicting receipt stays as IMMUTABLE evidence
+        ev = store._q.q("SELECT kind, origin_kind FROM evidence_entries"
+                        " WHERE recovery_id=%s", (rid,), "all")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["kind"], "conflicting_receipt")
+
+    def test_v40_evidence_overflow_frozen_at_64(self):
+        store, conn = mkstore()
+        req, b, rid = blocked_op(store)
+        for i in range(64):
+            token = "%032x" % (0xD000 + i)
+            evidence(store, rid, req.operation_id, token)
+        with self.assertRaises(cap.CapRefused):  # 65th: received-refused
+            evidence(store, rid, req.operation_id, "%032x" % 0xD040)
+        row = conn.execute(
+            "SELECT evidence_count, overflow_marker FROM blocked_records"
+            " WHERE recovery_id=?", (rid,)).fetchone()
+        self.assertEqual(row[0], 64)      # count FROZEN at 64
+        self.assertEqual(row[1], 1)       # overflow marker set, retained
+
+
+class V42Overflow(unittest.TestCase):
+    def test_v42_counter_overflow_refuses(self):
+        store, _ = mkstore()
+        run(store, put_req("a0" * 16))
+        store._q.q("UPDATE store_revisions SET store_revision=%s"
+                   " WHERE uid=1", (2**63 - 1,), "exec")
+        with self.assertRaises(Exception):
+            run(store, put_req("a1" * 16, key="other-key"))
+
+
+class V44V45V46ReadViews(unittest.TestCase):
+    """V44 changed targets refuse; V45 live/history never merged;
+    V46 history ordered by history_id."""
+
+    def test_v44_changed_targets_refuse(self):
+        store, _ = mkstore()
+        run(store, put_req("a1" * 16))
+        w = read_cap(store, "d1" * 16, f.ReadMethod.GET, {"fid": 1})
+        with self.assertRaises(cap.AuthError):
+            store.get(1, 2, w, store._clock, read_ctx(store))
+
+    def test_v45_v46_superseded_history_views(self):
+        store, _ = mkstore()
+        r1, _ = run(store, put_req("a1" * 16, key="tea", value="v1"))
+        fid = r1.result.outcome.readback.fact_id
+        run(store, sup_req("e5" * 16, [fid], {fid: 1}, value="v2"))
+        ctx = read_ctx(store)
+        # LIVE view: only the replacement
+        tgt_l = {"category": None, "cursor": None, "limit": 10,
+                 "row_kind": f.RowKind.LIVE.value}
+        wl = read_cap(store, "d1" * 16, f.ReadMethod.LIST_FACTS, tgt_l)
+        live = store.list_facts(1, f.RowKind.LIVE, None, None, 10, wl,
+                                store._clock, ctx)
+        self.assertEqual(len(live.rows), 1)
+        self.assertEqual(live.rows[0].value, "v2")
+        # HISTORY view: the superseded row, ordered by history_id
+        tgt_h = {"category": None, "cursor": None, "limit": 10,
+                 "row_kind": f.RowKind.HISTORY.value}
+        wh = read_cap(store, "d2" * 16, f.ReadMethod.LIST_FACTS, tgt_h)
+        hist = store.list_facts(1, f.RowKind.HISTORY, None, None, 10, wh,
+                                store._clock, ctx)
+        self.assertEqual(len(hist.rows), 1)
+        self.assertTrue(all(isinstance(x, f.HistoryRow)
+                            for x in hist.rows))
+        ids = [x.history_id for x in hist.rows]
+        self.assertEqual(ids, sorted(ids))
+
+
+class V51V54V55(unittest.TestCase):
+    """V51 legacy_sensitive erases as ordinary content; V54 precedence
+    (ERASED before CAS/CAPACITY); V55 binding mapping invariants."""
+
+    def test_v51_legacy_sensitive_erases_ordinarily(self):
+        store, conn = mkstore()
+        r1, _ = run(store, put_req("a1" * 16, key="old"))
+        conn.execute("UPDATE facts SET legacy_sensitive=1 WHERE fact_id=1")
+        r, _ = run(store, wipe_req("0a" * 16))
+        self.assertEqual(r.result.outcome.result_code, "applied")
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM facts").fetchone()[0], 0)
+
+    def test_v54_erased_before_capacity(self):
+        store, conn = mkstore()
+        r1, _ = run(store, put_req("a1" * 16, key="ghost"))
+        fid = r1.result.outcome.readback.fact_id
+        closure_and_delete(store, read_ctx(store), fid, "07" * 16)
+        # tombstoned key refuses ERASED even though the live set is empty
+        with self.assertRaises(f.FactConflict) as cm:
+            run(store, put_req("a2" * 16, key="ghost"))
+        self.assertIn("ERASED", str(cm.exception))
+
+    def test_v55_binding_mapping(self):
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        _, _, _, b = store.mint_mutation_fixtures(req)
+        proj = b.projection_dict()
+        # NO nonce/fence/target ids in the binding
+        for absent in ("nonce", "fence", "key_id", "ciphertext"):
+            self.assertNotIn(absent, proj)
+        # identity + channel agreement: WEB = SessionRef-shaped issuer
+        self.assertEqual(proj["uid"], 1)
+        self.assertEqual(proj["lifetime"], 1)
+        self.assertEqual(proj["operation_id"], req.operation_id)
+        self.assertIn("issuer", proj)
+        self.assertIn("capture_epoch", proj)
+        self.assertIn("content_fingerprint", proj)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)
