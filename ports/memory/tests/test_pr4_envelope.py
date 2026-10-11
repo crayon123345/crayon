@@ -933,6 +933,139 @@ class BlockerFixTests(unittest.TestCase):
                           msg=bad)
 
 
+class ResidualR2Tests(unittest.TestCase):
+    """Peer r2 residuals 1-5: in-transaction owner/fence validation,
+    SHARE concrete destination, registry semantic coherence, TOCTOU,
+    used-nonce commitment coherence."""
+
+    def test_committed_early_return_validates_evidence_owner_fence(self):
+        registry, _adapter, _clock = make_registry()
+        binding = make_web_binding()
+        claim = registry.claim_model(
+            verified(make_payload(binding)), "worker-1")
+        outcome = make_outcome()
+        registry.record_outcome_model(claim.scope, claim.owner_token,
+                                      claim.fence, outcome)
+        # same outcome, but evidence owner/fence forged: REPLAY even
+        # though the operation is already COMMITTED
+        fake = make_evidence(claim.scope, binding, "f" * 32, 99,
+                             outcome=outcome)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.resolve_unknown_model(
+                claim.scope, claim.owner_token, claim.fence, fake)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.REPLAY)
+
+    def test_toctou_owner_change_before_lock_refuses(self):
+        registry, adapter, _clock = make_registry()
+        claim = registry.claim_model(verified(), "worker-1")
+        # row owner changes between the claim and the record attempt
+        adapter._db.execute(
+            "UPDATE model_operations SET owner_token=? WHERE uid=?",
+            ("f" * 32, UID))
+        adapter._db.commit()
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.record_outcome_model(claim.scope, claim.owner_token,
+                                          claim.fence, make_outcome())
+        self.assertIs(cm.exception.code, env.EnvelopeCode.REPLAY)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.mark_uncertain_model(claim.scope, claim.owner_token,
+                                          claim.fence)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.REPLAY)
+
+    def test_share_requires_concrete_destination(self):
+        # constructor refuses SHARE with a None destination id
+        with self.assertRaises(env.EnvelopeError) as cm:
+            make_web_binding(
+                operation_class=cap.OperationClass.SHARE,
+                required_scopes=(cap.Scope.DATA_SHARE,))
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+        # authenticated canonical payload with SHARE/None destination
+        # refuses at verify
+        import json as _json
+        payload = make_payload()
+        forged = payload.to_dict()
+        forged["operation_class"] = "SHARE"
+        forged["required_scopes"] = ["data.share"]
+        forged["audience"] = {"id": None, "kind": "PRIVATE"}
+        key = make_key()
+        clock = env.SyntheticClock(NOW)
+        token = Fernet(key.material).encrypt(
+            _json.dumps(forged, sort_keys=True,
+                        separators=(",", ":")).encode("utf-8"))
+        envelope = env.ModelOnlyEnvelope(format_version=1, key_id="key-a",
+                                         token=token)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            env.verify_model(envelope, env.SyntheticKeyRing(keys=(key,)),
+                             make_context(payload.binding), clock)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+        # valid concrete destination round trip
+        share = make_web_binding(
+            operation_class=cap.OperationClass.SHARE,
+            required_scopes=(cap.Scope.DATA_SHARE,),
+            audience=env.ModelOnlyAudience(
+                kind=env.AudienceKind.EXTERNAL, id="synthetic-dest-1"))
+        payload = make_payload(share)
+        envelope = env.seal_model(payload, key, clock)
+        result = env.verify_model(envelope,
+                                  env.SyntheticKeyRing(keys=(key,)),
+                                  make_context(share), clock)
+        self.assertEqual(result.binding, share)
+
+    def test_row_semantic_coherence_enforced(self):
+        # well-typed but incoherent rows refuse, exactly like corrupt ones
+        registry, adapter, clock = make_registry()
+        claim = registry.claim_model(verified(), "worker-1")
+        registry.record_outcome_model(claim.scope, claim.owner_token,
+                                      claim.fence, make_outcome())
+        adapter._db.execute(
+            "UPDATE model_operations SET expiry=expiry+100000,"
+            " resolution_deadline=resolution_deadline+200000 WHERE uid=?",
+            (UID,))
+        adapter._db.commit()
+        clock.advance(1000)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.readback_model(claim.scope)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+
+    def test_row_coherence_claimed_with_outcome_and_fence(self):
+        registry, adapter, _clock = make_registry()
+        claim = registry.claim_model(verified(), "worker-1")
+        adapter._db.execute(
+            "UPDATE model_operations SET outcome_ref='x',"
+            " operation_marker_ref='y' WHERE uid=?", (UID,))
+        adapter._db.commit()
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.readback_model(claim.scope)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+        adapter._db.execute(
+            "UPDATE model_operations SET outcome_ref=NULL,"
+            " operation_marker_ref=NULL, fence=2 WHERE uid=?", (UID,))
+        adapter._db.commit()
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.readback_model(claim.scope)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+
+    def test_used_nonce_commitment_coherence(self):
+        registry, adapter, _clock = make_registry()
+        registry.claim_model(verified(), "worker-1")
+        # mutate the registered nonce's commitment to another valid hex
+        adapter._db.execute(
+            "UPDATE model_used_nonces SET commitment=? WHERE nonce=?",
+            (HEX64_B, HEX32_B))
+        adapter._db.commit()
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry.claim_model(verified(), "worker-2")
+        self.assertIs(cm.exception.code, env.EnvelopeCode.REPLAY)
+        # a changed binding reusing the registered nonce also refuses
+        registry2, _adapter2, _clock2 = make_registry()
+        registry2.claim_model(verified(), "worker-1")
+        changed = make_payload(
+            make_web_binding(information_ref="info-ref-2"), nonce=HEX32_B)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            registry2.claim_model(verified(changed), "worker-2")
+        self.assertIs(cm.exception.code, env.EnvelopeCode.REPLAY)
+
+
 class FinalAdditionTests(unittest.TestCase):
     """Peer final-verdict additions: canonical scope order, current
     issuer/session staleness, unique keyring ids, explicit key boundary."""

@@ -4,9 +4,11 @@ Status: MODEL ONLY, UNWIRED. Every construct in
 ports/memory/envelope.py is synthetic and non-authoritative; every
 production entry point is a fail-closed stub. Basis: PR-4 contract v6
 + peer DRAFT-READY verdict and controlling clarification (2026-10-11),
-plus the peer first-pass review blockers 1-8 and final-verdict
+plus the peer first-pass review blockers 1-8, final-verdict
 additions (scope order, current session/issuer, keyring uniqueness,
-explicit key boundary), all folded into this document. Plan v1 (PR-4
+explicit key boundary), and r2 residuals (in-transaction owner/fence
+validation, SHARE concrete destination, registry semantic coherence,
+used-nonce commitment coherence), all folded into this document. Plan v1 (PR-4
 entry), seam prep v4.1 sec 7/9, contract v6, owner decisions record
 v1, PR-1/2/3 merged (main 1af1f78bcd97da0e7851311fb4551ad1f7df1c17).
 
@@ -79,7 +81,8 @@ non-None id, never inferred), audience
 (ModelOnlyAudience: kind {PRIVATE, GROUP, EXTERNAL}, id nonblank safe
 synthetic str <=128 UTF-8 bytes; id None ONLY where the operation
 permits - MODEL default: GROUP requires an id; NOT an enum of actual
-audiences), information_ref (opaque synthetic, <=128 bytes),
+audiences), information_ref (opaque synthetic, <=128 bytes); SHARE requires a
+CONCRETE destination (audience id non-None, never inferred),
 content_fingerprint (64 lower hex), capture_epoch (>=1),
 grant_generation / policy_revision / decision_revision /
 consent_generation (>=0, exact non-bool), extraction_intent /
@@ -161,10 +164,15 @@ memory_markers is NOT implicitly a runtime nonce registry):
   commitment, owner_token, fence, outcome_ref (the FULL binding
   evidence tuple).
 
-Every row read from the registry is shape-, exact-type-, and
-closed-state-validated at the boundary; corrupt rows refuse TYPED
-(MALFORMED). Raw sqlite operational failures propagate DISTINCTLY,
-unwrapped.
+Every row read from the registry is validated at the boundary for
+shape, exact types, closed state, AND semantic coherence: fence is
+EXACTLY 1 (issued once, never reassigned), expiry ==
+capture_time + MAX_AGE, resolution_deadline ==
+expiry + RESOLUTION_WINDOW (checked BIGINT), COMMITTED IFF both
+outcome_ref and operation_marker_ref are non-NULL (every other state
+carries neither). Well-typed but incoherent rows refuse TYPED
+(MALFORMED) exactly like corrupt ones. Raw sqlite operational
+failures propagate DISTINCTLY, unwrapped.
 
 Semantics:
 - claim_model: ONE atomic insert/read + nonce-validation transaction
@@ -177,8 +185,12 @@ Semantics:
   are NEVER reassigned or reused; there is NO lease rollover.
 - Same-operation reseal atomically REGISTERS the new nonce under the
   same operation - NEVER another claim. A nonce crossing to another
-  operation REFUSES (REPLAY). CHANGED projection under the same
-  operation REFUSES (REPLAY). Idempotency is keyed on the canonical
+  operation REFUSES (REPLAY). A registered nonce whose stored
+  operation OR commitment does not match the presented binding
+  REFUSES (REPLAY) - a changed binding under a registered nonce is
+  never accepted. CHANGED projection under the same operation REFUSES
+  (REPLAY). Stored capture_time/expiry must match the immutable
+  verified binding on every same-operation claim. Idempotency is keyed on the canonical
   PLAINTEXT commitment - ciphertext hashes are NEVER idempotency
   evidence (Fernet reseals change bytes).
 - An existing CLAIMED row yields IN_PROGRESS - never a continuation,
@@ -196,8 +208,12 @@ Semantics:
 - mark_uncertain_model: LOCAL receipt ONLY - a timeout CANNOT assert
   a durable UNKNOWN write; this method writes NOTHING.
 - resolve_unknown_model: resolves ONLY from ModelOnlyEffectEvidence
-  whose OWN owner_token/fence match the claim's (method arguments
-  alone are insufficient) AND whose scope + binding commitment match,
+  whose OWN owner_token/fence match the claim's - validated BEFORE
+  EVERY state branch, including the COMMITTED idempotent return, and
+  with method owner/fence compared against the actual row INSIDE the
+  atomic section (no pre-lock-only checks; no reassignment API;
+  corruption fails closed) - AND whose scope + binding commitment
+  match,
   AND a durable synthetic marker readback from the adapter that
   carries the FULL binding: scope (uid, lifetime, operation_id),
   canonical commitment, owner_token, fence, marker ref, and the FULL

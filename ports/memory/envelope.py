@@ -452,6 +452,11 @@ class ModelOnlyRequestBinding:
             if (self.audience.kind is not AudienceKind.GROUP
                     or self.audience.id is None):
                 raise EnvelopeError(EnvelopeCode.MALFORMED)
+        # SHARE requires a CONCRETE destination: audience id non-None,
+        # never inferred (PR-3 SHARE rule)
+        if (self.operation_class is cap.OperationClass.SHARE
+                and self.audience.id is None):
+            raise EnvelopeError(EnvelopeCode.MALFORMED)
         _req_int(self.capture_time, 0)
         _req_int(self.expiry, 0)
         # Immutable submitted expiry: expiry == capture_time + MAX_AGE,
@@ -1034,6 +1039,9 @@ def _validate_operation_row(row):
         raise EnvelopeError(EnvelopeCode.MALFORMED)
     _req_hex(row[4], OWNER_TOKEN_HEX_LEN)          # owner_token
     _req_int(row[5], 1)                            # fence
+    if row[5] != 1:
+        # fences are issued EXACTLY once at 1 and never reassigned
+        raise EnvelopeError(EnvelopeCode.MALFORMED)
     if row[6] is not None:
         _req_safe_str(row[6], REF_MAX_BYTES)       # outcome_ref
     if row[7] is not None:
@@ -1041,6 +1049,18 @@ def _validate_operation_row(row):
     if (row[6] is None) != (row[7] is None):
         raise EnvelopeError(EnvelopeCode.MALFORMED)
     _req_int(row[8], 0)                            # resolution_deadline
+    # SEMANTIC coherence, not just types: immutable time arithmetic and
+    # state/outcome coupling must hold for every stored row
+    if row[2] != _checked_add(row[1], MAX_AGE_SECONDS):
+        raise EnvelopeError(EnvelopeCode.MALFORMED)
+    if row[8] != _checked_add(row[2], RESOLUTION_WINDOW_SECONDS):
+        raise EnvelopeError(EnvelopeCode.MALFORMED)
+    if row[3] == RegistryState.COMMITTED.value:
+        if row[6] is None or row[7] is None:
+            raise EnvelopeError(EnvelopeCode.MALFORMED)
+    elif row[6] is not None or row[7] is not None:
+        # non-COMMITTED states carry NO outcome/marker
+        raise EnvelopeError(EnvelopeCode.MALFORMED)
 
 
 class SyntheticRegistryAdapter:
@@ -1244,9 +1264,14 @@ class ModelOnlyRegistryModel:
             nonce_row = self._adapter.get_nonce(binding.uid,
                                                 binding.lifetime,
                                                 payload.nonce)
-            if nonce_row is not None and nonce_row[0] != binding.operation_id:
-                # nonce crossing to another operation REFUSES
-                raise EnvelopeError(EnvelopeCode.REPLAY)
+            if nonce_row is not None:
+                if nonce_row[0] != binding.operation_id:
+                    # nonce crossing to another operation REFUSES
+                    raise EnvelopeError(EnvelopeCode.REPLAY)
+                if nonce_row[1] != commitment:
+                    # a CHANGED binding under a REGISTERED nonce refuses:
+                    # operation AND commitment must both match
+                    raise EnvelopeError(EnvelopeCode.REPLAY)
             row = self._adapter.get_operation(scope)
             if row is None:
                 owner_token = self._fresh_owner_token()
@@ -1263,6 +1288,10 @@ class ModelOnlyRegistryModel:
                     owner_token=owner_token, outcome=None)
             if row[0] != commitment:
                 # CHANGED projection under the same operation REFUSES
+                raise EnvelopeError(EnvelopeCode.REPLAY)
+            if (row[1] != binding.capture_time
+                    or row[2] != binding.expiry):
+                # stored times must match the IMMUTABLE verified binding
                 raise EnvelopeError(EnvelopeCode.REPLAY)
             # same operation: a reseal atomically REGISTERS the new nonce
             # under the same operation - NEVER another claim
@@ -1302,7 +1331,10 @@ class ModelOnlyRegistryModel:
         disposable transaction. NEVER execute-after-expiry-then-mark.
         Duplicate/late records with the SAME known outcome are idempotent;
         a CHANGED outcome refuses; outcomes are never overwritten."""
-        self._check_scope_owner_fence(scope, owner_token, fence)
+        if type(scope) is not ModelOnlyOperationScope:
+            raise EnvelopeError(EnvelopeCode.MALFORMED)
+        _req_hex(owner_token, OWNER_TOKEN_HEX_LEN)
+        _req_int(fence, 1)
         if type(outcome) is not ModelOnlyOutcome:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
         expired_tombstoned = False
@@ -1311,6 +1343,9 @@ class ModelOnlyRegistryModel:
             # before the state/effect-marker decision, validated per read
             now = _clock_now(self._clock)
             row = self._require_row(scope)
+            # owner/fence validated INSIDE the atomic section
+            if row[4] != owner_token or row[5] != fence:
+                raise EnvelopeError(EnvelopeCode.REPLAY)
             state = RegistryState(row[3])
             if state is RegistryState.CLAIMED and now >= row[2]:
                 # expired pending -> blocked EXPIRED tombstone, never NEW.
@@ -1343,9 +1378,14 @@ class ModelOnlyRegistryModel:
                              ) -> ModelOnlyUncertainReceipt:
         """LOCAL uncertainty receipt. A timeout CANNOT assert a durable
         UNKNOWN write; this method writes NOTHING."""
-        self._check_scope_owner_fence(scope, owner_token, fence)
+        if type(scope) is not ModelOnlyOperationScope:
+            raise EnvelopeError(EnvelopeCode.MALFORMED)
+        _req_hex(owner_token, OWNER_TOKEN_HEX_LEN)
+        _req_int(fence, 1)
         with self._adapter.transaction():
             row = self._require_row(scope)
+            if row[4] != owner_token or row[5] != fence:
+                raise EnvelopeError(EnvelopeCode.REPLAY)
             state = RegistryState(row[3])
             if state not in (RegistryState.CLAIMED, RegistryState.UNKNOWN):
                 raise EnvelopeError(EnvelopeCode.MALFORMED)
@@ -1363,13 +1403,23 @@ class ModelOnlyRegistryModel:
         not-written certainty, no retry grant. LATE confirmed-marker
         evidence CAN resolve UNKNOWN after expiry (accounting for an
         already-occurring effect); it NEVER grants fresh execution."""
-        self._check_scope_owner_fence(scope, owner_token, fence)
+        if type(scope) is not ModelOnlyOperationScope:
+            raise EnvelopeError(EnvelopeCode.MALFORMED)
+        _req_hex(owner_token, OWNER_TOKEN_HEX_LEN)
+        _req_int(fence, 1)
         if type(evidence) is not ModelOnlyEffectEvidence:
             raise EnvelopeError(EnvelopeCode.MALFORMED)
         if evidence.scope != scope:
             raise EnvelopeError(EnvelopeCode.REPLAY)
         with self._adapter.transaction():
             row = self._require_row(scope)
+            # method AND evidence owner/fence validated INSIDE the atomic
+            # section, BEFORE every state branch or idempotent return
+            if row[4] != owner_token or row[5] != fence:
+                raise EnvelopeError(EnvelopeCode.REPLAY)
+            if (evidence.owner_token != row[4]
+                    or evidence.fence != row[5]):
+                raise EnvelopeError(EnvelopeCode.REPLAY)
             state = RegistryState(row[3])
             if state is RegistryState.EXPIRED:
                 # tombstones never reopen
@@ -1382,11 +1432,6 @@ class ModelOnlyRegistryModel:
                         and row[6] == evidence.outcome.outcome_ref
                         and row[7] == evidence.operation_marker_ref):
                     return _row_to_record(scope, row)
-                raise EnvelopeError(EnvelopeCode.REPLAY)
-            # the EVIDENCE's owner/fence must match the claim's - not only
-            # the method arguments
-            if (evidence.owner_token != row[4]
-                    or evidence.fence != row[5]):
                 raise EnvelopeError(EnvelopeCode.REPLAY)
             if evidence.effect_state is EffectState.CONFIRMED_COMMITTED:
                 marker = self._adapter.get_marker(
@@ -1425,16 +1470,6 @@ class ModelOnlyRegistryModel:
             if row is None:
                 return None
             return _row_to_record(scope, row)
-
-    def _check_scope_owner_fence(self, scope, owner_token, fence):
-        if type(scope) is not ModelOnlyOperationScope:
-            raise EnvelopeError(EnvelopeCode.MALFORMED)
-        _req_hex(owner_token, OWNER_TOKEN_HEX_LEN)
-        _req_int(fence, 1)
-        row = self._adapter.get_operation(scope)
-        if row is not None and (row[4] != owner_token or row[5] != fence):
-            # stale owner or fence CANNOT complete
-            raise EnvelopeError(EnvelopeCode.REPLAY)
 
     def _require_row(self, scope):
         row = self._adapter.get_operation(scope)
