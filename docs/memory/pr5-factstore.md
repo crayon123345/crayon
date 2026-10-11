@@ -127,8 +127,12 @@ Covered by the suite (115 tests):
   an applied readback outcome; REFUSED preserves BOTH the delivered
   certainty AND revision R with no re-execute; the FactStore WIPE
   erase lands an applied outcome with the live row gone on readback at
-  a FRESH revision R' > R; CLEARED post-erase records completion with
-  the erased revision/outcome untouched; teardown runs the same hook
+  a FRESH revision R' > R; BOTH REFUSED and CLEARED are exercised
+  AFTER the known erase/readback: REFUSED post-erase BLOCKS the erase
+  step's completion record (no scrub_log row, R' and the delivered
+  certainty retained, NO re-execute); CLEARED post-erase records
+  completion ONLY after the live coverage passes with the erased
+  revision/outcome/certainty untouched; teardown runs the same hook
   standalone. A standalone scrub_log row is NOT integration proof.
   PENDING RESTART (unacked rows redelivered with the SAME token), LOST
   RECEIVER ACK (row stays pending; same-token redelivery replays
@@ -228,7 +232,15 @@ Covered by the suite (115 tests):
   subject, event, destination, triple, anchor, source) - a
   missing/wrong ledger/class/subject/triple/anchor/source/count is a
   typed EvidenceIntegrityError on BOTH paths, never an incoherent
-  default success. W1 adds the INSERTION-IDENTITY/COUNT proof (v80
+  default success. The SAME FULL validation runs on EVERY canonical
+  path (late branch, forced-fence loser branch, AND the dedup/confirm
+  read): the resolved anchor identity is verified ALWAYS, including an
+  EMPTY ledger set (a zeroed-count event with no ledger rows refuses);
+  the SELECTED delivery is bound EXACTLY - the answered evidence row
+  must itself be a ledger member of the event (a row bound to a
+  coherent event for a DIFFERENT delivery refuses); and the event<->
+  evidence set is BIDIRECTIONALLY equal (an extra evidence row
+  claiming the event with no ledger entry refuses). W1 adds the INSERTION-IDENTITY/COUNT proof (v80
   960-965): each joined evidence row's inserting uid/lifetime/op
   EQUALS the event's inserting identity (mutations on EITHER the
   evidence row OR the event row refuse typed on BOTH paths), and

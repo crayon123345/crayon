@@ -2239,6 +2239,70 @@ class V34bHarnessVectors(unittest.TestCase):
                 finally:
                     store._q.q = orig_q
 
+        # W1-A: the SELECTED delivery is bound EXACTLY - D's evidence
+        # row claiming E's event makes a retry of D REFUSE (never a
+        # coherent answer from E's event)
+        store, conn = mkstore()
+        req, b, rid = blocked_op(store, op="aa" * 16)
+        resolve_op(store, req, b)
+        rd, _ = evidence(store, rid, req.operation_id, "d" * 32)
+        re_, _ = evidence(store, rid, req.operation_id, "e" * 32)
+        self.assertEqual(rd.kind, "inserted")
+        self.assertEqual(re_.kind, "inserted")
+        # bind D's row to E's event: a retry of D must REFUSE - the
+        # selected delivery is never answered from a coherent event
+        # for a DIFFERENT delivery
+        conn.execute(
+            "UPDATE evidence_entries SET insertion_event_id=?"
+            " WHERE delivery_token=?", (re_.event_id, "d" * 32))
+        conn.commit()
+        with self.assertRaises(f.EvidenceIntegrityError):
+            evidence(store, rid, req.operation_id, "d" * 32)
+        orig_q = force_real_unique_conflict(store)
+        try:
+            with self.assertRaises(f.EvidenceIntegrityError):
+                evidence(store, rid, req.operation_id, "d" * 32)
+        finally:
+            store._q.q = orig_q
+
+        # W1-B: an EMPTY ledger with matching zeroed counts STILL
+        # refuses: the anchor + selected-delivery checks are never
+        # skipped by an empty row set
+        store, conn, req, rid = rig_and_insert()
+        conn.execute("DELETE FROM resolution_event_ledger")
+        conn.execute("UPDATE insertion_events SET inserted_count=0,"
+                     " new_retained=1")
+        conn.commit()
+        with self.assertRaises(f.EvidenceIntegrityError):
+            evidence(store, rid, req.operation_id, "d" * 32)
+        orig_q = force_real_unique_conflict(store)
+        try:
+            with self.assertRaises(f.EvidenceIntegrityError):
+                evidence(store, rid, req.operation_id, "d" * 32)
+        finally:
+            store._q.q = orig_q
+
+        # W1-C: an EXTRA evidence row (distinct token) claiming the
+        # SAME event with NO ledger entry diverges the bidirectional
+        # event<->evidence set: refuses on BOTH paths
+        store, conn, req, rid = rig_and_insert()
+        conn.execute(
+            "INSERT INTO evidence_entries SELECT 'ee'||evidence_id,"
+            " recovery_id, kind, 'ee'||delivery_token, received_at,"
+            " ref, projection_json, insertion_event_id,"
+            " resolution_event_id, origin_kind, inserting_uid,"
+            " inserting_lifetime_id, inserting_operation_id"
+            " FROM evidence_entries")
+        conn.commit()
+        with self.assertRaises(f.EvidenceIntegrityError):
+            evidence(store, rid, req.operation_id, "d" * 32)
+        orig_q = force_real_unique_conflict(store)
+        try:
+            with self.assertRaises(f.EvidenceIntegrityError):
+                evidence(store, rid, req.operation_id, "d" * 32)
+        finally:
+            store._q.q = orig_q
+
     def test_w1_write_leg_enforces_inserting_op_equality(self):
         # v80 1050-1074 WRITE leg: the inserting operation identity is
         # ENFORCED - cap.request.operation_id == the registered
@@ -2285,10 +2349,13 @@ class V34bHarnessVectors(unittest.TestCase):
 
     def test_w2_scrub_factstore_erase_readback_revision(self):
         # W2 (v80 2060-2137 + the FactStore erase/readback gate): the
-        # scrub hook composed with a KNOWN FactStore mutation commit +
-        # erase/readback outcome + REVISION proof - a standalone
-        # scrub_log row is NOT integration proof, and outbox-state
-        # preservation alone is NOT the chosen locked post-erase gate
+        # scrub hook composed with a KNOWN FactStore erase/readback
+        # outcome + REVISION proof - REFUSED and CLEARED are BOTH
+        # exercised AFTER the known erase: the refusal BLOCKS the erase
+        # step's completion record (nothing recorded, R' retained, no
+        # re-execute); the clear records completion AFTER the live
+        # coverage with R'/outcome/certainty untouched. A standalone
+        # scrub_log row or outbox anchor alone is NOT the proof.
         store, req, b, rid, provider, harness, proj, oconn = self._rig()
         # the KNOWN mutation commit + its readback outcome/revision
         r1, _ = run(store, put_req("9e" * 16, key="w2key"))
@@ -2301,27 +2368,31 @@ class V34bHarnessVectors(unittest.TestCase):
         harness.send(comp.token)
         d = provider.deliver({"projection": proj, "token": comp.token})
         self.assertEqual(harness.ack(d["ack"]).kind, "delivered")
-
-        class Stuck:
-            pass  # raw cannot be discarded -> REFUSED
-
-        # REFUSED: the locked commit's certainty AND the FactStore
-        # revision are BOTH preserved; NO re-execute, NOTHING recorded
-        out = harness.scrub(comp.token, {
-            "raw_ref_handle": Stuck(), "comparison_buffer": None})
-        self.assertEqual(out["kind"], "refused")
-        self.assertEqual(harness.outbox_state(comp.token), "delivered")
-        self.assertEqual(store._store_revision(1), rev_committed)
-        self.assertEqual(harness.redeliver_pending()["redelivered"], [])
-        self.assertEqual(oconn.execute(
-            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
-
-        # the FactStore ERASE of the known mutation: applied outcome,
-        # the live row GONE on readback, a FRESH revision
+        # the KNOWN ERASE/READBACK: the invoker/result binding is the
+        # ACTUAL wipe op ("0f"*16) -> its applied outcome + the captured
+        # fresh revision; the live row is GONE on readback
         rw, _ = run(store, wipe_req("0f" * 16))
         self.assertEqual(rw.result.outcome.result_code, "applied")
         rev_erased = store._store_revision(1)
         self.assertGreater(rev_erased, rev_committed)
+        self.assertEqual(store._q.q(
+            "SELECT count(*) AS n FROM facts", (), "one")["n"], 0)
+
+        class Stuck:
+            pass  # raw cannot be discarded -> REFUSED
+
+        # REFUSED AFTER the known erase/readback: the erase step's
+        # COMPLETION (the scrub_log row keyed to the step token) stays
+        # BLOCKED - nothing recorded, the R' revision AND the delivered
+        # certainty are retained, NO re-execute
+        out = harness.scrub(comp.token, {
+            "raw_ref_handle": Stuck(), "comparison_buffer": None})
+        self.assertEqual(out["kind"], "refused")
+        self.assertEqual(harness.outbox_state(comp.token), "delivered")
+        self.assertEqual(store._store_revision(1), rev_erased)
+        self.assertEqual(harness.redeliver_pending()["redelivered"], [])
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
         self.assertEqual(store._q.q(
             "SELECT count(*) AS n FROM facts", (), "one")["n"], 0)
 
@@ -2335,8 +2406,9 @@ class V34bHarnessVectors(unittest.TestCase):
             def live_raw(self):
                 return self._raw is not None
 
-        # CLEARED post-erase: the step records completion; the erased
-        # revision/outcome is UNTOUCHED (no re-execute, no rollback)
+        # CLEARED AFTER the known erase/readback: completion recorded
+        # ONLY AFTER the live coverage passes; the erased outcome,
+        # revision R', and the delivered certainty are ALL untouched
         out2 = harness.scrub(comp.token, {
             "raw_ref_handle": OwnedHandle(),
             "comparison_buffer": OwnedHandle()})
@@ -2348,7 +2420,8 @@ class V34bHarnessVectors(unittest.TestCase):
         self.assertEqual(oconn.execute(
             "SELECT count(*) FROM scrub_log WHERE token=?",
             (comp.token,)).fetchone()[0], 1)
-        # TEARDOWN: the SAME hook standalone - cleared, records NOTHING
+        # TEARDOWN: the SAME hook standalone - cleared, records NOTHING,
+        # the revision/outcome state is retained
         outcome = harness.scrub_hook({
             "raw_ref_handle": OwnedHandle(),
             "comparison_buffer": OwnedHandle()})
