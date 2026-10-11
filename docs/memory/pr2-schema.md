@@ -39,14 +39,15 @@ ALTER TABLE facts ADD COLUMN row_version BIGINT NOT NULL DEFAULT 0;
 CREATE TABLE fact_history(
   id                  BIGSERIAL PRIMARY KEY,
   user_id             BIGINT NOT NULL,
-  owner_lifetime      BIGINT NOT NULL,
+  owner_lifetime      BIGINT NOT NULL CHECK (owner_lifetime >= 1),
   fact_id             BIGINT NOT NULL,
   source_row_version  BIGINT NOT NULL CHECK (source_row_version >= 0),
   closed_reason       TEXT NOT NULL
                       CHECK (closed_reason IN ('supersede','consolidate')),
   superseded_by_version BIGINT NOT NULL CHECK (superseded_by_version >= 1),
-  operation_id        TEXT NOT NULL,
-  replacement_fact_id BIGINT,
+  operation_id        TEXT NOT NULL
+                      CHECK (length(btrim(operation_id)) > 0),
+  replacement_fact_id BIGINT NOT NULL,
   archived_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   content_payload     BYTEA NOT NULL,
   UNIQUE (user_id, owner_lifetime, fact_id, source_row_version)
@@ -67,6 +68,13 @@ CREATE TABLE fact_history(
   and the identity pair (replacement_fact_id, owner_lifetime) carries
   the actual identity. The N-to-1 junction is explicit: all N history
   rows share one operation_id and the surviving replacement_fact_id.
+- replacement_fact_id is REQUIRED (NOT NULL): the only supported
+  closing reasons ('supersede','consolidate') BOTH close into a
+  replacement - deletion-content history never exists, so a NULL
+  replacement is always malformed. owner_lifetime >= 1 and a nonblank
+  operation_id are enforced by CHECKs. No global ordering is claimed
+  across DIFFERENT facts' versions - superseded_by_version is only
+  ever read paired with replacement_fact_id + owner_lifetime.
 - content_payload: ONE serialized authenticated-encryption envelope
   holding the ENTIRE content snapshot - fact key, value, category,
   source AND the provenance snapshot (excerpt, capture timestamp,
@@ -77,9 +85,9 @@ CREATE TABLE fact_history(
   tombstones; NO plaintext content indexes; NO why-logs.
 - Erasure-class operations PHYSICALLY REMOVE applicable rows;
   deletion-content history is NEVER inserted.
-- NO SUPERSEDE-EVENT epoch column exists (PR-1's superseded_by_epoch
-  concept is renamed to superseded_by_version + operation_id +
-  replacement lineage). owner_lifetime STAYS: it is the lifetime
+- NO SUPERSEDE-EVENT epoch column exists (v3's superseded_by_epoch
+  concept - a PR-2 v3 invention, never a PR-1 element - is renamed to
+  superseded_by_version + operation_id + replacement lineage). owner_lifetime STAYS: it is the lifetime
   identity (a PR-1 allocation) that began the account lifetime, not a
   per-supersede counter. Its derivation detail stays OPEN for
   implementation review - synthetic lifetimes in tests are not
@@ -240,9 +248,16 @@ industry-practice claims.
 ## Local test note
 
 ports/memory/tests/test_pr2_schema.py runs against a LOCAL disposable
-sqlite design-model mirror (dialect adaptations: trim() for btrim(),
-length-only digest CHECK plus python-layer hex validation, BLOB for
-BYTEA) with paramstyle translation so the shipped SQL strings are what
-execute, plus stdlib HMAC vector tests INLINE in the test file. No
-hosted or external database is written anywhere; a hosted test-schema
-run needs a separate approved authority.
+sqlite design-model mirror. There are NO shipped module SQL strings in
+PR-2 (no source helper exists), so the mirror HAND-TRANSLATES the
+proposed DDL above with stated dialect adaptations (trim() for
+btrim(), BLOB for BYTEA, length-only digest CHECK plus a python-layer
+hex validator wired into the test-local write boundary, TEXT
+timestamps) - unlike PR-1, no shipped-SQL execution is claimed. The
+python-layer write boundary validates digests before persisting;
+direct raw SQL bypasses it, and that mirror gap is pinned by an
+explicit test so it is never mistaken for the contract. NFC results
+are pinned to the test runtime's unicodedata version (reported by a
+test); cross-runtime NFC equivalence is an OPEN gate, not claimed.
+No hosted or external database is written anywhere; a hosted
+test-schema run needs a separate approved authority.

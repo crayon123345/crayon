@@ -7,9 +7,15 @@ helper exists); the sqlite mirror below HAND-TRANSLATES the proposed
 DDL from docs/memory/pr2-schema.md with these dialect adaptations:
 - btrim()          -> trim()
 - BYTEA            -> BLOB
-- digest regex CHECK '~' (Postgres) -> length=64 CHECK + python-layer
-  hex validation (sqlite has no built-in regexp)
+- digest regex CHECK '~' (Postgres) -> length=64 CHECK + a python-layer
+  hex validator WIRED INTO the test-local write boundary (direct raw
+  SQL bypasses it - dialect gap stated honestly and exercised by one
+  explicit test; the validator-protected model path is the contract)
 - TIMESTAMPTZ DEFAULT now() -> TEXT DEFAULT CURRENT_TIMESTAMP
+Unicode/runtime assumptions: NFC results are pinned to THIS runtime's
+unicodedata (Python 3, Unicode version reported by the test run);
+cross-runtime NFC equivalence (other ICU/Unicode versions) is an OPEN
+gate, NOT claimed here.
 content_payload is SYNTHETIC OPAQUE MOCK BYTES - never parsed, never
 encryption proof. All keys/inputs are synthetic public test values.
 """
@@ -29,6 +35,7 @@ MARKER_INPUT_MAX_BYTES = 4096  # frozen marker-input limit (sec 5);
                                # NOT the 500-codepoint provenance budget
 NORM_VERSION = "nfc-lf-v1"
 FRAME_DOMAIN = b"crayon.memory-marker.v1\x00"
+BIGINT_MAX = 9223372036854775807
 
 # synthetic public vector constants (peer-supplied, compute-verified)
 VKEY = bytes(range(32))          # K = bytes 00..1f
@@ -47,7 +54,22 @@ class CASMismatch(DesignError):
     """Explicit CAS conflict - never silent."""
 
 
+class VersionOverflow(DesignError):
+    """Signed BIGINT row_version overflow - fail closed, row unchanged."""
+
+
 # ----- design-model helpers (TEST-local, NOT shipped source) -----
+
+def require_version(value, what):
+    """Shared exact-version validator: BOTH expected and stored
+    versions must be exact non-bool ints >= 0. bool True/False and
+    float 1.0 are REJECTED (True == 1 and 1.0 == 1 would otherwise
+    silently pass a CAS compare)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DesignError("%s must be an exact non-bool int >= 0"
+                          % (what,))
+    return value
+
 
 def canon_uid(uid):
     """uid -> canonical ASCII decimal bytes. Validated EXACT int only:
@@ -106,7 +128,9 @@ def marker_digest(key, uid, text, profile=NORM_VERSION):
 
 def validate_digest_hex(digest):
     """Python-layer ACTUAL hex validation (mirrors the proposed
-    Postgres regex CHECK '^[0-9a-f]{64}$')."""
+    Postgres regex CHECK '^[0-9a-f]{64}$'). WIRED INTO the test-local
+    marker write boundary (insert_marker) - the model path never
+    persists an unvalidated digest."""
     if not isinstance(digest, str) or len(digest) != 64:
         raise DesignError("digest must be 64 hex chars")
     if any(c not in "0123456789abcdef" for c in digest):
@@ -127,14 +151,16 @@ SCHEMA = (
     " provenance_payload BLOB,"
     " UNIQUE(user_id, key), CHECK (row_version >= 0))",
     "CREATE TABLE fact_history(id INTEGER PRIMARY KEY,"
-    " user_id INTEGER NOT NULL, owner_lifetime INTEGER NOT NULL,"
+    " user_id INTEGER NOT NULL,"
+    " owner_lifetime INTEGER NOT NULL CHECK (owner_lifetime >= 1),"
     " fact_id INTEGER NOT NULL,"
     " source_row_version INTEGER NOT NULL CHECK (source_row_version >= 0),"
     " closed_reason TEXT NOT NULL"
     " CHECK (closed_reason IN ('supersede','consolidate')),"
     " superseded_by_version INTEGER NOT NULL"
     " CHECK (superseded_by_version >= 1),"
-    " operation_id TEXT NOT NULL, replacement_fact_id INTEGER,"
+    " operation_id TEXT NOT NULL CHECK (length(trim(operation_id)) > 0),"
+    " replacement_fact_id INTEGER NOT NULL,"
     " archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
     " content_payload BLOB NOT NULL,"
     " UNIQUE(user_id, owner_lifetime, fact_id, source_row_version))",
@@ -163,6 +189,19 @@ def fresh_db(path):
     for stmt in SCHEMA:
         conn.execute(stmt)
     return conn
+
+
+def insert_marker(db, uid, mtype, key_id, nver, digest, epoch):
+    """TEST-LOCAL WRITE BOUNDARY for markers: the digest is validated
+    (validate_digest_hex) BEFORE persisting - the model path never
+    stores an unvalidated digest. (Direct raw SQL bypasses this; that
+    dialect gap is exercised explicitly in its own test.)"""
+    validate_digest_hex(digest)
+    db.execute(
+        "INSERT INTO memory_markers(user_id,marker_type,key_id,"
+        "normalization_version,content_key_digest,created_epoch)"
+        " VALUES (?,?,?,?,?,?)",
+        (uid, mtype, key_id, nver, digest, epoch))
 
 
 class DBCase(unittest.TestCase):
@@ -210,29 +249,37 @@ class TestSchemaLifecycle(DBCase):
 
 
 class TestRowVersionModel(DBCase):
-    """Design-model writer probes: strict increase, identical replay
-    unchanged, explicit CAS mismatch. The writer itself is a LATER PR;
-    this models the contract the schema is shaped for."""
+    """Design-model writer probes: exact-version validation on BOTH
+    expected and stored versions, strict increase, identical replay
+    unchanged, explicit CAS mismatch, typed fail-closed overflow.
+    The writer itself is a LATER PR; this models its contract."""
 
     def _write(self, uid, key, value, expected_version):
+        require_version(expected_version, "expected_version")
         row = self.db.execute(
             "SELECT id, value, row_version FROM facts"
             " WHERE user_id=? AND key=?", (uid, key)).fetchone()
         if row is None:
+            if expected_version != 0:
+                # no silent create under a nonzero expectation
+                raise CASMismatch("no row exists; expected_version"
+                                  " must be 0")
             # seam-created rows start at version 1; 0 = legacy only
             self.db.execute(
                 "INSERT INTO facts(user_id,key,value,row_version)"
                 " VALUES (?,?,?,1)", (uid, key, value))
             return 1
-        if row["row_version"] != expected_version:
+        stored = require_version(row["row_version"], "stored row_version")
+        if stored != expected_version:
             raise CASMismatch("expected %r, found %r"
-                              % (expected_version, row["row_version"]))
+                              % (expected_version, stored))
         if row["value"] == value:
-            return row["row_version"]  # identical replay: UNCHANGED
-        new = row["row_version"] + 1   # strict increase
+            return stored  # identical replay: UNCHANGED
+        if stored >= BIGINT_MAX:
+            raise VersionOverflow("row_version at signed BIGINT max")
         self.db.execute("UPDATE facts SET value=?, row_version=?"
-                        " WHERE id=?", (value, new, row["id"]))
-        return new
+                        " WHERE id=?", (value, stored + 1, row["id"]))
+        return stored + 1
 
     def test_strict_increase_and_identical_replay(self):
         self.assertEqual(self._write(1, "k", "v1", 0), 1)
@@ -244,16 +291,48 @@ class TestRowVersionModel(DBCase):
         with self.assertRaises(CASMismatch):
             self._write(1, "k", "v2", 7)
 
-    def test_row_version_exact_nonbool_int(self):
-        for bad in (True, False, 1.5, "1", None):
+    def test_writer_rejects_inexact_expected_versions(self):
+        """Writer-level rejection (NOT self-raised): True, 1.0, -1,
+        'x', None never reach the CAS compare."""
+        self._write(1, "k", "v1", 0)  # row at version 1
+        for bad in (True, False, 1.0, 0.0, -1, "1", None):
             with self.assertRaises(DesignError, msg=repr(bad)):
-                if isinstance(bad, bool) or not isinstance(bad, int):
-                    raise DesignError("row_version must be exact int")
+                self._write(1, "k", "v2", bad)
+        row = self.db.execute("SELECT value, row_version FROM facts"
+                              " WHERE user_id=1 AND key='k'").fetchone()
+        self.assertEqual((row["value"], row["row_version"]), ("v1", 1))
+
+    def test_writer_rejects_corrupt_stored_version(self):
+        """A corrupted stored version (TEXT in the INTEGER column)
+        fails closed at the writer, never coerced."""
+        self._write(1, "k", "v1", 0)
+        self.db.execute("UPDATE facts SET row_version='abc'"
+                        " WHERE user_id=1 AND key='k'")
+        with self.assertRaises(DesignError):
+            self._write(1, "k", "v2", 1)
+
+    def test_no_silent_create_without_row(self):
+        with self.assertRaises(CASMismatch):
+            self._write(1, "ghost", "v", 5)
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM facts WHERE user_id=1 AND key='ghost'"
+        ).fetchone())
+
+    def test_overflow_fails_closed_row_unchanged(self):
+        self._write(1, "k", "v1", 0)
+        self.db.execute("UPDATE facts SET row_version=?"
+                        " WHERE user_id=1 AND key='k'", (BIGINT_MAX,))
+        with self.assertRaises(VersionOverflow):
+            self._write(1, "k", "v2", BIGINT_MAX)
+        row = self.db.execute("SELECT value, row_version FROM facts"
+                              " WHERE user_id=1 AND key='k'").fetchone()
+        self.assertEqual((row["value"], row["row_version"]),
+                         ("v1", BIGINT_MAX))
 
 
 class TestFactHistory(DBCase):
     def _insert(self, uid=1, lifetime=100, fact_id=10, srv=0,
-                reason="supersede", sbv=1, op="op-1", repl=None,
+                reason="supersede", sbv=1, op="op-1", repl=99,
                 payload=b"\x00mock-envelope-not-encryption\x01"):
         self.db.execute(
             "INSERT INTO fact_history(user_id,owner_lifetime,fact_id,"
@@ -279,58 +358,108 @@ class TestFactHistory(DBCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self._insert(sbv=0)  # fresh replacements start at 1
 
+    def test_replacement_referent_required(self):
+        """Both supported closing reasons close INTO a replacement:
+        NULL replacement, lifetime < 1, and blank operation_id are
+        refused by the schema itself."""
+        for reason in ("supersede", "consolidate"):
+            with self.assertRaises((sqlite3.IntegrityError,
+                                    sqlite3.OperationalError),
+                                   msg=reason):
+                self.db.execute(
+                    "INSERT INTO fact_history(user_id,owner_lifetime,"
+                    "fact_id,source_row_version,closed_reason,"
+                    "superseded_by_version,operation_id,"
+                    "replacement_fact_id,content_payload)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (1, 100, 10, 0, reason, 1, "op-x", None, b"\x00"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert(lifetime=0)
+        for bad_op in ("", "   "):
+            with self.assertRaises(sqlite3.IntegrityError, msg=repr(bad_op)):
+                self._insert(op=bad_op)
+
     def test_snapshot_uniqueness(self):
         self._insert(srv=0)
         with self.assertRaises(sqlite3.IntegrityError):
             self._insert(srv=0)  # (owner,lifetime,fact,src_version) dup
         self._insert(srv=1)  # next version is a new snapshot
 
-    def test_n_to_1_junction_grouping(self):
-        """N consolidated facts -> one replacement: all N history rows
-        share one operation_id + the surviving replacement_fact_id."""
-        self._insert(fact_id=10, srv=0, reason="consolidate",
+    def test_n_to_1_junction_with_real_replacement(self):
+        """Meaningful N-to-1: the replacement fact row EXISTS at
+        version 1 (seam-created) with the SAME owner + lifetime the
+        history rows reference. No global ordering is asserted across
+        different facts' versions."""
+        self.db.execute(
+            "INSERT INTO facts(id,user_id,key,value,row_version)"
+            " VALUES (99,1,'merged','v',1)")
+        self._insert(fact_id=10, srv=0, reason="consolidate", sbv=1,
                      op="op-merge-1", repl=99)
-        self._insert(fact_id=11, srv=0, reason="consolidate",
+        self._insert(fact_id=11, srv=0, reason="consolidate", sbv=1,
                      op="op-merge-1", repl=99)
         rows = self.db.execute(
-            "SELECT fact_id FROM fact_history WHERE operation_id=?"
-            " AND replacement_fact_id=?", ("op-merge-1", 99)).fetchall()
+            "SELECT h.fact_id, h.owner_lifetime, f.row_version"
+            " FROM fact_history h JOIN facts f"
+            " ON f.id = h.replacement_fact_id"
+            " AND f.user_id = h.user_id"
+            " WHERE h.operation_id='op-merge-1'").fetchall()
         self.assertEqual({r["fact_id"] for r in rows}, {10, 11})
+        for r in rows:
+            self.assertEqual(r["owner_lifetime"], 100)
+            self.assertEqual(r["row_version"], 1)  # the referenced
+            # replacement's post-commit version
 
 
 class TestMarkers(DBCase):
     DIG = EXPECTED_1
 
-    def _insert(self, uid=1, mtype="erased_content", key_id="mk1",
-                nver=NORM_VERSION, digest=DIG, epoch=1):
-        self.db.execute(
-            "INSERT INTO memory_markers(user_id,marker_type,key_id,"
-            "normalization_version,content_key_digest,created_epoch)"
-            " VALUES (?,?,?,?,?,?)",
-            (uid, mtype, key_id, nver, digest, epoch))
-
     def test_uniqueness_tuple(self):
-        self._insert()
+        insert_marker(self.db, 1, "erased_content", "mk1",
+                      NORM_VERSION, self.DIG, 1)
         with self.assertRaises(sqlite3.IntegrityError):
-            self._insert()
-        self._insert(uid=2)  # different owner: fine
+            insert_marker(self.db, 1, "erased_content", "mk1",
+                          NORM_VERSION, self.DIG, 1)
+        insert_marker(self.db, 2, "erased_content", "mk1",
+                      NORM_VERSION, self.DIG, 1)  # different owner: fine
 
     def test_nonblank_key_and_version_checks(self):
         for bad in ("", "   "):
             with self.assertRaises(sqlite3.IntegrityError, msg=repr(bad)):
-                self._insert(key_id=bad)
+                insert_marker(self.db, 1, "erased_content", bad,
+                              NORM_VERSION, self.DIG, 1)
             with self.assertRaises(sqlite3.IntegrityError, msg=repr(bad)):
-                self._insert(nver=bad)
+                insert_marker(self.db, 1, "erased_content", "mk1",
+                              bad, self.DIG, 1)
 
     def test_created_epoch_floor(self):
         with self.assertRaises(sqlite3.IntegrityError):
-            self._insert(epoch=0)
+            insert_marker(self.db, 1, "erased_content", "mk1",
+                          NORM_VERSION, self.DIG, 0)
 
-    def test_hex_validation_python_layer(self):
-        for bad in ("g" * 64, "A" * 64, "a" * 63, "a" * 65, "", 64 * " "):
+    def test_malformed_digests_not_persisted(self):
+        """The write boundary validates BEFORE persisting: malformed
+        digests raise and the table stays empty."""
+        for bad in ("g" * 64, "A" * 64, "a" * 63, "a" * 65, "", " " * 64):
             with self.assertRaises(DesignError, msg=repr(bad)):
-                validate_digest_hex(bad)
-        self.assertEqual(validate_digest_hex(self.DIG), self.DIG)
+                insert_marker(self.db, 1, "erased_content", "mk1",
+                              NORM_VERSION, bad, 1)
+        self.assertEqual(self.db.execute(
+            "SELECT count(*) c FROM memory_markers").fetchone()["c"], 0)
+
+    def test_direct_sql_dialect_gap_documented(self):
+        """DIALECT CAVEAT, kept SEPARATE from the validator-protected
+        model path: raw SQL bypasses validate_digest_hex, and the
+        sqlite mirror CHECK is length-only (no regexp), so 'g'*64
+        passes HERE. The proposed Postgres DDL carries the actual
+        regex CHECK; this test pins the mirror gap so it is never
+        mistaken for the contract."""
+        self.db.execute(
+            "INSERT INTO memory_markers(user_id,marker_type,key_id,"
+            "normalization_version,content_key_digest,created_epoch)"
+            " VALUES (?,?,?,?,?,?)",
+            (1, "erased_content", "mk1", NORM_VERSION, "g" * 64, 1))
+        self.assertEqual(self.db.execute(
+            "SELECT count(*) c FROM memory_markers").fetchone()["c"], 1)
 
 
 class TestNormalization(unittest.TestCase):
@@ -392,6 +521,12 @@ class TestHMACVectors(unittest.TestCase):
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2"
             "e32cff7")
 
+    def test_unicode_version_reported(self):
+        """Pinned runtime assumption: report the unicodedata version
+        these NFC results were computed under (cross-runtime NFC
+        equivalence is an OPEN gate, not claimed)."""
+        self.assertRegex(unicodedata.unidata_version, r"^\d+\.\d+\.\d+$")
+
     def test_constant_32_byte_output(self):
         for text in ("a", "Café\nTea", "x" * 1000):
             d = marker_digest(VKEY, VUID, text)
@@ -424,11 +559,8 @@ class TestExclusionSurvivalModel(DBCase):
         """Design model: a marker written at epoch 3 still matches at
         epoch 9 - created_epoch is never a matching filter."""
         dig = marker_digest(VKEY, VUID, "Café\nTea")
-        self.db.execute(
-            "INSERT INTO memory_markers(user_id,marker_type,key_id,"
-            "normalization_version,content_key_digest,created_epoch)"
-            " VALUES (?,?,?,?,?,?)",
-            (VUID, "erased_content", "mk1", NORM_VERSION, dig, 3))
+        insert_marker(self.db, VUID, "erased_content", "mk1",
+                      NORM_VERSION, dig, 3)
         for observed_epoch in (3, 9):  # epoch "moves"; matching ignores it
             row = self.db.execute(
                 "SELECT 1 FROM memory_markers WHERE user_id=? AND"
