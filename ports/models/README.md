@@ -22,7 +22,7 @@ permission. Model output is not proof.
 
 ## STATUS: STAGING MODULE - NOT MOUNTED, NOT LIVE
 
-Complete as a tested module (59/59 tests, 10/10 repeat runs stable) but
+Complete as a tested module (61/61 tests, 10/10 repeat runs stable) but
 NOT wired into the running app. Named limits, exactly:
 
 1. DETERMINISTIC DEFAULT: ProviderConfig defaults to provider "none"
@@ -41,12 +41,25 @@ NOT wired into the running app. Named limits, exactly:
    the injected call (bad arguments) propagates and is NOT counted
    against the breaker; CapabilityUnavailable/CallTimeout take the
    fallback path; a raising fallback is re-raised as ModelsError.
+   Backend-raised SystemExit/KeyboardInterrupt are boxed on the worker
+   thread (BackendRaised) and take the failure path under the original
+   exception's name; an interrupt on the CALLER thread still propagates.
+   Backends must not raise ModelsError - every validating adapter
+   converts it to CapabilityUnavailable (ports/find_support_nli and
+   ports/find_personal_semantic both do, each regression-tested with
+   a real backend-raise probe).
 4. BREAKER: opens after failure_threshold consecutive failures; any
    success closes and resets. Half-open after cooldown_ms; a FAILED
    half-open trial re-opens with a FRESH cooldown so a down backend is
-   not hammered per request. allow()/state/snapshot() never mutate
-   state; snapshot() returns a copy. A decreasing/stuck clock fails
-   closed (breaker stays open).
+   not hammered per request. allow() does not mutate state, so the
+   breaker is NOT thread-safe - own one per single-threaded caller
+   (guarded_call records each outcome synchronously, making trials
+   sequential under that use). snapshot() returns a copy. A
+   decreasing/stuck clock fails closed (breaker stays open).
+   INTEGRATION LIMIT (round-9, review 5480642386): while half-open,
+   allow() admits trials until an outcome is recorded - guarded_call
+   records synchronously, but an integration calling the breaker
+   directly must bound concurrent half-open trials itself.
 5. TIMEOUT CAVEAT: a timed-out backend runs on a daemon thread that may
    linger; its late result is discarded and can never be observed or
    affect state. Hard cancellation of a stuck backend is production
@@ -55,7 +68,15 @@ NOT wired into the running app. Named limits, exactly:
    numeric bounds, non-callable backends, enabled given as a plain
    string, and wrong argument types raise ModelsError - never raw
    TypeError/ValueError/KeyError.
-7. NO WEIGHTS, NO DOWNLOADS, NO NETWORK: local/hosted backends arrive
+7. VALIDATION LIVES IN THE ADAPTERS, NOT THE PROVIDER (round-9,
+   review 5480642386): FunctionProvider is a generic callable carrier - it
+   performs NO output validation and NO thresholding. Integration
+   wiring must route every backend through a validating adapter
+   (ports/find_support_nli for citation support, ports/
+   find_personal_semantic for embed/rerank); wiring a raw backend
+   callable straight to the app skips every safeguard and is refused
+   by design.
+8. NO WEIGHTS, NO DOWNLOADS, NO NETWORK: local/hosted backends arrive
    as injected callables in later adapter PRs. Model license/terms
    verification happens per adapter PR at the pinned model revision
    (candidates declared in the plan: MoritzLaurer/DeBERTa-v3-base-mnli-
@@ -63,13 +84,13 @@ NOT wired into the running app. Named limits, exactly:
    bge-small-en-v1.5 (MIT), cross-encoder/ms-marco-MiniLM-L6-v2) - no
    model is fetched, hosted or paid for by this module. RSS/memory-fit
    claims belong to the adapter PRs and must be MEASURED, not estimated.
-8. READ-ONLY, NOT MOUNTED: no action paths.
+9. READ-ONLY, NOT MOUNTED: no action paths.
 
 ## Files
 
 - models.py - ProviderConfig (+from_env), CircuitBreaker, NoneProvider,
   FunctionProvider, get_provider, guarded_call.
-- test_models.py - 59 tests: config/from_env validation, breaker state
+- test_models.py - 61 tests: config/from_env validation, breaker state
   machine (fake clock), provider delegation/validation, guarded-call
   fallback/timeout/no-retry semantics, fail-closed misbehaving-backend
-  probes.
+  probes, backend BaseException failure-path policy probes.
