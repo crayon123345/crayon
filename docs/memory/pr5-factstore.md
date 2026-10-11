@@ -152,6 +152,34 @@ Covered by the suite (96 tests):
   consent_generation) equal to the owned fixture snapshot.
 - B9 wrapper typing: a None wrapper never dereferences - typed refusal
   on get/list/execute paths.
+- Mutation caller-context binding (sec 10): the ORIGINAL envelope must
+  BE the request's actual binding; ORIGINAL issuer == CURRENT issuer;
+  the caller's CURRENT snapshot fields (uid/lifetime/capture_epoch/
+  grant_generation/policy_revision/decision_revision/
+  consent_generation) must EQUAL the store's OWNED snapshot re-read
+  inside the transaction, AFTER Phase A (PR-3 tier precedence
+  preserved) - a fabricated/stale field refuses typed STALE.
+- Evidence target/source existence (v80 795-812): an OP_RECORDS
+  receipt target must NAME the anchor's receipt AND that receipt row
+  must EXIST in the durable inventory - guessed/fabricated strings
+  refuse; per-kind positive/absent/mismatch checks are unit-tested.
+- Scrub typed outcomes (v80 2060-2137): destroy/clear/probe FAILURES
+  are contained (typed 'refused', never raw exceptions); ONLY an
+  explicit live_raw() == False probe proves absence - a missing or
+  failed probe is UNKNOWN and never clears; the outcome schema is
+  EXACTLY {kind, ref_ids, live_check}.
+- Issuer-ack durable reread (v80 1628-1645): binds token + recovery +
+  projection (source included); a POSITIVE same-identity pending =
+  re-attempt; missing/unreadable/unknown-state/incoherent = typed
+  uncertain - never a blind pending claim.
+- The (recovery_id, delivery_token) UNIQUE fence is exercised by the
+  ACTUAL loser path in tests (forced real INSERT conflict -> rollback
+  -> winner compare -> replay or typed drift refusal); a stored
+  evidence row with a MISSING insertion event is a typed integrity
+  refusal (never a defaulted count); V34 fault injection covers each
+  execute step INDIVIDUALLY (1a footprint, 2-3a current checks, 4
+  Phase-B readback, 5 tombstone, 6 CAS, 7 classify, 8 allocation, 9
+  apply+record).
 - The exclusive cross-instance isolation fixture: a second opener of the
   same path refuses; a file-backed connection WITHOUT the exclusive
   marker refuses; close releases the lock; :memory: remains allowed.

@@ -663,6 +663,42 @@ class V26ToV29EpochsAndCrossing(unittest.TestCase):
             store.execute(2, req, c, l, p, ctx)
 
 
+    def test_t1_mutation_requires_current_owned_context(self):
+        # T1: a mutation whose caller context carries a FABRICATED or
+        # STALE current field refuses typed STALE - uid/lifetime/grant
+        # generation/capture epoch/policy/decision/consent 999 never
+        # execute; PR-3 Phase A precedence is preserved (Phase A runs
+        # BEFORE the snapshot equality)
+        store, _ = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        for field in ("current_uid", "current_lifetime",
+                      "current_capture_epoch", "current_grant_generation",
+                      "current_policy_revision",
+                      "current_decision_revision",
+                      "current_consent_generation"):
+            with self.subTest(field=field):
+                bad = dataclasses.replace(ctx, **{field: 999})
+                with self.assertRaises(cap.ConflictError) as cm:
+                    store.execute(1, req, c, l, p, bad)
+                self.assertIn("STALE_POLICY", str(cm.exception))
+        # the ORIGINAL envelope under a NEW current context after the
+        # issuer changed: original != current = STALE, never executes
+        moved = dataclasses.replace(
+            ctx, current_issuer=env.SessionRef(session_token_hash="ef" * 32))
+        with self.assertRaises(cap.ConflictError) as cm:
+            store.execute(1, req, c, l, p, moved)
+        self.assertIn("STALE_POLICY", str(cm.exception))
+        # a FOREIGN original envelope is not this op's envelope
+        _, _, _, b2, _ = mint(store, put_req("a2" * 16))
+        foreign = dataclasses.replace(ctx, original_binding=b2)
+        with self.assertRaises(cap.AuthError):
+            store.execute(1, req, c, l, p, foreign)
+        # the UNCHANGED paired context still executes
+        r = store.execute(1, req, c, l, p, ctx)
+        self.assertEqual(r.kind, "executed")
+
+
 class V30ToV33Replay(unittest.TestCase):
     """V30 valid-capability replay = recorded outcome; V31 Phase A before
     drift; V32 REVOKED before replay; V33 reseal never re-registers."""
@@ -1081,6 +1117,24 @@ def evidence(store, rid, op, token, kind=f.EvidenceKind.RECEIPT,
         self.assertIn("REQUEST_DRIFT", str(cm.exception))
 
 
+def force_real_unique_conflict(store):
+    """Race injection: the loser's existence prelookup ran BEFORE the
+    winner's commit became visible - the loser's INSERT then hits the
+    REAL (recovery_id, delivery_token) UNIQUE fence."""
+    orig_q = store._q.q
+    state = {"fired": False}
+
+    def spy(sql, params=(), mode="none"):
+        if not state["fired"] \
+                and "FROM evidence_entries WHERE" in sql \
+                and "delivery_token" in sql:
+            state["fired"] = True
+            return None  # the winner landed after our lookup
+        return orig_q(sql, params, mode)
+    store._q.q = spy
+    return orig_q
+
+
 class V34bInsertionEvents(unittest.TestCase):
     """V34b receiver-side named vectors: repeat, drift, same-second,
     blocked repeat, blocked->resolved, late-after-resolution."""
@@ -1139,34 +1193,61 @@ class V34bInsertionEvents(unittest.TestCase):
         self.assertIsNotNone(r2.resolution_event_id)
 
 
+    def test_t2_receipt_target_per_kind_inventory_checks(self):
+        # T2 (v80 795-812): the OP_RECORDS receipt target is checked
+        # against the DURABLE INVENTORY - positive (real receipt),
+        # absent (no receipt), mismatch (another op's receipt)
+        store, _ = mkstore()
+        r1, _ = run(store, put_req("a1" * 16))  # commits: receipt exists
+        req, b, rid = blocked_op(store, op="ab" * 16)
+        bh = f.extended_binding_hash(b, req)
+
+        def proj_for(entry):
+            return f.SafeEvidenceProjection(
+                recovery_id=rid, uid=1, lifetime_id=1,
+                operation_id=req.operation_id, commitment=bh,
+                kind=f.EvidenceKind.RECEIPT,
+                target=f.ScopedInventoryRef(
+                    owner=f.Lifetime(uid=1, lifetime_id=1),
+                    class_name=f.CopyClass.OP_RECORDS, entry_id=entry),
+                source=f.EvidenceKind.RECEIPT,
+                accounting_scope=f.Lifetime(uid=1, lifetime_id=1))
+        # POSITIVE: the committed op's OWN receipt exists -> the
+        # per-kind inventory check passes for ITS anchor
+        ok = f._evidence_target_source_ok(
+            store._q, proj_for("receipt:" + "a1" * 16), 1, 1, "a1" * 16)
+        self.assertTrue(ok)
+        # ABSENT: the blocked op has NO receipt -> False
+        self.assertFalse(f._evidence_target_source_ok(
+            store._q, proj_for("receipt:" + "ab" * 16), 1, 1,
+            "ab" * 16))
+        # MISMATCH: the entry names a receipt that exists for ANOTHER
+        # op -> False for THIS anchor
+        self.assertFalse(f._evidence_target_source_ok(
+            store._q, proj_for("receipt:" + "a1" * 16), 1, 1,
+            "ab" * 16))
+        # guessed garbage -> False
+        self.assertFalse(f._evidence_target_source_ok(
+            store._q, proj_for("receipt:" + "ff" * 16), 1, 1,
+            "ab" * 16))
+
     def test_concurrent_double_delivery_one_winner(self):
         # CONCURRENT DOUBLE-DELIVERY (v80 3931): two contenders compose
-        # the SAME delivery INDEPENDENTLY; the first commits (winner),
-        # the loser's full path replays with NO writes
+        # the SAME delivery INDEPENDENTLY; the winner commits; the
+        # loser's INSERT hits the REAL UNIQUE fence (its prelookup ran
+        # pre-commit) -> rollback -> winner compare -> REPLAY, no writes
         store, conn = mkstore()
         req, b, rid = blocked_op(store)
-        proj = f.SafeEvidenceProjection(
-            recovery_id=rid, uid=1, lifetime_id=1,
-            operation_id=req.operation_id,
-            commitment=f.extended_binding_hash(b, req),
-            kind=f.EvidenceKind.RECEIPT,
-            target=f.RecoveryBoundRef(recovery_id=rid,
-                                      source=f.EvidenceKind.RECEIPT),
-            source=f.EvidenceKind.RECEIPT,
-            accounting_scope=f.Lifetime(uid=1, lifetime_id=1))
-        wa, ctxa = store.mint_read_fixtures(
-            1, 1, "b3" * 16, f.ReadMethod.READBACK,
-            {"projection": proj.to_dict(), "token": "d" * 32})
-        wb, ctxb = store.mint_read_fixtures(
-            1, 1, "b3" * 16, f.ReadMethod.READBACK,
-            {"projection": proj.to_dict(), "token": "d" * 32})
-        ra = store.insert_evidence(1, 1, "b3" * 16, proj, "d" * 32,
-                                   wa, ctxa)
-        self.assertEqual(ra.kind, "blocked_inserted")
-        rb = store.insert_evidence(1, 1, "b3" * 16, proj, "d" * 32,
-                                   wb, ctxb)
-        self.assertEqual(rb.kind, "blocked_replay_no_event")
-        self.assertEqual(rb.contribution, 0)
+        r1, proj = evidence(store, rid, req.operation_id, "d" * 32)
+        self.assertEqual(r1.kind, "blocked_inserted")
+        orig_q = force_real_unique_conflict(store)
+        try:
+            r2, _ = evidence(store, rid, req.operation_id, "d" * 32)
+        finally:
+            store._q.q = orig_q
+        self.assertEqual(r2.kind, "blocked_replay_no_event")
+        self.assertEqual(r2.contribution, 0)
+        # the transaction CLOSED and exactly ONE row exists
         self.assertEqual(conn.execute(
             "SELECT count(*) FROM evidence_entries").fetchone()[0], 1)
 
@@ -1197,20 +1278,20 @@ class V34bInsertionEvents(unittest.TestCase):
         names = [r[1] for r in conn.execute(
             "PRAGMA index_list('evidence_entries')").fetchall()]
         self.assertIn("evidence_entries_delivery", names)
-        with self.assertRaises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO evidence_entries(evidence_id, recovery_id,"
-                " kind, delivery_token, received_at, ref,"
-                " projection_json, insertion_event_id,"
-                " resolution_event_id, origin_kind, inserting_uid,"
-                " inserting_lifetime_id, inserting_operation_id)"
-                " VALUES('dup', ?, 'receipt', ?, 0, 'evidence:dup',"
-                " '{}', NULL, NULL, 'blocked_arrival', 1, 1, ?)",
-                (rid, "d" * 32, req.operation_id))
-        conn.rollback()
-        with self.assertRaises(f.DeliveryDriftError):
-            evidence(store, rid, req.operation_id, "d" * 32,
-                     commitment="9" * 64)
+        # the ACTUAL loser path: the drifted loser's INSERT hits the
+        # REAL UNIQUE fence -> rollback -> winner compare -> typed
+        # drift REFUSAL (no raw-duplicate shortcut)
+        # the drifted loser keeps the anchor-join fields (same
+        # uid/lifetime/op/commitment) but CHANGES the kind - it passes
+        # every join and loses the REAL race at the fence
+        orig_q = force_real_unique_conflict(store)
+        try:
+            with self.assertRaises(f.DeliveryDriftError):
+                evidence(store, rid, req.operation_id, "d" * 32,
+                         kind=f.EvidenceKind.LATE_ACCOUNTING)
+        finally:
+            store._q.q = orig_q
+        # the transaction CLOSED and the winner's row is unchanged
         self.assertEqual(conn.execute(
             "SELECT count(*) FROM evidence_entries").fetchone()[0], 1)
 
@@ -1477,8 +1558,8 @@ class V34StepFaultsAndRestart(unittest.TestCase):
         # UNCHANGED retry stays permitted (pre-commit refusal, NO blind
         # retry, an absent row is never treated as rollback proof)
         injectables = [
-            ("steps1-4_launch_gate_phaseB", "_execute_readback"),
-            ("steps2-3a_current_checks", "_execute_current_checks"),
+            ("step2_3a_current_checks", "_execute_current_checks"),
+            ("step4_phase_b_readback", "_phase_b_lookup"),
             ("step5_tombstone", "_tombstone_check"),
             ("step6_cas", "_cas_check"),
             ("step7_classify", "_classify"),
@@ -1514,6 +1595,32 @@ class V34StepFaultsAndRestart(unittest.TestCase):
                 self.assertEqual(r.kind, "executed")
                 self.assertEqual(conn.execute(
                     "SELECT count(*) FROM facts").fetchone()[0], 1)
+
+    def test_fault_step1a_footprint_rolls_back(self):
+        # v80 3928 step 1a: a fault at the declared-footprint step
+        # rolls the attempt back ENTIRELY; an unchanged retry works
+        store, conn = mkstore()
+        req = put_req("a1" * 16)
+        c, l, p, b, ctx = mint(store, req)
+        orig = f._footprint
+
+        def boom(*a, **k):
+            raise sqlite3.OperationalError("injected step-1a fault")
+        f._footprint = boom
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                store.execute(1, req, c, l, p, ctx)
+        finally:
+            f._footprint = orig
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM facts").fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM abort_witnesses WHERE state='armed'"
+            ).fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM attempt_registry").fetchone()[0], 0)
+        r = store.execute(1, req, c, l, p, ctx)
+        self.assertEqual(r.kind, "executed")
 
     def test_fault_step8_monotone_allocation_rolls_back(self):
         # v80 3928 step 8: a fault at the monotone epoch allocation
@@ -1889,6 +1996,27 @@ class V34bHarnessVectors(unittest.TestCase):
             accounting_scope=f.Lifetime(uid=1, lifetime_id=1))
         return store, req, b, rid, provider, harness, proj, oconn
 
+    def test_t5_late_loser_missing_event_is_integrity_refusal(self):
+        # T5: a winner evidence row whose insertion event is MISSING
+        # is an INCOHERENT durable join = typed integrity REFUSAL,
+        # never a defaulted count - on BOTH the replay path and the
+        # forced-fence loser path
+        store, conn = mkstore()
+        req, b, rid = blocked_op(store, op="aa" * 16)
+        resolve_op(store, req, b)
+        r1, _ = evidence(store, rid, req.operation_id, "d" * 32)
+        self.assertEqual(r1.kind, "inserted")
+        conn.execute("DELETE FROM insertion_events")
+        conn.commit()
+        with self.assertRaises(f.EvidenceIntegrityError):
+            evidence(store, rid, req.operation_id, "d" * 32)
+        orig_q = force_real_unique_conflict(store)
+        try:
+            with self.assertRaises(f.EvidenceIntegrityError):
+                evidence(store, rid, req.operation_id, "d" * 32)
+        finally:
+            store._q.q = orig_q
+
     def test_unrelated_same_owner_target_refused(self):
         # the R1 repro (v80 795-812, 3948-3951 UNRELATED SAME-OWNER
         # TARGET): a VALID recovery/hash with an UNRELATED same-owner
@@ -1930,9 +2058,11 @@ class V34bHarnessVectors(unittest.TestCase):
         self.assertEqual(store._q.q(
             "SELECT count(*) AS n FROM evidence_entries", (),
             "one")["n"], 0)
-        # the subject's OWN receipt entry (the store-built target)
-        # SATISFIES the binding and inserts
-        good = f.SafeEvidenceProjection(
+        # a FABRICATED receipt target: the string NAMES the anchor's
+        # receipt ("receipt:<op>") but the op is BLOCKED - NO receipt
+        # row exists - guessed strings with no inventory existence
+        # proof REFUSE and write NOTHING (operation_receipts stays 0)
+        fab = f.SafeEvidenceProjection(
             target=f.ScopedInventoryRef(
                 owner=f.Lifetime(uid=1, lifetime_id=1),
                 class_name=f.CopyClass.OP_RECORDS,
@@ -1940,11 +2070,86 @@ class V34bHarnessVectors(unittest.TestCase):
             **base)
         w3, ctx3 = store.mint_read_fixtures(
             1, 1, "b3" * 16, f.ReadMethod.READBACK,
+            {"projection": fab.to_dict(), "token": "ef" * 16})
+        with self.assertRaises(f.EvidenceScopeError):
+            store.insert_evidence(1, 1, "b3" * 16, fab, "ef" * 16,
+                                  w3, ctx3)
+        self.assertEqual(store._q.q(
+            "SELECT count(*) AS n FROM operation_receipts", (),
+            "one")["n"], 0)
+        # the subject's OWN recovery-bound entry (the store-built
+        # target/source association) SATISFIES the binding and inserts
+        good = f.SafeEvidenceProjection(
+            target=f.RecoveryBoundRef(
+                recovery_id=rid, source=f.EvidenceKind.RECEIPT),
+            **base)
+        w4, ctx4 = store.mint_read_fixtures(
+            1, 1, "b3" * 16, f.ReadMethod.READBACK,
             {"projection": good.to_dict(), "token": "ef" * 16})
         r = store.insert_evidence(1, 1, "b3" * 16, good, "ef" * 16,
-                                  w3, ctx3)
+                                  w4, ctx4)
         self.assertEqual(r.kind, "blocked_inserted")
         f.close_exclusive_db(conn)
+
+    def test_t3_scrub_destroy_failure_is_typed_refusal(self):
+        # T3 (v80 2060-2137): a destroy/clear FAILURE or a FAILED
+        # probe never escapes raw and never clears - typed 'refused'
+        # with NOTHING recorded
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+
+        class ExplodingHandle:
+            def destroy(self):
+                raise RuntimeError("boom")
+
+            def live_raw(self):
+                raise RuntimeError("probe boom")
+
+        class BlindHandle:
+            def clear(self):
+                pass  # no live_raw probe at all: absence is UNKNOWN
+
+        out = harness.scrub(comp.token, {
+            "raw_ref_handle": ExplodingHandle(),
+            "comparison_buffer": BlindHandle()})
+        self.assertEqual(out["kind"], "refused")
+        self.assertIsNone(out["live_check"]["raw_found"])
+        self.assertEqual(sorted(out.keys()),
+                         ["kind", "live_check", "ref_ids"])
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log WHERE token=?",
+            (comp.token,)).fetchone()[0], 0)
+
+    def test_t4_ack_reread_identity_coherence(self):
+        # T4 (v80 1628-1645): the durable reread binds token +
+        # recovery + projection; a POSITIVE same-identity pending =
+        # re-attempt; missing/unreadable/incoherent = typed uncertain
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        d = provider.deliver({"projection": proj, "token": comp.token})
+        ack_input = d["ack"]
+        # POSITIVE same-identity pending
+        ar = harness._ack_durable_reread(comp.token, ack_input)
+        self.assertEqual(ar.kind, "still_pending")
+        # MISSING row = uncertain, NEVER a blind pending claim
+        ar = harness._ack_durable_reread("00" * 16, ack_input)
+        self.assertEqual(ar.kind, "uncertain")
+        # INCOHERENT recovery = uncertain
+        other = dataclasses.replace(ack_input.projection,
+                                    recovery_id="ff" * 16)
+        bad = dataclasses.replace(ack_input, projection=other)
+        ar = harness._ack_durable_reread(comp.token, bad)
+        self.assertEqual(ar.kind, "uncertain")
+        # INCOHERENT projection content = uncertain
+        drifted = dataclasses.replace(ack_input.projection,
+                                      commitment="9" * 64)
+        bad2 = dataclasses.replace(ack_input, projection=drifted)
+        ar = harness._ack_durable_reread(comp.token, bad2)
+        self.assertEqual(ar.kind, "uncertain")
+        # delivered = done
+        harness.ack(ack_input)
+        ar = harness._ack_durable_reread(comp.token, ack_input)
+        self.assertEqual(ar.kind, "delivered")
 
     def test_safe_payload_stable_token(self):
         store, req, b, rid, provider, harness, proj, oconn = self._rig()
@@ -2053,7 +2258,11 @@ class V34bHarnessVectors(unittest.TestCase):
         self.assertEqual(out["live_check"]["raw_found"], False)
         self.assertEqual(sorted(out["live_check"]["containers"]),
                          ["comparison_buffer", "raw_ref_handle"])
-        self.assertEqual(out["scrubbed"], comp.token)
+        # the CLOSED outcome schema is EXACT: kind/ref_ids/live_check
+        # ONLY - the scrub_log row carries the recording
+        self.assertEqual(sorted(out.keys()),
+                         ["kind", "live_check", "ref_ids"])
+        self.assertNotIn("scrubbed", out)
         self.assertEqual(calls, [0])  # NO completion BEFORE discard
         self.assertFalse(raw.live_raw())
         self.assertFalse(buf.live_raw())
@@ -2066,7 +2275,9 @@ class V34bHarnessVectors(unittest.TestCase):
         out2 = harness.scrub(comp2.token, {
             "raw_ref_handle": stuck, "comparison_buffer": RawHandle(None)})
         self.assertEqual(out2["kind"], "refused")
-        self.assertEqual(out2["live_check"]["raw_found"], True)
+        # NO probe on the stuck container = UNKNOWN (raw_found None),
+        # never an arbitrary len/bool pass/fail
+        self.assertIsNone(out2["live_check"]["raw_found"])
         self.assertNotIn("scrubbed", out2)
         self.assertEqual(oconn.execute(
             "SELECT count(*) FROM scrub_log WHERE token=?",
