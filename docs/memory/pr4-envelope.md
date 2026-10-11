@@ -6,9 +6,11 @@ production entry point is a fail-closed stub. Basis: PR-4 contract v6
 + peer DRAFT-READY verdict and controlling clarification (2026-10-11),
 plus the peer first-pass review blockers 1-8, final-verdict
 additions (scope order, current session/issuer, keyring uniqueness,
-explicit key boundary), and r2 residuals (in-transaction owner/fence
+explicit key boundary), r2 residuals (in-transaction owner/fence
 validation, SHARE concrete destination, registry semantic coherence,
-used-nonce commitment coherence), all folded into this document. Plan v1 (PR-4
+used-nonce commitment coherence), and the r3 residual (parse-specific
+RecursionError/ValueError refuse typed MALFORMED), all folded into
+this document. Plan v1 (PR-4
 entry), seam prep v4.1 sec 7/9, contract v6, owner decisions record
 v1, PR-1/2/3 merged (main 1af1f78bcd97da0e7851311fb4551ad1f7df1c17).
 
@@ -163,6 +165,14 @@ memory_markers is NOT implicitly a runtime nonce registry):
 - model_markers: PK marker_ref; uid, lifetime, operation_id,
   commitment, owner_token, fence, outcome_ref (the FULL binding
   evidence tuple).
+
+Strict JSON parsing of the authenticated plaintext refuses typed
+MALFORMED for every PARSE-SPECIFIC failure: malformed JSON, duplicate
+keys, floats, constants, non-canonical reserialization, nesting past
+the interpreter recursion limit, and integers past the CPython digit
+limit (RecursionError/ValueError from the parser). Genuine crypto or
+SQLite operational failures never pass through the parser and still
+propagate distinctly.
 
 Every row read from the registry is validated at the boundary for
 shape, exact types, closed state, AND semantic coherence: fence is

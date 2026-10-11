@@ -1066,6 +1066,73 @@ class ResidualR2Tests(unittest.TestCase):
         self.assertIs(cm.exception.code, env.EnvelopeCode.REPLAY)
 
 
+class ResidualR3Tests(unittest.TestCase):
+    """Peer r3 residual: parse-specific RecursionError/ValueError from
+    authenticated plaintext refuse typed MALFORMED, never raw."""
+
+    def _seal_raw(self, raw: bytes):
+        import json as _json
+        key = make_key()
+        clock = env.SyntheticClock(NOW)
+        token = Fernet(key.material).encrypt(raw)
+        return env.ModelOnlyEnvelope(format_version=1, key_id="key-a",
+                                     token=token), key, clock
+
+    def test_deeply_nested_plaintext_refuses_typed(self):
+        raw = b"[" * 1600 + b"]" * 1600
+        envelope, key, clock = self._seal_raw(raw)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            env.verify_model(envelope, env.SyntheticKeyRing(keys=(key,)),
+                             make_context(make_web_binding()), clock)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+
+    def test_huge_integer_plaintext_refuses_typed(self):
+        raw = b"9" * 5000
+        envelope, key, clock = self._seal_raw(raw)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            env.verify_model(envelope, env.SyntheticKeyRing(keys=(key,)),
+                             make_context(make_web_binding()), clock)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+
+    def test_bigint_boundary_capture_time(self):
+        # a capture_time at the BIGINT boundary round trips;
+        # BIGINT_MAX+1 refuses typed MALFORMED - never a raw overflow
+        # or a silent wrap. expiry == capture_time + 900 stays within
+        # BIGINT in the accepted case.
+        import json as _json
+        # accepted case: coherent binding at the boundary round trips
+        binding = make_web_binding(capture_time=cap.BIGINT_MAX - 900,
+                                   expiry=cap.BIGINT_MAX)
+        key = make_key(decrypt_until=cap.BIGINT_MAX)
+        clock = env.SyntheticClock(cap.BIGINT_MAX - 900)
+        token = Fernet(key.material).encrypt_at_time(
+            _json.dumps(make_payload(binding).to_dict(), sort_keys=True,
+                        separators=(",", ":")).encode("utf-8"),
+            cap.BIGINT_MAX - 900)
+        envelope = env.ModelOnlyEnvelope(format_version=1, key_id="key-a",
+                                         token=token)
+        result = env.verify_model(envelope,
+                                  env.SyntheticKeyRing(keys=(key,)),
+                                  make_context(binding), clock)
+        self.assertEqual(result.binding, binding)
+        # refused case: forged BIGINT_MAX+1 capture_time in the
+        # authenticated plaintext refuses typed MALFORMED
+        normal = make_web_binding()
+        forged = make_payload(normal).to_dict()
+        forged["capture_time"] = cap.BIGINT_MAX + 1
+        key = make_key()
+        clock = env.SyntheticClock(NOW)
+        token = Fernet(key.material).encrypt(
+            _json.dumps(forged, sort_keys=True,
+                        separators=(",", ":")).encode("utf-8"))
+        envelope = env.ModelOnlyEnvelope(format_version=1, key_id="key-a",
+                                         token=token)
+        with self.assertRaises(env.EnvelopeError) as cm:
+            env.verify_model(envelope, env.SyntheticKeyRing(keys=(key,)),
+                             make_context(normal), clock)
+        self.assertIs(cm.exception.code, env.EnvelopeCode.MALFORMED)
+
+
 class FinalAdditionTests(unittest.TestCase):
     """Peer final-verdict additions: canonical scope order, current
     issuer/session staleness, unique keyring ids, explicit key boundary."""

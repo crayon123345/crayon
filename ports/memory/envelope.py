@@ -226,7 +226,13 @@ def _strict_loads(data: bytes):
         return json.loads(text, object_pairs_hook=_no_dupes,
                           parse_float=_reject_float,
                           parse_constant=_reject_constant)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        # JSONDecodeError: malformed JSON. RecursionError: nesting past
+        # the interpreter limit (~1500 nested arrays). ValueError: the
+        # int parser digit limit (CPython int_max_str_digits) and the
+        # parse hooks above. All are PARSE-SPECIFIC and refuse typed
+        # MALFORMED; genuine crypto/SQLite operational failures never
+        # pass through here and still propagate distinctly.
         raise EnvelopeError(EnvelopeCode.MALFORMED)
 
 
