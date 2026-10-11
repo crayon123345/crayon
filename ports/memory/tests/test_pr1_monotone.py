@@ -373,25 +373,60 @@ class TestMalformedShapes(unittest.TestCase):
             fn(self.FakeDB(result), 5)
 
     def test_get_grants_shape(self):
-        for bad in ([{}], [{"scope": "memory.write"}], [1], ["x"]):
+        for bad in ([{}], [{"scope": "memory.write"}], [1], ["x"],
+                    [["scope", "granted_at", "expires_at",
+                      "per_op_expiry_optin"]],
+                    [("scope", "granted_at", "expires_at",
+                      "per_op_expiry_optin")]):
             self._assert_module_error(bad, grants.get_grants,
                                       grants.GrantError)
 
     def test_get_generation_shape(self):
-        for bad in ({}, 1, "x", {"other": 1}):
+        for bad in ({}, 1, "x", {"other": 1}, False, 0, "", [],
+                    ["generation"]):
             self._assert_module_error(bad, grants.get_generation,
                                       grants.GrantError)
 
     def test_bump_generation_shape(self):
-        for bad in ({}, 1, {"other": 1}):
+        for bad in ({}, 1, {"other": 1}, False, 0, "", [],
+                    ["generation"]):
             self._assert_module_error(bad, grants.bump_generation,
                                       grants.GrantError)
 
     def test_allocate_shape(self):
-        for bad in ({}, 1, "x", {"other": 1}):
+        for bad in ({}, 1, "x", {"other": 1}, False, 0, "", [],
+                    ["next_epoch"]):
             self._assert_module_error(bad,
                                       owner_counters.allocate_next_epoch,
                                       owner_counters.CounterError)
+
+    def test_supported_empties_and_falsy_results(self):
+        """Round 3: the q contract's ONLY supported empties are None
+        and an empty list/tuple. Malformed FALSY results
+        (False, 0, {}, '') must raise, never be silently coerced to
+        'empty' by `or []`."""
+        for bad in (False, 0, {}, "", 0.0):
+            self._assert_module_error(bad, grants.get_grants,
+                                      grants.GrantError)
+        self.assertEqual(grants.get_grants(self.FakeDB(None), 5), ())
+        self.assertEqual(grants.get_grants(self.FakeDB([]), 5), ())
+        self.assertEqual(grants.get_grants(self.FakeDB(()), 5), ())
+        self.assertEqual(grants.get_generation(self.FakeDB(None), 5), 0)
+
+    def test_genuine_db_errors_propagate(self):
+        """Operational database failures are NOT masked by the shape
+        validators - they propagate as their original exception."""
+        class BoomDB:
+            def q(self, sql, params=(), mode="all"):
+                raise RuntimeError("connection lost")
+        self.assertRaises(RuntimeError, grants.get_grants, BoomDB(), 5)
+        self.assertRaises(RuntimeError, grants.get_generation,
+                          BoomDB(), 5)
+        self.assertRaises(RuntimeError, grants.bump_generation,
+                          BoomDB(), 5)
+        self.assertRaises(RuntimeError,
+                          owner_counters.allocate_next_epoch,
+                          BoomDB(), 5)
 
 
 class TestTransactionAtomicity(unittest.TestCase):

@@ -15,6 +15,7 @@ Design rules (memory seam prep v4.1 sec 3-4):
   owner_counters); every function takes `uid` explicitly.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -42,17 +43,17 @@ def _require_int(value, what: str, minimum: int) -> int:
 
 
 def _require_row(row, what: str, fields) -> None:
-    """Readback SHAPE validation: a row must be a mapping carrying the
-    required fields. A malformed result shape (empty dict, bare scalar,
-    wrong type) raises GrantError, never a raw KeyError/TypeError.
-    Genuine database operational errors are NOT caught anywhere in
-    this module - they propagate."""
-    if not hasattr(row, "__getitem__") or isinstance(row, (str, bytes)):
+    """Readback SHAPE validation: a row must be a collections.abc.Mapping
+    carrying the required fields. A malformed result shape (empty dict,
+    bare scalar, wrong type) raises GrantError, never a raw
+    KeyError/TypeError. A LIST OF FIELD NAMES (['scope', ...]) must not
+    pass either: membership checks alone would accept it ('scope' in
+    ['scope', ...] is True) and row['scope'] would then die with a raw
+    TypeError. Genuine database operational errors are NOT caught
+    anywhere in this module - they propagate."""
+    if not isinstance(row, Mapping):
         raise GrantError("malformed %s row: %r" % (what, row))
-    try:
-        missing = [f for f in fields if f not in row]
-    except TypeError:
-        raise GrantError("malformed %s row: %r" % (what, row))
+    missing = [f for f in fields if f not in row]
     if missing:
         raise GrantError("%s row missing fields %r" % (what, missing))
 
@@ -100,9 +101,18 @@ def get_grants(db, uid: int) -> Tuple[Grant, ...]:
     """All stored grant rows for the owner (expired included; callers
     filter with Grant.active(now)). Read at capability mint AND
     re-read inside the transaction (v4.1 sec 4 step 2)."""
-    rows = db.q(GRANTS_READ_SQL, (_require_owner_uid(uid),), "all") or []
-    if not isinstance(rows, (list, tuple)):
-        raise GrantError("malformed grants result: %r" % (rows,))
+    # Validate the RAW result BEFORE any emptiness handling. The q
+    # contract's ONLY supported empties are None and an empty
+    # list/tuple; a malformed falsy result (False, 0, {}, '') must
+    # raise, never be silently coerced to "no grants" by `or []` -
+    # silent coercion would hide store corruption behind an
+    # empty-grants answer.
+    raw = db.q(GRANTS_READ_SQL, (_require_owner_uid(uid),), "all")
+    if raw is None:
+        raw = []
+    if not isinstance(raw, (list, tuple)):
+        raise GrantError("malformed grants result: %r" % (raw,))
+    rows = raw
     grants_out = []
     for r in rows:
         _require_row(r, "grant", ("scope", "granted_at",

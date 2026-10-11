@@ -21,6 +21,9 @@ Design rules (memory seam prep v4.1 sec 4 step 4):
 """
 
 
+from collections.abc import Mapping
+
+
 class CounterError(Exception):
     """Allocation failed; the caller's transaction must roll back."""
 
@@ -34,6 +37,21 @@ def _require_owner_uid(uid: int) -> int:
         raise CounterError(
             "owner id must be an exact int, got %r" % (uid,))
     return uid
+
+
+def _require_row(row, what: str, fields) -> None:
+    """Readback SHAPE validation: a row must be a collections.abc.Mapping
+    carrying the required fields. A list of field names
+    (['next_epoch']) must not pass - membership checks alone would
+    accept it and row['next_epoch'] would then die with a raw
+    TypeError. Malformed shapes raise CounterError; genuine database
+    operational errors are NOT caught anywhere in this module - they
+    propagate."""
+    if not isinstance(row, Mapping):
+        raise CounterError("malformed %s row: %r" % (what, row))
+    missing = [f for f in fields if f not in row]
+    if missing:
+        raise CounterError("%s row missing fields %r" % (what, missing))
 
 
 def _require_epoch_value(value) -> int:
@@ -71,10 +89,5 @@ def allocate_next_epoch(db, uid: int) -> int:
     row = db.q(ALLOCATE_SQL, (_require_owner_uid(uid),), "one")
     if row is None:
         raise CounterError("epoch allocation returned no row for owner")
-    if not hasattr(row, "__getitem__") or isinstance(row, (str, bytes)):
-        raise CounterError("malformed allocation row: %r" % (row,))
-    try:
-        value = row["next_epoch"]
-    except (KeyError, TypeError):
-        raise CounterError("allocation row missing next_epoch")
-    return _require_epoch_value(value)
+    _require_row(row, "allocation", ("next_epoch",))
+    return _require_epoch_value(row["next_epoch"])
