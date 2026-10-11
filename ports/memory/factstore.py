@@ -3784,7 +3784,10 @@ CREATE TABLE IF NOT EXISTS outbox(
   projection_json TEXT NOT NULL, state TEXT NOT NULL,
   composed_at INTEGER NOT NULL, delivered_at INTEGER);
 CREATE TABLE IF NOT EXISTS scrub_log(
-  token TEXT PRIMARY KEY, scrubbed_at INTEGER NOT NULL);
+  token TEXT PRIMARY KEY, scrubbed_at INTEGER NOT NULL,
+  step TEXT NOT NULL DEFAULT 'generic',
+  operation_id TEXT, result_code TEXT,
+  revision INTEGER, coverage_id TEXT);
 """
 
 
@@ -3985,7 +3988,7 @@ class IssuerHarness:
                    "live_check": live_check}
         return outcome
 
-    def scrub(self, token: str, refs) -> dict:
+    def scrub(self, token: str, refs, erase=None) -> dict:
         """VOLATILE ERASURE (v80 2060-2137, EXACT): scrub(refs:
         OwnedContainers) -> ScrubOutcome. OwnedContainers = the CLOSED
         enumeration {raw_ref_handle, comparison_buffer} - the ONLY
@@ -4009,12 +4012,56 @@ class IssuerHarness:
         if outcome["kind"] != "cleared":
             return outcome  # REFUSAL: nothing recorded, no state change
         self._verify_stage("scrub", token)  # re-verified AFTER the raw
+        # ERASE-STEP COMPLETION BINDING (ninth fold): an erase-step
+        # completion record binds the EXACT erase/readback step -
+        # {operation, KNOWN outcome, revision, coverage id} - VERIFIED
+        # LIVE BEFORE the record is written. The verify probe is the
+        # fixture's readback against the DURABLE receiver state; the
+        # SAME conservative rule as raw_found applies: a None/0/empty/
+        # non-bool/failed/malformed probe or binding = REFUSED, NOTHING
+        # recorded. A WRONG or ABSENT erase CANNOT record an erase-step
+        # completion. A scrub WITHOUT the binding records ONLY a
+        # 'generic' volatile-hook completion (step='generic') - the
+        # generic proof is NEVER an erase-step gate. NO physical
+        # memory-wipe claim anywhere: the hook clears VOLATILE fixture
+        # handles ONLY.
+        if erase is not None:
+            if not isinstance(erase, dict) or set(erase.keys()) != {
+                    "operation_id", "result_code", "revision",
+                    "coverage_id", "verify"}:
+                raise HarnessRefusedError("scrub", "erase_binding")
+            _req_hex(erase["operation_id"], 32)
+            if type(erase["revision"]) is not int \
+                    or erase["revision"] < 1 \
+                    or not isinstance(erase["result_code"], str) \
+                    or not erase["result_code"] \
+                    or not isinstance(erase["coverage_id"], str) \
+                    or not erase["coverage_id"]:
+                raise HarnessRefusedError("scrub", "erase_binding")
+            verify = erase["verify"]
+            if not callable(verify):
+                raise HarnessRefusedError("scrub", "erase_binding")
+            try:
+                verified = verify(erase)
+            except Exception:
+                verified = False  # a failed probe = conservative False
+            if verified is not True:  # a STRICT literal True ONLY
+                raise HarnessRefusedError("scrub", "erase_unverified")
         now = _clock_now(self._clock)
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            self._conn.execute(
-                "INSERT INTO scrub_log(token, scrubbed_at) VALUES(?,?)",
-                (token, now))
+            if erase is None:
+                self._conn.execute(
+                    "INSERT INTO scrub_log(token, scrubbed_at, step)"
+                    " VALUES(?,?,'generic')", (token, now))
+            else:
+                self._conn.execute(
+                    "INSERT INTO scrub_log(token, scrubbed_at, step,"
+                    " operation_id, result_code, revision, coverage_id)"
+                    " VALUES(?,?,'erase',?,?,?,?)",
+                    (token, now, erase["operation_id"],
+                     erase["result_code"], erase["revision"],
+                     erase["coverage_id"]))
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")

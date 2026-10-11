@@ -133,7 +133,19 @@ Covered by the suite (115 tests):
   certainty retained, NO re-execute); CLEARED post-erase records
   completion ONLY after the live coverage passes with the erased
   revision/outcome/certainty untouched; teardown runs the same hook
-  standalone. A standalone scrub_log row is NOT integration proof.
+  standalone. The COMPLETION RECORD BINDS THE ERASE STEP EXACTLY
+  (ninth fold): the scrub_log row carries the step kind + the erase
+  invoker/result identity {operation, KNOWN outcome, revision,
+  coverage id}, VERIFIED LIVE against the durable store BEFORE the
+  write (a strict literal-True probe ONLY - a None/0/empty/non-bool/
+  failed/malformed probe or binding = typed HarnessRefusedError,
+  NOTHING recorded). A WRONG erase (no matching outcome row / revision
+  mismatch / live facts remaining) CANNOT complete; a scrub WITHOUT
+  the binding records ONLY a 'generic' volatile-hook completion -
+  NEVER an erase-step gate; the standalone teardown hook completes
+  NOTHING. No physical memory-wipe claim: the hook clears VOLATILE
+  fixture handles ONLY. A standalone scrub_log row is NOT integration
+  proof.
   PENDING RESTART (unacked rows redelivered with the SAME token), LOST
   RECEIVER ACK (row stays pending; same-token redelivery replays
   receiver-side, no double-count), LOST DELIVERED-STATE UPDATE
