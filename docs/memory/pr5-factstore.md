@@ -134,26 +134,39 @@ Covered by the suite (115 tests):
   completion ONLY after the live coverage passes with the erased
   revision/outcome/certainty untouched; teardown runs the same hook
   standalone. The COMPLETION RECORD BINDS THE ERASE STEP EXACTLY
-  (tenth fold): the caller passes ONLY an OPAQUE step CLAIM
+  (eleventh fold): the caller passes ONLY an OPAQUE step CLAIM
   {operation_id, coverage_id} - a per-call outcome/revision/verify
-  callback is REJECTED (a caller-selected callback is not proof). The
-  claim resolves through the fixture-OWNED readback registered ONCE at
-  setup, which returns the OWNED VERIFIED step tuple (owner/lifetime/
-  op + WIPE method + KNOWN decoded outcome + APPLIED revision + closed
-  coverage) from DURABLE receiver state - or None; the scrub_log row
-  carries the OWNED tuple, never caller claims. Verification runs
-  AFTER BEGIN (issuer-log coupling; the readback reads the RECEIVER
-  store - cross-DB atomicity is NOT claimed). A WRONG operation (an
-  earlier PUT), an absent erase, an unknown coverage, stale/changed
-  durable state, a malformed claim, or an unregistered verifier =
-  typed HarnessRefusedError with NOTHING recorded. Step key
-  erase:{operation_id}:{revision} is UNIQUE: a second completion of
-  the same step OR the same token is a typed conflict refusal (NO
-  re-execute). A scrub WITHOUT the claim records ONLY a 'generic'
-  volatile-hook completion - NEVER an erase-step gate; the standalone
-  teardown hook completes NOTHING. No physical memory-wipe claim: the
-  hook clears VOLATILE fixture handles ONLY. A standalone scrub_log
-  row is NOT integration proof.
+  callback is REJECTED (a caller-selected callback is not proof), and
+  the claim is COPIED + normalized BEFORE BEGIN (the caller's dict is
+  never re-read). The claim resolves through the FROZEN typed
+  OwnedEraseReadback adapter - the ONLY accepted registration type
+  (exact type check, store bound AT CONSTRUCTION, checked against the
+  harness's injected receiver store; a lambda/function/subclass/
+  duck-typed callable/second registration all REFUSE) - into the
+  SOURCE-OWNED FactStore.erase_proof route. erase_proof verifies the
+  EXACT committed erase identity under ONE coherent receiver read
+  snapshot: exactly one operation row with strict positive ids, WIPE
+  method + 'applied', the KNOWN decoded outcome agreeing on method +
+  applied_at_revision, the owner's CURRENT lifetime, the
+  FRESH-CURRENT policy (applied_at_revision == the CURRENT store
+  revision - the claimed erase must be the LATEST committed op for
+  the owner subject; historical revision-owned coverage is UNPROVABLE
+  here and REFUSES; newer absence is never substituted for old
+  coverage; unrelated owners never stale), and the CURRENT
+  owner+lifetime-scoped coverage probe (facts == 0). The scrub_log
+  row carries the OWNED tuple (applied AND verified revisions), never
+  caller claims; the scrub-side CLOSED dict validation refuses a
+  forged method/result/id/coverage/join even in a shaped dict. Step
+  key erase:{owner_uid}:{lifetime_id}:{operation_id}:{coverage_id}:
+  {applied_revision} is UNIQUE: a second completion of the same step
+  OR the same token is a typed conflict refusal (NO re-execute).
+  Verification runs AFTER BEGIN (issuer-log coupling; the readback
+  reads the RECEIVER store - cross-DB atomicity is NOT claimed). A
+  scrub WITHOUT the claim records ONLY a 'generic' volatile-hook
+  completion - NEVER an erase-step gate; the standalone teardown hook
+  completes NOTHING. No physical memory-wipe claim: the hook clears
+  VOLATILE fixture handles ONLY. A standalone scrub_log row is NOT
+  integration proof.
   PENDING RESTART (unacked rows redelivered with the SAME token), LOST
   RECEIVER ACK (row stays pending; same-token redelivery replays
   receiver-side, no double-count), LOST DELIVERED-STATE UPDATE

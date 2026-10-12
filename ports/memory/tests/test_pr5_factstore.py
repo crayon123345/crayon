@@ -2348,54 +2348,21 @@ class V34bHarnessVectors(unittest.TestCase):
         self.assertEqual((ev[1], ev[2]), (1, 1))
 
     def test_w2_scrub_factstore_erase_readback_revision(self):
-        # W2 (v80 2060-2137 + the FactStore erase/readback gate), TENTH
-        # fold: the completion record binds the erase step through the
-        # fixture-OWNED registered readback ONLY - the caller passes an
-        # OPAQUE step CLAIM {operation_id, coverage_id}; NO per-call
-        # outcome/revision/verify is accepted. The owned verifier
-        # resolves the claim to the exact COMMITTED erase identity
-        # (owner/lifetime/op + WIPE method + KNOWN decoded outcome +
-        # APPLIED revision + closed coverage) from DURABLE state, or
-        # None. REFUSED and CLEARED are both exercised AFTER the known
-        # erase; wrong operation (an earlier PUT) / absent erase /
-        # unknown coverage / stale state / malformed claims / a second
+        # W2 (v80 2060-2137 + the FactStore erase/readback gate),
+        # ELEVENTH fold: the completion record binds the erase step
+        # through the FROZEN typed OwnedEraseReadback adapter ONLY
+        # (store identity bound at CONSTRUCTION + checked against the
+        # harness's injected receiver at registration; NO callable
+        # protocol). The adapter delegates to the SOURCE-OWNED
+        # FactStore.erase_proof route: exact subject/erase-class/known-
+        # decoded-outcome/current-lifetime/FRESH-CURRENT-revision/
+        # closed-coverage under ONE coherent receiver read snapshot.
+        # REFUSED and CLEARED are both exercised AFTER the known erase;
+        # wrong operation (an earlier PUT) / absent erase / unknown
+        # coverage / stale state / malformed claims / a second
         # completion are all typed refusals with NOTHING recorded. The
         # generic path and the standalone teardown NEVER record an
         # erase-step completion. No physical memory-wipe claim.
-
-        def make_owned_readback(store):
-            def owned_erase_readback(operation_id, coverage_id):
-                # the OWNED verifier: the exact committed erase join
-                import json as _json
-                row = store._q.q(
-                    "SELECT uid, lifetime_id, method, result_code,"
-                    " applied_at_revision, outcome_json FROM"
-                    " operation_records WHERE operation_id=%s",
-                    (operation_id,), "one")
-                if row is None or row["method"] != "wipe":
-                    return None  # not the erase class (e.g. an earlier PUT)
-                try:
-                    decoded = _json.loads(row["outcome_json"])
-                except Exception:
-                    return None
-                if decoded.get("method") != "wipe" \
-                        or decoded.get("applied_at_revision") \
-                        != row["applied_at_revision"]:
-                    return None  # the KNOWN DECODED outcome must agree
-                if row["result_code"] != "applied":
-                    return None
-                if coverage_id != "facts-live-zero":
-                    return None  # the CLOSED coverage set
-                if store._q.q("SELECT count(*) AS n FROM facts", (),
-                              "one")["n"] != 0:
-                    return None  # the live coverage probe
-                return {"operation_id": operation_id, "method": "wipe",
-                        "result_code": row["result_code"],
-                        "revision": row["applied_at_revision"],
-                        "coverage_id": coverage_id,
-                        "owner_uid": row["uid"],
-                        "lifetime_id": row["lifetime_id"]}
-            return owned_erase_readback
 
         CLAIM = {"operation_id": "0f" * 16,
                  "coverage_id": "facts-live-zero"}
@@ -2433,7 +2400,7 @@ class V34bHarnessVectors(unittest.TestCase):
             assert rev_erased > rev_committed
             assert store._q.q("SELECT count(*) AS n FROM facts", (),
                               "one")["n"] == 0
-            harness.register_erase_readback(make_owned_readback(store))
+            harness.register_erase_readback(f.OwnedEraseReadback(store))
             return (store, harness, oconn, comp, rev_erased, proj, rid,
                     provider)
 
@@ -2462,12 +2429,14 @@ class V34bHarnessVectors(unittest.TestCase):
         self.assertEqual(store._store_revision(1), rev_erased)
         row = oconn.execute(
             "SELECT step, step_id, operation_id, method, result_code,"
-            " revision, coverage_id, owner_uid, lifetime_id FROM"
-            " scrub_log WHERE token=?", (comp.token,)).fetchone()
+            " revision, verified_at_revision, coverage_id, owner_uid,"
+            " lifetime_id FROM scrub_log WHERE token=?",
+            (comp.token,)).fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(tuple(row), (
-            "erase", "erase:%s:%d" % ("0f" * 16, rev_erased),
-            "0f" * 16, "wipe", "applied", rev_erased,
+            "erase", "erase:1:1:%s:facts-live-zero:%d" % (
+                "0f" * 16, rev_erased),
+            "0f" * 16, "wipe", "applied", rev_erased, rev_erased,
             "facts-live-zero", 1, 1))
         self.assertEqual(store._q.q(
             "SELECT count(*) AS n FROM facts", (), "one")["n"], 0)
@@ -2530,7 +2499,7 @@ class V34bHarnessVectors(unittest.TestCase):
         harness.send(comp.token)
         d = provider.deliver({"projection": proj, "token": comp.token})
         self.assertEqual(harness.ack(d["ack"]).kind, "delivered")
-        harness.register_erase_readback(make_owned_readback(store))
+        harness.register_erase_readback(f.OwnedEraseReadback(store))
         with self.assertRaises(f.HarnessRefusedError):
             harness.scrub(comp.token, {
                 "raw_ref_handle": OwnedHandle(),
@@ -2599,6 +2568,7 @@ class V34bHarnessVectors(unittest.TestCase):
                     "comparison_buffer": OwnedHandle()}, erase=bad)
         self.assertEqual(oconn.execute(
             "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
+
         store, req, b, rid, provider, harness, proj, oconn = self._rig()
         comp = harness.compose({"projection": proj, "recovery_id": rid})
         harness.send(comp.token)
@@ -2608,6 +2578,177 @@ class V34bHarnessVectors(unittest.TestCase):
             harness.scrub(comp.token, {  # NO registered readback
                 "raw_ref_handle": OwnedHandle(),
                 "comparison_buffer": OwnedHandle()}, erase=CLAIM)
+
+    def test_w2_scrub_eleventh_fold_vectors(self):
+        # ELEVENTH FOLD vectors: (A) registration provenance matrix;
+        # (B) source-owned route policy against FORGED durable rows;
+        # (D) the FRESH-CURRENT freshness vectors (the peer's exact
+        # probe); (E) the scrub-side closed-dict validation against
+        # shaped forged tuples.
+
+        class _Ok:
+            def clear(self):
+                pass
+
+            def live_raw(self):
+                return False
+
+        # (A) REGISTRATION PROVENANCE MATRIX: a lambda, a non-callable,
+        # a SUBCLASS instance, an adapter bound to a DIFFERENT store,
+        # adapter mutation, and a SECOND registration all REFUSE; only
+        # the exact frozen adapter bound to the harness's OWN receiver
+        # store registers
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        for bad in (lambda o, c: None, 42, "x"):
+            with self.assertRaises(f.HarnessRefusedError):
+                harness.register_erase_readback(bad)
+
+        class Sub(f.OwnedEraseReadback):
+            pass
+
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.register_erase_readback(Sub(store))
+        other, _c2, _p2 = mkstore_path()
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.register_erase_readback(f.OwnedEraseReadback(other))
+        with self.assertRaises(f.HarnessRefusedError):
+            f.OwnedEraseReadback(object())
+        adapter = f.OwnedEraseReadback(store)
+        with self.assertRaises(f.HarnessRefusedError):
+            adapter._store = other  # FROZEN: the bound store never swaps
+        harness.register_erase_readback(adapter)
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.register_erase_readback(f.OwnedEraseReadback(store))
+
+        # (B) FORGED DURABLE ROWS via the SOURCE-OWNED route: a
+        # fabricated wipe row at rev 999 (decoded outcome agreeing)
+        # REFUSES (not the current revision); a fabricated row with
+        # NEGATIVE owner/lifetime ids REFUSES (exact-subject policy)
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        store._q.q(
+            "INSERT INTO operation_records(uid, lifetime_id,"
+            " operation_id, binding_hash, marker, method, result_code,"
+            " outcome_json, outcome_kind, proof_json,"
+            " applied_at_revision, epoch, store_revision, fence,"
+            " scrubbed, scrub_revision) VALUES(1,1,%s,'x',NULL,"
+            "'wipe','applied',"
+            "'{\"method\":\"wipe\",\"applied_at_revision\":999}'," 
+            "'full',NULL,999,1,999,1,0,1)", ("ab" * 16,), "exec")
+        self.assertIsNone(store.erase_proof("ab" * 16,
+                                            "facts-live-zero"))
+        store._q.q(
+            "INSERT INTO operation_records(uid, lifetime_id,"
+            " operation_id, binding_hash, marker, method, result_code,"
+            " outcome_json, outcome_kind, proof_json,"
+            " applied_at_revision, epoch, store_revision, fence,"
+            " scrubbed, scrub_revision) VALUES(-99,-99,%s,'x',NULL,"
+            "'wipe','applied',"
+            "'{\"method\":\"wipe\",\"applied_at_revision\":1}'," 
+            "'full',NULL,1,1,1,1,0,1)",
+            ("cd" * 16,), "exec")
+        self.assertIsNone(store.erase_proof("cd" * 16,
+                                            "facts-live-zero"))
+        # a malformed operation id / unknown coverage refuse on entry
+        self.assertIsNone(store.erase_proof("zz", "facts-live-zero"))
+        self.assertIsNone(store.erase_proof("ab" * 16, "everything"))
+
+        # (D) FRESH-CURRENT - the peer's exact probe: wipe 0f at R2 /
+        # new PUT at R3 / new wipe 1f at R4. The OLD 0f claim REFUSES
+        # (historical R2-owned coverage is UNPROVABLE - newer absence
+        # is never substituted for it); the CURRENT 1f claim CLEARS
+        # with its own R4 aftermath
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        r1, _ = run(store, put_req("9e" * 16, key="w2key"))
+        self.assertEqual(r1.result.outcome.result_code, "applied")
+        rw0, _ = run(store, wipe_req("0f" * 16))
+        self.assertEqual(rw0.result.outcome.result_code, "applied")
+        rev_w0 = store._store_revision(1)
+        r2, _ = run(store, put_req("7d" * 16, key="w2key2"))
+        self.assertEqual(r2.result.outcome.result_code, "applied")
+        rev_put = store._store_revision(1)
+        rw1, _ = run(store, wipe_req("1f" * 16))
+        self.assertEqual(rw1.result.outcome.result_code, "applied")
+        rev_w1 = store._store_revision(1)
+        self.assertLess(rev_w0, rev_put)
+        self.assertLess(rev_put, rev_w1)
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        harness.send(comp.token)
+        d = provider.deliver({"projection": proj, "token": comp.token})
+        self.assertEqual(harness.ack(d["ack"]).kind, "delivered")
+        harness.register_erase_readback(f.OwnedEraseReadback(store))
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.scrub(comp.token, {
+                "raw_ref_handle": _Ok(), "comparison_buffer": _Ok()},
+                erase={"operation_id": "0f" * 16,
+                       "coverage_id": "facts-live-zero"})
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
+        out = harness.scrub(comp.token, {
+            "raw_ref_handle": _Ok(), "comparison_buffer": _Ok()},
+            erase={"operation_id": "1f" * 16,
+                   "coverage_id": "facts-live-zero"})
+        self.assertEqual(out["kind"], "cleared")
+        row = oconn.execute(
+            "SELECT step_id, revision, verified_at_revision FROM"
+            " scrub_log WHERE token=?", (comp.token,)).fetchone()
+        self.assertEqual(tuple(row), (
+            "erase:1:1:%s:facts-live-zero:%d" % ("1f" * 16, rev_w1),
+            rev_w1, rev_w1))
+
+        # (E) SHAPED FORGED TUPLES: even with the store route
+        # fault-patched to return a shaped dict, the scrub-side CLOSED
+        # validation refuses a wrong method/result/id/revision/
+        # coverage/join, a missing key, and an extra key - NOTHING
+        # recorded; the REAL route clears once restored
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        r1, _ = run(store, put_req("9e" * 16, key="w2key"))
+        self.assertEqual(r1.result.outcome.result_code, "applied")
+        rw, _ = run(store, wipe_req("0f" * 16))
+        self.assertEqual(rw.result.outcome.result_code, "applied")
+        rev = store._store_revision(1)
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        harness.send(comp.token)
+        d = provider.deliver({"projection": proj, "token": comp.token})
+        self.assertEqual(harness.ack(d["ack"]).kind, "delivered")
+        harness.register_erase_readback(f.OwnedEraseReadback(store))
+        real = store.erase_proof
+        base = {"operation_id": "0f" * 16, "method": "wipe",
+                "result_code": "applied", "revision": rev,
+                "verified_at_revision": rev,
+                "coverage_id": "facts-live-zero",
+                "owner_uid": 1, "lifetime_id": 1}
+        forged_shapes = (
+            dict(base, method="put"),
+            dict(base, result_code="refused"),
+            dict(base, owner_uid=-99),
+            dict(base, lifetime_id=-99),
+            dict(base, revision=0),
+            dict(base, verified_at_revision=0),
+            dict(base, coverage_id="everything"),
+            dict(base, operation_id="1f" * 16),
+            {k: v for k, v in base.items() if k != "method"},
+            dict(base, extra="x"))
+        for forged in forged_shapes:
+            store.erase_proof = (lambda o, c, _f=forged: _f)
+            with self.assertRaises(f.HarnessRefusedError):
+                harness.scrub(comp.token, {
+                    "raw_ref_handle": _Ok(), "comparison_buffer": _Ok()},
+                    erase={"operation_id": "0f" * 16,
+                           "coverage_id": "facts-live-zero"})
+        store.erase_proof = real
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
+        out = harness.scrub(comp.token, {
+            "raw_ref_handle": _Ok(), "comparison_buffer": _Ok()},
+            erase={"operation_id": "0f" * 16,
+                   "coverage_id": "facts-live-zero"})
+        self.assertEqual(out["kind"], "cleared")
+        row = oconn.execute(
+            "SELECT step_id, revision, verified_at_revision FROM"
+            " scrub_log WHERE token=?", (comp.token,)).fetchone()
+        self.assertEqual(tuple(row), (
+            "erase:1:1:%s:facts-live-zero:%d" % ("0f" * 16, rev),
+            rev, rev))
 
     def test_unrelated_same_owner_target_refused(self):
         # the R1 repro (v80 795-812, 3948-3951 UNRELATED SAME-OWNER

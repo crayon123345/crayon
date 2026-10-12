@@ -3787,10 +3787,45 @@ CREATE TABLE IF NOT EXISTS scrub_log(
   token TEXT PRIMARY KEY, scrubbed_at INTEGER NOT NULL,
   step TEXT NOT NULL DEFAULT 'generic',
   step_id TEXT, operation_id TEXT, method TEXT,
-  result_code TEXT, revision INTEGER, coverage_id TEXT,
-  owner_uid INTEGER, lifetime_id INTEGER);
+  result_code TEXT, revision INTEGER, verified_at_revision INTEGER,
+  coverage_id TEXT, owner_uid INTEGER, lifetime_id INTEGER);
 CREATE UNIQUE INDEX IF NOT EXISTS scrub_log_step ON scrub_log(step_id);
 """
+
+
+# the CLOSED erase-coverage set (eleventh fold): the ONLY coverage
+# ids the source-owned erase route can ever verify
+ERASE_COVERAGE_IDS = ("facts-live-zero",)
+
+
+class OwnedEraseReadback:
+    """FIXTURE-OWNED erase readback ADAPTER (eleventh fold, finding A).
+    The ONLY erase-readback type IssuerHarness.register_erase_readback
+    accepts. The RECEIVER STORE identity is bound AT CONSTRUCTION
+    (EXACT type check - NOT a subclass, NOT a duck-typed callable, NOT
+    a lambda); the adapter is FROZEN after construction (a subclass or
+    callback can NEVER swap the bound store). The adapter carries NO
+    verification logic: readback() delegates to the SOURCE-OWNED
+    FactStore.erase_proof route, which reads the DURABLE receiver
+    state under ONE coherent read snapshot. Registration-once alone is
+    NOT provenance binding - the harness additionally checks the
+    adapter's bound store IS its injected receiver's store."""
+
+    __test__ = False
+    __slots__ = ("_store",)
+
+    def __init__(self, store: "FactStore") -> None:
+        if type(store) is not FactStore:
+            raise HarnessRefusedError("scrub", "erase_binding")
+        object.__setattr__(self, "_store", store)
+
+    def __setattr__(self, name, value):
+        # FROZEN: the bound receiver store can never be swapped
+        raise HarnessRefusedError("scrub", "erase_binding")
+
+    def readback(self, operation_id: str, coverage_id: str):
+        """Delegates to the SOURCE-OWNED erase route ONLY."""
+        return self._store.erase_proof(operation_id, coverage_id)
 
 
 class IssuerHarness:
@@ -3897,23 +3932,21 @@ class IssuerHarness:
         return {"projection": stored, "recovery_id": row[0],
                 "token": token}
 
-    def register_erase_readback(self, verifier) -> None:
-        """FIXTURE-OWNED erase readback (tenth fold): the ONLY source of
-        erase-step truth. Registered ONCE by the fixture owner at setup
-        (a second registration or a non-callable REFUSES). An arbitrary
-        per-call verify callback is NEVER accepted anywhere: scrub()
-        takes only the OPAQUE step CLAIM {operation_id, coverage_id}
-        and resolves it through THIS owned verifier. The verifier maps
-        a claimed (operation_id, coverage_id) to the OWNED VERIFIED
-        step tuple {operation_id, method, result_code, revision,
-        coverage_id, owner_uid, lifetime_id} read from the DURABLE
-        receiver state (the exact committed erase identity: the WIPE
-        method/erase class, owner/lifetime, KNOWN decoded outcome,
-        APPLIED revision, closed coverage) - or None (no such verified
-        step)."""
-        if not callable(verifier) or self._erase_readback is not None:
+    def register_erase_readback(self, adapter) -> None:
+        """FIXTURE-OWNED erase readback registration (eleventh fold):
+        accepts EXACTLY one OwnedEraseReadback whose RECEIVER STORE was
+        bound at CONSTRUCTION and IS this harness's INJECTED RECEIVER
+        store (registration-once alone is NOT provenance binding -
+        BOTH checks run). ANY other object - a lambda, a function, a
+        duck-typed callable, a subclass instance - REFUSES; a second
+        registration REFUSES. scrub() takes only the OPAQUE step CLAIM
+        {operation_id, coverage_id} and resolves it through THIS owned
+        adapter into the SOURCE-OWNED FactStore.erase_proof route."""
+        if type(adapter) is not OwnedEraseReadback                 or self._erase_readback is not None:
             raise HarnessRefusedError("scrub", "erase_registration")
-        self._erase_readback = verifier
+        if adapter._store is not self._receiver._store:
+            raise HarnessRefusedError("scrub", "erase_registration")
+        self._erase_readback = adapter
 
     def outbox_state(self, token: str) -> str:
         _req_hex(token, 32)
@@ -4033,38 +4066,53 @@ class IssuerHarness:
         if outcome["kind"] != "cleared":
             return outcome  # REFUSAL: nothing recorded, no state change
         self._verify_stage("scrub", token)  # re-verified AFTER the raw
-        # ERASE-STEP COMPLETION BINDING (tenth fold): the caller passes
-        # ONLY the OPAQUE step CLAIM {operation_id, coverage_id} - NO
-        # per-call outcome/revision/verify (a caller-selected callback
-        # or claimed outcome is NOT proof and is REJECTED). The claim
-        # is resolved through the fixture-OWNED registered readback,
-        # which returns the OWNED VERIFIED step tuple from DURABLE
-        # receiver state (exact committed erase identity: WIPE method /
-        # erase class, owner/lifetime, KNOWN decoded outcome, APPLIED
-        # revision, closed coverage) or None. The record carries the
-        # OWNED tuple, never the caller's claims. A WRONG operation
-        # (e.g. an earlier PUT), an absent erase, an unknown coverage,
-        # or a stale/changed durable state = NO verified step = typed
-        # refusal, NOTHING recorded. Step key: erase:{operation_id}:
-        # {revision} (UNIQUE) - a second completion of the SAME step,
-        # or a second completion of the SAME token, is a typed conflict
-        # refusal (NO re-execute). Verification runs AFTER BEGIN so the
-        # issuer-log write is coupled to the check (the readback reads
-        # the RECEIVER store - cross-DB atomicity is NOT claimed). The
-        # generic path records ONLY a 'generic' volatile-hook
-        # completion - NEVER an erase-step gate. NO physical
-        # memory-wipe claim anywhere: the hook clears VOLATILE fixture
-        # handles ONLY.
+        # ERASE-STEP COMPLETION BINDING (eleventh fold): the caller
+        # passes ONLY the OPAQUE step CLAIM {operation_id,
+        # coverage_id} - NO per-call outcome/revision/verify (a
+        # caller-selected callback is NOT proof and is REJECTED; the
+        # registered readback is the FROZEN typed OwnedEraseReadback
+        # adapter, NEVER an arbitrary callable). The claim is resolved
+        # through the adapter into the SOURCE-OWNED
+        # FactStore.erase_proof route: the exact committed erase
+        # identity (owner/lifetime/op + WIPE method + KNOWN decoded
+        # outcome + APPLIED revision + closed coverage) read from
+        # DURABLE receiver state under ONE coherent read snapshot, or
+        # None. FRESHNESS POLICY (finding D) is FRESH-CURRENT: the
+        # claimed erase must be the LATEST committed operation for the
+        # owner subject (applied_at_revision == the CURRENT store
+        # revision) with the CURRENT owner-scoped coverage probe
+        # showing the erase's own aftermath - a historical
+        # revision-owned coverage is UNPROVABLE in this fixture (no
+        # historical snapshots) and REFUSES; newer absence is NEVER
+        # substituted for old coverage; an UNRELATED owner's commits
+        # never stale the claim (revisions are per-owner). The record
+        # carries the OWNED tuple (applied AND verified revisions),
+        # never the caller's claims. Step key: erase:{owner_uid}:
+        # {lifetime_id}:{operation_id}:{coverage_id}:{applied_revision}
+        # (UNIQUE) - a second completion of the SAME step, or of the
+        # SAME token, is a typed conflict refusal (NO re-execute).
+        # Verification runs AFTER BEGIN so the issuer-log write is
+        # coupled to the check (the readback reads the RECEIVER store -
+        # cross-DB atomicity is NOT claimed). The generic path records
+        # ONLY a 'generic' volatile-hook completion - NEVER an
+        # erase-step gate. NO physical memory-wipe claim anywhere: the
+        # hook clears VOLATILE fixture handles ONLY.
         if erase is not None:
             if not isinstance(erase, dict) or set(erase.keys()) != {
                     "operation_id", "coverage_id"}:
                 raise HarnessRefusedError("scrub", "erase_binding")
+            # the CLOSED CLAIM COPY (eleventh fold, finding C):
+            # normalized ONCE BEFORE BEGIN - ONLY the copy is read
+            # below; the caller's dict is never re-read, so a later
+            # mutation of the caller's object cannot drift the check
+            claim = {"operation_id": erase["operation_id"],
+                     "coverage_id": erase["coverage_id"]}
             try:
-                _req_hex(erase["operation_id"], 32)
+                _req_hex(claim["operation_id"], 32)
             except Exception:
                 raise HarnessRefusedError("scrub", "erase_binding")
-            if not isinstance(erase["coverage_id"], str) \
-                    or not erase["coverage_id"]:
+            if not isinstance(claim["coverage_id"], str) \
+                    or not claim["coverage_id"]:
                 raise HarnessRefusedError("scrub", "erase_binding")
             if self._erase_readback is None:
                 raise HarnessRefusedError("scrub", "erase_unverified")
@@ -4077,40 +4125,60 @@ class IssuerHarness:
                     " VALUES(?,?,'generic')", (token, now))
             else:
                 try:
-                    step = self._erase_readback(erase["operation_id"],
-                                                erase["coverage_id"])
+                    raw_step = self._erase_readback.readback(
+                        claim["operation_id"], claim["coverage_id"])
                 except HarnessRefusedError:
                     raise
                 except Exception:
-                    step = None  # a failed readback = NO verified step
-                if not isinstance(step, dict) or set(step.keys()) != {
-                        "operation_id", "method", "result_code",
-                        "revision", "coverage_id", "owner_uid",
-                        "lifetime_id"}:
-                    raise HarnessRefusedError("scrub", "erase_unverified")
-                # the CLOSED COPY, checked against the claim - the
-                # OWNED tuple is bound to the record, never the claim
-                if step["operation_id"] != erase["operation_id"] \
-                        or step["coverage_id"] != erase["coverage_id"] \
+                    raw_step = None  # a failed readback = NO step
+                # the CLOSED STEP COPY + the EXACT typed policy
+                # (eleventh fold, finding B): closed enums + strict
+                # positive ints + the claim join - a forged method/
+                # result/id refuses EVEN in a shaped dict; only the
+                # copy is used below
+                step = None
+                if isinstance(raw_step, dict)                         and set(raw_step.keys()) == {
+                            "operation_id", "method", "result_code",
+                            "revision", "verified_at_revision",
+                            "coverage_id", "owner_uid", "lifetime_id"}:
+                    step = dict(raw_step)
+                if step is None \
+                        or step["operation_id"] != claim["operation_id"] \
+                        or step["coverage_id"] != claim["coverage_id"] \
+                        or step["coverage_id"] not in ERASE_COVERAGE_IDS \
+                        or step["method"] != "wipe" \
+                        or step["result_code"] != "applied" \
                         or type(step["revision"]) is not int \
                         or step["revision"] < 1 \
-                        or not isinstance(step["method"], str) \
-                        or not step["method"] \
-                        or not isinstance(step["result_code"], str) \
-                        or not step["result_code"] \
+                        or type(step["verified_at_revision"]) is not int \
+                        or step["verified_at_revision"] \
+                        < step["revision"] \
                         or type(step["owner_uid"]) is not int \
-                        or type(step["lifetime_id"]) is not int:
+                        or step["owner_uid"] < 1 \
+                        or type(step["lifetime_id"]) is not int \
+                        or step["lifetime_id"] < 1:
                     raise HarnessRefusedError("scrub", "erase_unverified")
+                # STEP-ID EXACT SPEC (eleventh fold, finding E): the
+                # GLOBAL step identity is the FULL tuple
+                # erase:{owner_uid}:{lifetime_id}:{operation_id}:
+                # {coverage_id}:{applied_revision} - one completion per
+                # exact step EVER (UNIQUE(step_id)); a second
+                # completion of the same step OR the same token (PK)
+                # is a typed conflict refusal, NO re-execute
                 self._conn.execute(
                     "INSERT INTO scrub_log(token, scrubbed_at, step,"
                     " step_id, operation_id, method, result_code,"
-                    " revision, coverage_id, owner_uid, lifetime_id)"
-                    " VALUES(?,?,'erase',?,?,?,?,?,?,?,?)",
+                    " revision, verified_at_revision, coverage_id,"
+                    " owner_uid, lifetime_id)"
+                    " VALUES(?,?,'erase',?,?,?,?,?,?,?,?,?)",
                     (token, now,
-                     "erase:%s:%d" % (step["operation_id"],
-                                      step["revision"]),
+                     "erase:%d:%d:%s:%s:%d" % (
+                         step["owner_uid"], step["lifetime_id"],
+                         step["operation_id"], step["coverage_id"],
+                         step["revision"]),
                      step["operation_id"], step["method"],
                      step["result_code"], step["revision"],
+                     step["verified_at_revision"],
                      step["coverage_id"], step["owner_uid"],
                      step["lifetime_id"]))
             self._conn.execute("COMMIT")
@@ -4688,6 +4756,110 @@ class FactStore:
                   " store_revision=excluded.store_revision RETURNING"
                   " store_revision", (uid, new), "one")
         return new
+
+    def erase_proof(self, operation_id: str, coverage_id: str):
+        """SOURCE-OWNED erase proof route (eleventh fold, findings
+        B/C/D) - the ONLY erase-verification path. Maps a claimed
+        (operation_id, coverage_id) to the OWNED VERIFIED step tuple
+        {operation_id, method, result_code, revision,
+        verified_at_revision, coverage_id, owner_uid, lifetime_id}
+        from DURABLE receiver state, or None (NO verified step).
+        EXACT policy, every conjunct required:
+          - EXACT SUBJECT: precisely ONE operation_records row for the
+            operation; uid/lifetime_id/applied_at_revision are strict
+            positive ints (a forged/negative id REFUSES);
+          - ERASE CLASS: method == 'wipe' AND result_code == 'applied'
+            (an earlier PUT or a refused/no-op wipe is NOT an erase);
+          - KNOWN DECODED OUTCOME: outcome_json decodes and its
+            method == 'wipe' AND its applied_at_revision == the row's
+            (a fabricated or mismatched outcome REFUSES);
+          - CURRENT LIFETIME: the row's lifetime_id == the owner's
+            CURRENT lifetime_state row;
+          - FRESH-CURRENT (finding D): the row's applied_at_revision
+            == the owner's CURRENT store revision - the claimed erase
+            must be the LATEST committed operation for the owner
+            subject. A historical revision-owned coverage is
+            UNPROVABLE here (NO historical snapshots exist) and
+            REFUSES; newer absence is NEVER substituted for old
+            coverage; an unrelated owner's commits CANNOT stale the
+            claim (store revisions are per-owner);
+          - COVERAGE: coverage_id in ERASE_COVERAGE_IDS AND the CURRENT
+            owner+lifetime-scoped facts probe == 0 rows (the erase's
+            OWN aftermath - never a global facts count).
+        ALL reads run inside ONE explicit read transaction on the
+        receiver connection (finding C): the row/probe/revision are a
+        COHERENT snapshot, not independent reads. Any failure = None,
+        NEVER a raw exception."""
+        try:
+            _req_hex(operation_id, OP_ID_LEN)
+        except Exception:
+            return None
+        if type(coverage_id) is not str \
+                or coverage_id not in ERASE_COVERAGE_IDS:
+            return None
+        conn = self._q.raw
+        try:
+            conn.execute("BEGIN")
+            rows = self._q.q(
+                "SELECT uid, lifetime_id, method, result_code,"
+                " applied_at_revision, outcome_json FROM"
+                " operation_records WHERE operation_id=%s",
+                (operation_id,), "all")
+            if rows is None or len(rows) != 1:
+                conn.execute("ROLLBACK")
+                return None
+            row = rows[0]
+            uid = row["uid"]
+            lid = row["lifetime_id"]
+            rev = row["applied_at_revision"]
+            if type(uid) is not int or uid < 1 \
+                    or type(lid) is not int or lid < 1 \
+                    or type(rev) is not int or rev < 1:
+                conn.execute("ROLLBACK")
+                return None
+            if row["method"] != "wipe" or row["result_code"] != "applied":
+                conn.execute("ROLLBACK")
+                return None
+            try:
+                decoded = json.loads(row["outcome_json"])
+            except Exception:
+                conn.execute("ROLLBACK")
+                return None
+            if not isinstance(decoded, dict) \
+                    or decoded.get("method") != "wipe" \
+                    or decoded.get("applied_at_revision") != rev:
+                conn.execute("ROLLBACK")
+                return None
+            cur = self._q.q(
+                "SELECT lifetime_id FROM lifetime_state WHERE uid=%s",
+                (uid,), "one")
+            if cur is None or cur["lifetime_id"] != lid:
+                conn.execute("ROLLBACK")
+                return None
+            current = self._store_revision(uid)
+            if current != rev:
+                conn.execute("ROLLBACK")
+                return None  # STALE: not the latest subject op
+            probe = self._q.q(
+                "SELECT count(*) AS n FROM facts WHERE uid=%s AND"
+                " lifetime_id=%s", (uid, lid), "one")
+            if probe is None or probe["n"] != 0:
+                conn.execute("ROLLBACK")
+                return None
+            conn.execute("COMMIT")
+        except HarnessRefusedError:
+            raise
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            return None
+        return {"operation_id": operation_id, "method": "wipe",
+                "result_code": "applied", "revision": rev,
+                "verified_at_revision": current,
+                "coverage_id": coverage_id, "owner_uid": uid,
+                "lifetime_id": lid}
 
     def _current_epoch(self, uid: int) -> int:
         row = self._q.q("SELECT current_epoch FROM fixture_snapshot"
