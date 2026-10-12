@@ -6,15 +6,16 @@ import cr_db as db
 import cr_google as G
 from cr_safety import looks_like_secret,redact
 VERSIONS=['2026-07-28','2025-11-25','2025-06-18','2025-03-26']
-NOTICE='Tool arguments go to this server. Its tools can read or change external systems. Crayon sends no ambient history or Google/account content. Every call needs an exact arguments review. Only add a server you trust. No secrets in URLs. OAuth/stdio not supported yet.'
+NOTICE='Tool arguments go to this server. Its tools can read or change external systems. Crayon sends no ambient history or Google/account content. Every call needs an exact arguments review. Only add a server you trust. No secrets in URLs. Bearer credentials come from server environment only, never chat. OAuth/stdio not supported yet.'
 def endpoint(url):
  p=urlsplit(url)
  from cr_web import _safe_host
  if p.scheme!='https' or not p.hostname or p.username or p.password or p.query or p.fragment or p.port not in (None,443) or not _safe_host(p.hostname):raise ValueError('Use a public HTTPS MCP endpoint, no credentials/query/private hosts.')
  return url
 def connectors(uid):return db.kv_get('mcp_connectors_'+str(uid),{}) or {}
-def session(url,method,args=None):
+def session(url,method,args=None,token=None):
  endpoint(url);headers={'Accept':'application/json, text/event-stream','MCP-Protocol-Version':VERSIONS[0]}
+ if token is not None:headers['Authorization']='Bearer '+token
  with httpx.Client(timeout=20,follow_redirects=False) as client:
   def rpc(ident,method,params):
    response=client.post(url,headers=headers,json={'jsonrpc':'2.0','id':ident,'method':method,'params':params} if ident is not None else {'jsonrpc':'2.0','method':method,'params':params})
@@ -43,10 +44,10 @@ def session(url,method,args=None):
    headers['MCP-Protocol-Version']=version;rpc(None,'notifications/initialized',{})
   payload={**(meta if modern else {}),**(args or {})}
   return rpc(2,method,payload)
-def add(uid,name,url,accept):
+def add(uid,name,url,accept,token=None):
  if accept is not True:raise ValueError(NOTICE)
  if not re.fullmatch('[A-Za-z0-9_-]{1,30}',name):raise ValueError('Use a short connector name.')
- endpoint(url);tools=session(url,'tools/list').get('tools',[])
+ endpoint(url);tools=session(url,'tools/list',token=token).get('tools',[])
  if not isinstance(tools,list) or len(tools)>50:raise ValueError('Tool catalog too large.')
  safe=[]
  for t in tools:
@@ -58,8 +59,30 @@ def add(uid,name,url,accept):
  c[name]={'url':url,'tools':safe,'consent_at':int(time.time()),'notice':NOTICE};db.kv_set('mcp_connectors_'+str(uid),c)
  db.audit(uid,'mcp_connector_consent',json.dumps({'name':name,'url':url,'notice':NOTICE}))
  return {'name':name,'tools':safe,'notice':NOTICE}
+def _cred_key(uid,name):return 'mcp_cred_'+str(uid)+'_'+name
+def _read_env_credential(env_var):
+ if not re.fullmatch(r'[A-Z0-9_]{1,60}',env_var or ''):raise ValueError('Invalid credential variable name.')
+ import os
+ token=os.environ.get(env_var,'')
+ if not re.fullmatch(r'[!-~]{10,300}',token):raise ValueError('Credential missing or unusable in server environment.')
+ return token
+def add_keyed(uid,name,url,env_var,accept):
+ '''Consented connector whose bearer credential lives in a SERVER ENV var.
+ The secret is never accepted from chat, never logged, never echoed.'''
+ if accept is not True:raise ValueError(NOTICE)
+ token=_read_env_credential(env_var)  # fail closed BEFORE any network
+ r=add(uid,name,url,True,token=token)
+ db.kv_set(_cred_key(uid,name),G.encrypt(uid,{'token':token,'env':env_var}))
+ db.audit(uid,'mcp_connector_keyed',json.dumps({'name':name,'url':url,'env':env_var}))
+ return r
+def _credential(uid,name):
+ blob=db.kv_get(_cred_key(uid,name))
+ if not blob:return None
+ try:return G.decrypt(uid,blob).get('token')
+ except Exception:return None
 def remove(uid,name):
- c=connectors(uid);c.pop(name,None);db.kv_set('mcp_connectors_'+str(uid),c);return {'removed':True}
+ c=connectors(uid);c.pop(name,None);db.kv_set('mcp_connectors_'+str(uid),c)
+ db.q('DELETE FROM kv WHERE key=%s',(_cred_key(uid,name),),'none');return {'removed':True}
 def prepare(uid,server,tool,arguments):
  c=connectors(uid).get(server)
  if not c or not any(t['name']==tool for t in c['tools']):raise ValueError('Connect this server/tool first.')
@@ -88,6 +111,6 @@ def confirm(uid,ident,decision):
  import cr_progress
  db.audit(uid,'mcp_call_review_confirmed',json.dumps({'server':p['server'],'tool':p['tool'],'destination':p['url']}))
  cr_progress.emit('Calling reviewed MCP tool')
- try:r=session(p['url'],'tools/call',{'name':p['tool'],'arguments':p['arguments']})
+ try:r=session(p['url'],'tools/call',{'name':p['tool'],'arguments':p['arguments']},token=_credential(uid,p['server']))
  except Exception:raise ValueError('MCP result unconfirmed. Check the server before another call. No retry.') from None
  return {'text':redact(json.dumps(r,ensure_ascii=False))[:12000],'untrusted':True,'note':'Server returned this result; not independent verification of its claims.'}
