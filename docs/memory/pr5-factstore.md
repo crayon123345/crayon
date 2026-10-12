@@ -134,18 +134,26 @@ Covered by the suite (115 tests):
   completion ONLY after the live coverage passes with the erased
   revision/outcome/certainty untouched; teardown runs the same hook
   standalone. The COMPLETION RECORD BINDS THE ERASE STEP EXACTLY
-  (ninth fold): the scrub_log row carries the step kind + the erase
-  invoker/result identity {operation, KNOWN outcome, revision,
-  coverage id}, VERIFIED LIVE against the durable store BEFORE the
-  write (a strict literal-True probe ONLY - a None/0/empty/non-bool/
-  failed/malformed probe or binding = typed HarnessRefusedError,
-  NOTHING recorded). A WRONG erase (no matching outcome row / revision
-  mismatch / live facts remaining) CANNOT complete; a scrub WITHOUT
-  the binding records ONLY a 'generic' volatile-hook completion -
-  NEVER an erase-step gate; the standalone teardown hook completes
-  NOTHING. No physical memory-wipe claim: the hook clears VOLATILE
-  fixture handles ONLY. A standalone scrub_log row is NOT integration
-  proof.
+  (tenth fold): the caller passes ONLY an OPAQUE step CLAIM
+  {operation_id, coverage_id} - a per-call outcome/revision/verify
+  callback is REJECTED (a caller-selected callback is not proof). The
+  claim resolves through the fixture-OWNED readback registered ONCE at
+  setup, which returns the OWNED VERIFIED step tuple (owner/lifetime/
+  op + WIPE method + KNOWN decoded outcome + APPLIED revision + closed
+  coverage) from DURABLE receiver state - or None; the scrub_log row
+  carries the OWNED tuple, never caller claims. Verification runs
+  AFTER BEGIN (issuer-log coupling; the readback reads the RECEIVER
+  store - cross-DB atomicity is NOT claimed). A WRONG operation (an
+  earlier PUT), an absent erase, an unknown coverage, stale/changed
+  durable state, a malformed claim, or an unregistered verifier =
+  typed HarnessRefusedError with NOTHING recorded. Step key
+  erase:{operation_id}:{revision} is UNIQUE: a second completion of
+  the same step OR the same token is a typed conflict refusal (NO
+  re-execute). A scrub WITHOUT the claim records ONLY a 'generic'
+  volatile-hook completion - NEVER an erase-step gate; the standalone
+  teardown hook completes NOTHING. No physical memory-wipe claim: the
+  hook clears VOLATILE fixture handles ONLY. A standalone scrub_log
+  row is NOT integration proof.
   PENDING RESTART (unacked rows redelivered with the SAME token), LOST
   RECEIVER ACK (row stays pending; same-token redelivery replays
   receiver-side, no double-count), LOST DELIVERED-STATE UPDATE

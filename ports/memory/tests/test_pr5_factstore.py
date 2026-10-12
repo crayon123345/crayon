@@ -2348,78 +2348,60 @@ class V34bHarnessVectors(unittest.TestCase):
         self.assertEqual((ev[1], ev[2]), (1, 1))
 
     def test_w2_scrub_factstore_erase_readback_revision(self):
-        # W2 (v80 2060-2137 + the FactStore erase/readback gate): the
-        # scrub hook composed with a KNOWN FactStore erase/readback
-        # outcome + REVISION proof - REFUSED and CLEARED are BOTH
-        # exercised AFTER the known erase, and the completion record
-        # BINDS THE ERASE STEP EXACTLY (ninth fold): the completion is
-        # recorded ONLY with the erase invoker/result binding
-        # {operation, KNOWN outcome, revision, coverage id} VERIFIED
-        # LIVE BEFORE the write. A wrong or absent erase CANNOT record
-        # an erase-step completion; a scrub without the binding records
-        # ONLY a generic volatile-hook completion (never an erase-step
-        # gate); the standalone teardown hook completes NOTHING. No
-        # physical memory-wipe claim: the hook clears VOLATILE fixture
-        # handles only.
-        store, req, b, rid, provider, harness, proj, oconn = self._rig()
-        # the KNOWN mutation commit + its readback outcome/revision
-        r1, _ = run(store, put_req("9e" * 16, key="w2key"))
-        self.assertEqual(r1.result.outcome.result_code, "applied")
-        self.assertIsNotNone(r1.result.outcome.readback.fact_id)
-        rev_committed = store._store_revision(1)
-        self.assertGreaterEqual(rev_committed, 1)
-        # the chosen known-commit side (harness delivery committed)
-        comp = harness.compose({"projection": proj, "recovery_id": rid})
-        harness.send(comp.token)
-        d = provider.deliver({"projection": proj, "token": comp.token})
-        self.assertEqual(harness.ack(d["ack"]).kind, "delivered")
-        # the KNOWN ERASE/READBACK: the invoker/result binding is the
-        # ACTUAL wipe op ("0f"*16) -> its applied outcome + the captured
-        # fresh revision; the live row is GONE on readback
-        rw, _ = run(store, wipe_req("0f" * 16))
-        self.assertEqual(rw.result.outcome.result_code, "applied")
-        rev_erased = store._store_revision(1)
-        self.assertGreater(rev_erased, rev_committed)
-        self.assertEqual(store._q.q(
-            "SELECT count(*) AS n FROM facts", (), "one")["n"], 0)
+        # W2 (v80 2060-2137 + the FactStore erase/readback gate), TENTH
+        # fold: the completion record binds the erase step through the
+        # fixture-OWNED registered readback ONLY - the caller passes an
+        # OPAQUE step CLAIM {operation_id, coverage_id}; NO per-call
+        # outcome/revision/verify is accepted. The owned verifier
+        # resolves the claim to the exact COMMITTED erase identity
+        # (owner/lifetime/op + WIPE method + KNOWN decoded outcome +
+        # APPLIED revision + closed coverage) from DURABLE state, or
+        # None. REFUSED and CLEARED are both exercised AFTER the known
+        # erase; wrong operation (an earlier PUT) / absent erase /
+        # unknown coverage / stale state / malformed claims / a second
+        # completion are all typed refusals with NOTHING recorded. The
+        # generic path and the standalone teardown NEVER record an
+        # erase-step completion. No physical memory-wipe claim.
 
-        def verify_erase(e):
-            # the LIVE readback verifier: the KNOWN outcome row, the
-            # CURRENT revision, and the coverage probe are re-read from
-            # the DURABLE store at completion time - strict True ONLY
-            row = store._q.q(
-                "SELECT result_code FROM operation_records WHERE"
-                " operation_id=%s", (e["operation_id"],), "one")
-            if row is None or row["result_code"] != e["result_code"]:
-                return False
-            if store._store_revision(1) != e["revision"]:
-                return False
-            if store._q.q("SELECT count(*) AS n FROM facts", (),
-                          "one")["n"] != 0:
-                return False
-            return True
+        def make_owned_readback(store):
+            def owned_erase_readback(operation_id, coverage_id):
+                # the OWNED verifier: the exact committed erase join
+                import json as _json
+                row = store._q.q(
+                    "SELECT uid, lifetime_id, method, result_code,"
+                    " applied_at_revision, outcome_json FROM"
+                    " operation_records WHERE operation_id=%s",
+                    (operation_id,), "one")
+                if row is None or row["method"] != "wipe":
+                    return None  # not the erase class (e.g. an earlier PUT)
+                try:
+                    decoded = _json.loads(row["outcome_json"])
+                except Exception:
+                    return None
+                if decoded.get("method") != "wipe" \
+                        or decoded.get("applied_at_revision") \
+                        != row["applied_at_revision"]:
+                    return None  # the KNOWN DECODED outcome must agree
+                if row["result_code"] != "applied":
+                    return None
+                if coverage_id != "facts-live-zero":
+                    return None  # the CLOSED coverage set
+                if store._q.q("SELECT count(*) AS n FROM facts", (),
+                              "one")["n"] != 0:
+                    return None  # the live coverage probe
+                return {"operation_id": operation_id, "method": "wipe",
+                        "result_code": row["result_code"],
+                        "revision": row["applied_at_revision"],
+                        "coverage_id": coverage_id,
+                        "owner_uid": row["uid"],
+                        "lifetime_id": row["lifetime_id"]}
+            return owned_erase_readback
 
-        BINDING = {"operation_id": "0f" * 16, "result_code": "applied",
-                   "revision": rev_erased, "coverage_id":
-                   "facts-live-zero", "verify": verify_erase}
+        CLAIM = {"operation_id": "0f" * 16,
+                 "coverage_id": "facts-live-zero"}
 
         class Stuck:
             pass  # raw cannot be discarded -> REFUSED
-
-        # REFUSED AFTER the known erase/readback: the erase step's
-        # COMPLETION stays BLOCKED - nothing recorded, the R' revision
-        # AND the delivered certainty are retained, NO re-execute
-        out = harness.scrub(comp.token, {
-            "raw_ref_handle": Stuck(), "comparison_buffer": None},
-            erase=BINDING)
-        self.assertEqual(out["kind"], "refused")
-        self.assertEqual(harness.outbox_state(comp.token), "delivered")
-        self.assertEqual(store._store_revision(1), rev_erased)
-        self.assertEqual(harness.redeliver_pending()["redelivered"], [])
-        self.assertEqual(oconn.execute(
-            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
-        self.assertEqual(store._q.q(
-            "SELECT count(*) AS n FROM facts", (), "one")["n"], 0)
 
         class OwnedHandle:
             def __init__(self):
@@ -2431,70 +2413,142 @@ class V34bHarnessVectors(unittest.TestCase):
             def live_raw(self):
                 return self._raw is not None
 
-        # CLEARED AFTER the known erase/readback, SAME step: completion
-        # recorded ONLY AFTER the live coverage passes, and the record
-        # CARRIES the exact erase-step identity; the erased outcome,
-        # revision R', and the delivered certainty are ALL untouched
-        out2 = harness.scrub(comp.token, {
-            "raw_ref_handle": OwnedHandle(),
-            "comparison_buffer": OwnedHandle()}, erase=BINDING)
-        self.assertEqual(out2["kind"], "cleared")
+        def rig_erased():
+            # known PUT commit -> delivered commit -> KNOWN WIPE erase
+            # at fresh revision R' with the live row gone
+            store, req, b, rid, provider, harness, proj, oconn = \
+                self._rig()
+            r1, _ = run(store, put_req("9e" * 16, key="w2key"))
+            assert r1.result.outcome.result_code == "applied"
+            rev_committed = store._store_revision(1)
+            comp = harness.compose({"projection": proj,
+                                    "recovery_id": rid})
+            harness.send(comp.token)
+            d = provider.deliver({"projection": proj,
+                                  "token": comp.token})
+            assert harness.ack(d["ack"]).kind == "delivered"
+            rw, _ = run(store, wipe_req("0f" * 16))
+            assert rw.result.outcome.result_code == "applied"
+            rev_erased = store._store_revision(1)
+            assert rev_erased > rev_committed
+            assert store._q.q("SELECT count(*) AS n FROM facts", (),
+                              "one")["n"] == 0
+            harness.register_erase_readback(make_owned_readback(store))
+            return (store, harness, oconn, comp, rev_erased, proj, rid,
+                    provider)
+
+        # REFUSED AFTER the known erase: completion BLOCKED (nothing
+        # recorded, R' + delivered certainty retained, NO re-execute)
+        store, harness, oconn, comp, rev_erased, proj, rid, provider = rig_erased()
+        out = harness.scrub(comp.token, {
+            "raw_ref_handle": Stuck(), "comparison_buffer": None},
+            erase=CLAIM)
+        self.assertEqual(out["kind"], "refused")
+        self.assertEqual(harness.outbox_state(comp.token), "delivered")
         self.assertEqual(store._store_revision(1), rev_erased)
+        self.assertEqual(harness.redeliver_pending()["redelivered"], [])
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
         self.assertEqual(store._q.q(
             "SELECT count(*) AS n FROM facts", (), "one")["n"], 0)
-        self.assertEqual(harness.outbox_state(comp.token), "delivered")
-        row = oconn.execute(
-            "SELECT step, operation_id, result_code, revision,"
-            " coverage_id FROM scrub_log WHERE token=?",
-            (comp.token,)).fetchone()
-        self.assertIsNotNone(row)
-        self.assertEqual(tuple(row), ("erase", "0f" * 16, "applied",
-                                      rev_erased, "facts-live-zero"))
-        # TEARDOWN: the SAME hook standalone - cleared, records NOTHING,
-        # the revision/outcome state is retained (a standalone hook
-        # cannot complete ANY step)
-        outcome = harness.scrub_hook({
+
+        # CLEARED AFTER the known erase, SAME step: completion recorded
+        # ONLY through the OWNED verified tuple - the row carries the
+        # exact committed erase identity, never caller claims
+        out2 = harness.scrub(comp.token, {
             "raw_ref_handle": OwnedHandle(),
-            "comparison_buffer": OwnedHandle()})
-        self.assertEqual(outcome["kind"], "cleared")
+            "comparison_buffer": OwnedHandle()}, erase=CLAIM)
+        self.assertEqual(out2["kind"], "cleared")
+        self.assertEqual(store._store_revision(1), rev_erased)
+        row = oconn.execute(
+            "SELECT step, step_id, operation_id, method, result_code,"
+            " revision, coverage_id, owner_uid, lifetime_id FROM"
+            " scrub_log WHERE token=?", (comp.token,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(tuple(row), (
+            "erase", "erase:%s:%d" % ("0f" * 16, rev_erased),
+            "0f" * 16, "wipe", "applied", rev_erased,
+            "facts-live-zero", 1, 1))
+        self.assertEqual(store._q.q(
+            "SELECT count(*) AS n FROM facts", (), "one")["n"], 0)
+
+        # IDEMPOTENCY/CONFLICT (C): a SECOND completion of the SAME
+        # token, or of the SAME step under a DIFFERENT delivered token,
+        # is a typed conflict refusal - NO re-execute, NOTHING changed
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.scrub(comp.token, {
+                "raw_ref_handle": OwnedHandle(),
+                "comparison_buffer": OwnedHandle()}, erase=CLAIM)
+        comp2 = harness.compose({"projection": proj,
+                                 "recovery_id": rid})
+        harness.send(comp2.token)
+        d2 = provider.deliver({"projection": proj, "token": comp2.token})
+        self.assertEqual(harness.ack(d2["ack"]).kind, "delivered")
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.scrub(comp2.token, {
+                "raw_ref_handle": OwnedHandle(),
+                "comparison_buffer": OwnedHandle()}, erase=CLAIM)
         self.assertEqual(store._store_revision(1), rev_erased)
         self.assertEqual(oconn.execute(
             "SELECT count(*) FROM scrub_log").fetchone()[0], 1)
 
-        # NEGATIVE (the peer's probe shape): a known PUT + delivered
-        # ACK with NO WIPE - a WRONG erase binding (the operation/
-        # revision/coverage do NOT match durable state) REFUSES the
-        # erase-step completion: typed HarnessRefusedError, NOTHING
-        # recorded, the live row and revision are retained
+        # STALE/CHANGED STATE (C): after a NEW put (the coverage probe
+        # now fails live), a fresh token's erase claim REFUSES - the
+        # verified tuple is re-read at completion, never cached
+        r2, _ = run(store, put_req("7d" * 16, key="w2key2"))
+        self.assertEqual(r2.result.outcome.result_code, "applied")
+        comp3 = harness.compose({"projection": proj,
+                                 "recovery_id": rid})
+        harness.send(comp3.token)
+        d3 = provider.deliver({"projection": proj, "token": comp3.token})
+        self.assertEqual(harness.ack(d3["ack"]).kind, "delivered")
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.scrub(comp3.token, {
+                "raw_ref_handle": OwnedHandle(),
+                "comparison_buffer": OwnedHandle()}, erase=CLAIM)
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log WHERE step='erase'")
+            .fetchone()[0], 1)
+
+        # TEARDOWN: the standalone hook clears and records NOTHING
+        outcome = harness.scrub_hook({
+            "raw_ref_handle": OwnedHandle(),
+            "comparison_buffer": OwnedHandle()})
+        self.assertEqual(outcome["kind"], "cleared")
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 1)
+
+        # NEGATIVE A (the peer's probe shape): PUT + delivered ACK, NO
+        # WIPE - the OWNED verifier finds NO committed erase -> typed
+        # refusal, NOTHING recorded, the live row persists. An extra
+        # caller "verify" key is REJECTED as a malformed claim
+        # (arbitrary per-call callbacks are never accepted)
         store, req, b, rid, provider, harness, proj, oconn = self._rig()
         r1, _ = run(store, put_req("9e" * 16, key="w2key"))
         self.assertEqual(r1.result.outcome.result_code, "applied")
-        rev_put = store._store_revision(1)
         comp = harness.compose({"projection": proj, "recovery_id": rid})
         harness.send(comp.token)
         d = provider.deliver({"projection": proj, "token": comp.token})
         self.assertEqual(harness.ack(d["ack"]).kind, "delivered")
-        self.assertEqual(store._q.q(
-            "SELECT count(*) AS n FROM facts", (), "one")["n"], 1)
-        # the SAME verifier, re-read against THIS rig's store: no
-        # "0f"*16 outcome row exists and a live fact persists -> the
-        # probe fails (strict False) -> the completion is REFUSED
-        WRONG = {"operation_id": "0f" * 16, "result_code": "applied",
-                 "revision": rev_put, "coverage_id": "facts-live-zero",
-                 "verify": verify_erase}
+        harness.register_erase_readback(make_owned_readback(store))
         with self.assertRaises(f.HarnessRefusedError):
             harness.scrub(comp.token, {
                 "raw_ref_handle": OwnedHandle(),
-                "comparison_buffer": OwnedHandle()}, erase=WRONG)
+                "comparison_buffer": OwnedHandle()}, erase=CLAIM)
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.scrub(comp.token, {
+                "raw_ref_handle": OwnedHandle(),
+                "comparison_buffer": OwnedHandle()},
+                erase={"operation_id": "0f" * 16,
+                       "coverage_id": "facts-live-zero",
+                       "verify": lambda e: True})
         self.assertEqual(oconn.execute(
             "SELECT count(*) FROM scrub_log WHERE step='erase'")
             .fetchone()[0], 0)
         self.assertEqual(store._q.q(
             "SELECT count(*) AS n FROM facts", (), "one")["n"], 1)
-        self.assertEqual(store._store_revision(1), rev_put)
-        # ... and the SAME no-wipe probe with NO binding records ONLY a
-        # GENERIC volatile-hook completion - NEVER an erase-step
-        # completion - while the live row persists
+        # ... and the SAME no-wipe probe with NO claim records ONLY a
+        # GENERIC completion - NEVER an erase-step completion
         out3 = harness.scrub(comp.token, {
             "raw_ref_handle": OwnedHandle(),
             "comparison_buffer": OwnedHandle()})
@@ -2502,11 +2556,58 @@ class V34bHarnessVectors(unittest.TestCase):
         self.assertEqual(oconn.execute(
             "SELECT step FROM scrub_log WHERE token=?",
             (comp.token,)).fetchone()[0], "generic")
-        self.assertEqual(oconn.execute(
-            "SELECT count(*) FROM scrub_log WHERE step='erase'")
-            .fetchone()[0], 0)
         self.assertEqual(store._q.q(
             "SELECT count(*) AS n FROM facts", (), "one")["n"], 1)
+
+        # NEGATIVE B: with a REAL wipe present, claiming the EARLIER
+        # PUT op (method='put') or an UNKNOWN coverage id -> NO
+        # verified step -> typed refusal; the record never mislabels a
+        # PUT as the erase
+        store, harness, oconn, comp, rev_erased, proj, rid, provider = rig_erased()
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.scrub(comp.token, {
+                "raw_ref_handle": OwnedHandle(),
+                "comparison_buffer": OwnedHandle()},
+                erase={"operation_id": "9e" * 16,
+                       "coverage_id": "facts-live-zero"})
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.scrub(comp.token, {
+                "raw_ref_handle": OwnedHandle(),
+                "comparison_buffer": OwnedHandle()},
+                erase={"operation_id": "0f" * 16,
+                       "coverage_id": "everything"})
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
+        self.assertEqual(store._store_revision(1), rev_erased)
+
+        # NEGATIVE D (typed-refusal matrix): malformed op id, None op,
+        # empty coverage, missing key, extra key, and an UNREGISTERED
+        # harness all refuse TYPED (HarnessRefusedError - NEVER
+        # ModelInputError or a raw exception) with NOTHING recorded
+        store, harness, oconn, comp, rev_erased, proj, rid, provider = rig_erased()
+        for bad in ({"operation_id": "zz",
+                     "coverage_id": "facts-live-zero"},
+                    {"operation_id": None,
+                     "coverage_id": "facts-live-zero"},
+                    {"operation_id": "0f" * 16, "coverage_id": ""},
+                    {"operation_id": "0f" * 16},
+                    {"operation_id": "0f" * 16,
+                     "coverage_id": "facts-live-zero", "x": 1}):
+            with self.assertRaises(f.HarnessRefusedError):
+                harness.scrub(comp.token, {
+                    "raw_ref_handle": OwnedHandle(),
+                    "comparison_buffer": OwnedHandle()}, erase=bad)
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
+        store, req, b, rid, provider, harness, proj, oconn = self._rig()
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        harness.send(comp.token)
+        d = provider.deliver({"projection": proj, "token": comp.token})
+        self.assertEqual(harness.ack(d["ack"]).kind, "delivered")
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.scrub(comp.token, {  # NO registered readback
+                "raw_ref_handle": OwnedHandle(),
+                "comparison_buffer": OwnedHandle()}, erase=CLAIM)
 
     def test_unrelated_same_owner_target_refused(self):
         # the R1 repro (v80 795-812, 3948-3951 UNRELATED SAME-OWNER
