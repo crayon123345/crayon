@@ -213,8 +213,14 @@ def _numeric_match(claim_tokens, sent_token_set, sent_tokens):
         if factor:
             if v * factor not in sent_timed:
                 return False
-        elif v not in sent_values and t not in sent_token_set:
-            return False
+        elif any(c.isdigit() for c in t):
+            # Digit tokens keep gate strictness (normalized value or exact).
+            if v not in sent_values and t not in sent_token_set:
+                return False
+        # Unitless number WORDS keep the gate's vacuous behavior: the
+        # exact-token check never saw them, and counting semantics
+        # ("three times a week" == "monday wednesday and friday") are the
+        # model's call, not the gate's.
     return True
 
 
