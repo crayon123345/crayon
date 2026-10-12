@@ -153,7 +153,15 @@ Covered by the suite (116 tests):
   impossible 'refused', an 'unknown'/scrubbed kind-flag mismatch, a
   dropped/mismatched wipe report (owner/lifetime/operation), and any
   unknown class beyond the DECLARED provider_side one all REFUSE;
-  json.loads agreement alone is NOT proof), the decoded outcome
+  json.loads agreement alone is NOT proof), PLUS the EXACT REPORT
+  JOIN (thirteenth fold): report.commit_revision ==
+  outcome.applied_at_revision, report.new_epoch == outcome.new_epoch
+  == the owner's DURABLE current epoch, and the NESTED first page
+  binding the SAME report_id/owner/lifetime/operation/commit with
+  every inventory entry carrying the SAME owner - a positive-but-
+  contradictory report REFUSES; the negatives isolate ONE field per
+  probe with a consistent-row control, so each refusal is
+  attributable to the intended field), the decoded outcome
   agreeing on method + applied_at_revision, the owner's CURRENT lifetime, the
   FRESH-CURRENT policy (applied_at_revision == the CURRENT store
   revision - the claimed erase must be the LATEST committed op for

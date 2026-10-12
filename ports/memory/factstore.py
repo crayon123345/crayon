@@ -4781,7 +4781,17 @@ class FactStore:
             operation and its unknown_coverage may carry ONLY the
             DECLARED provider_side class (the local coverage is
             CLOSED; provider-side derivation is the model's declared
-            unknown - any OTHER unknown class REFUSES). A missing/contradictory/incoherent stored
+            unknown - any OTHER unknown class REFUSES). EXACT REPORT
+            JOIN (thirteenth fold): typed positivity is NOT coherence
+            - report.commit_revision must EQUAL
+            outcome.applied_at_revision, report.new_epoch must EQUAL
+            outcome.new_epoch, and the decoded new_epoch must EQUAL
+            the owner's DURABLE current epoch (fixture_snapshot); the
+            NESTED first page must bind the SAME report_id, owner/
+            lifetime, operation_id and commit_revision as the report/
+            outcome, and every first-page inventory entry must carry
+            the SAME owner. A positive-but-contradictory report
+            (commit/epoch drift, mismatched nested page) REFUSES. A missing/contradictory/incoherent stored
             outcome, an 'unknown' kind flag, a kind/scrubbed
             disagreement, or a report-shape violation REFUSES -
             json.loads agreement alone is NOT proof;
@@ -4852,7 +4862,20 @@ class FactStore:
                     or decoded.report.owner.uid != uid \
                     or decoded.report.owner.lifetime_id != lid \
                     or any(c is not UnknownCoverage.PROVIDER_SIDE
-                           for c in decoded.report.unknown_coverage):
+                           for c in decoded.report.unknown_coverage)                     or decoded.report.commit_revision \
+                            != decoded.applied_at_revision \
+                    or decoded.report.new_epoch != decoded.new_epoch \
+                    or decoded.new_epoch != self._current_epoch(uid) \
+                    or decoded.report.first_page.owner \
+                            != decoded.report.owner \
+                    or decoded.report.first_page.operation_id \
+                            != operation_id \
+                    or decoded.report.first_page.commit_revision \
+                            != decoded.applied_at_revision \
+                    or decoded.report.first_page.report_id \
+                            != decoded.report.report_id \
+                    or any(e.owner != decoded.report.owner
+                           for e in decoded.report.first_page.ids):
                 conn.execute("ROLLBACK")
                 return None
             cur = self._q.q(

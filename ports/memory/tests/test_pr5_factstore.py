@@ -2620,15 +2620,23 @@ class V34bHarnessVectors(unittest.TestCase):
         with self.assertRaises(f.HarnessRefusedError):
             harness.register_erase_readback(f.OwnedEraseReadback(store))
 
-        # (B) DURABLE DECODE NEGATIVES (twelfth fold): erase_proof
-        # decodes through the ACTUAL _decode_stored_outcome rule - a
-        # MISSING result, a union-impossible result ('refused' on a
-        # wipe), an 'unknown' kind flag, a kind/scrubbed flag
-        # disagreement, a DROPPED report, and a report carrying ANY
-        # unknown class beyond the DECLARED provider_side one all
-        # refuse even on a genuine-shaped tampered row; json.loads
-        # agreement alone is NOT proof. A fabricated row with NEGATIVE
-        # owner/lifetime ids refuses at the exact-subject policy.
+        # (B) DURABLE DECODE + EXACT REPORT JOIN NEGATIVES (twelfth/
+        # thirteenth folds): erase_proof decodes through the ACTUAL
+        # _decode_stored_outcome rule - a MISSING result, a union-
+        # impossible result ('refused' on a wipe), an 'unknown' kind
+        # flag, a kind/scrubbed flag disagreement, a DROPPED report,
+        # and a report carrying ANY unknown class beyond the DECLARED
+        # provider_side one all refuse even on a genuine-shaped
+        # tampered row; json.loads agreement alone is NOT proof. The
+        # EXACT REPORT JOIN (thirteenth fold) additionally refuses a
+        # positive-but-contradictory report: commit_revision/new_epoch
+        # drift vs the outcome, a CONSISTENT outcome+report epoch pair
+        # contradicting the DURABLE owner epoch, and a nested first
+        # page with a mismatched op/owner/commit/report_id/inventory
+        # owner. Every forged row keeps the report op binding
+        # CONSISTENT with its row id so each refusal is attributable
+        # to the INTENDED field. A fabricated row with NEGATIVE owner/
+        # lifetime ids refuses at the exact-subject policy.
         store, req, b, rid, provider, harness, proj, oconn = self._rig()
         json = __import__("json")
         r1, _ = run(store, put_req("9e" * 16, key="w2key"))
@@ -2643,6 +2651,13 @@ class V34bHarnessVectors(unittest.TestCase):
 
         def insert_forged(op, mut, kind="full", scrubbed=0):
             obj = json.loads(good_json)
+            # FIELD ISOLATION (thirteenth fold): keep the nested
+            # report/first-page op binding CONSISTENT with the forged
+            # row id BEFORE mutating, so each refusal is attributable
+            # to the INTENDED field - never an incidental report-op
+            # mismatch
+            obj["report"]["operation_id"] = op
+            obj["report"]["first_page"]["operation_id"] = op
             mut(obj)
             store._q.q(
                 "INSERT INTO operation_records(uid, lifetime_id,"
@@ -2664,6 +2679,42 @@ class V34bHarnessVectors(unittest.TestCase):
             "c3" * 16,
             lambda o: o["report"]["unknown_coverage"].append(
                 "unaudited_external_copy"))
+        # EXACT REPORT JOIN negatives (thirteenth fold) - each
+        # isolates ONE field on an otherwise genuine-shaped row:
+        # report commit_revision / report new_epoch / a CONSISTENT
+        # outcome+report epoch pair contradicting the DURABLE owner
+        # epoch / nested first-page op, owner, commit, report_id, and
+        # an inventory-entry owner
+        insert_forged("g9" * 16,
+                      lambda o: o["report"].__setitem__(
+                          "commit_revision", 999))
+        insert_forged("h7" * 16,
+                      lambda o: o["report"].__setitem__("new_epoch",
+                                                        999))
+
+        def epoch_pair(o):
+            o["new_epoch"] = 999
+            o["report"]["new_epoch"] = 999
+        insert_forged("j3" * 16, epoch_pair)
+        insert_forged("k9" * 16,
+                      lambda o: o["report"]["first_page"].__setitem__(
+                          "operation_id", "d4" * 16))
+        insert_forged("m7" * 16,
+                      lambda o: o["report"]["first_page"].__setitem__(
+                          "owner", {"uid": 1, "lifetime_id": 2}))
+        insert_forged("n3" * 16,
+                      lambda o: o["report"]["first_page"].__setitem__(
+                          "commit_revision", 999))
+        insert_forged("p9" * 16,
+                      lambda o: o["report"]["first_page"].__setitem__(
+                          "report_id", "report:wipe:" + "e3" * 16))
+        insert_forged("q7" * 16,
+                      lambda o: o["report"]["first_page"]["ids"]
+                      [0].__setitem__("owner",
+                                      {"uid": 1, "lifetime_id": 2}))
+        f5_obj = json.loads(good_json)
+        f5_obj["report"]["operation_id"] = "f5" * 16
+        f5_obj["report"]["first_page"]["operation_id"] = "f5" * 16
         store._q.q(
             "INSERT INTO operation_records(uid, lifetime_id,"
             " operation_id, binding_hash, marker, method, result_code,"
@@ -2671,9 +2722,11 @@ class V34bHarnessVectors(unittest.TestCase):
             " applied_at_revision, epoch, store_revision, fence,"
             " scrubbed, scrub_revision) VALUES(-99,-99,%s,'x',NULL,"
             " 'wipe','applied',%s,'full',NULL,%s,1,%s,1,0,1)",
-            ("f5" * 16, good_json, rev_w, rev_w), "exec")
+            ("f5" * 16, json.dumps(f5_obj), rev_w, rev_w), "exec")
         for op in ("ab" * 16, "cd" * 16, "e7" * 16, "a9" * 16,
-                   "b1" * 16, "c3" * 16, "f5" * 16):
+                   "b1" * 16, "c3" * 16, "f5" * 16, "g9" * 16,
+                   "h7" * 16, "j3" * 16, "k9" * 16, "m7" * 16,
+                   "n3" * 16, "p9" * 16, "q7" * 16):
             self.assertIsNone(store.erase_proof(op, "facts-live-zero"),
                               op)
         # a malformed operation id / unknown coverage refuse on entry
@@ -2694,6 +2747,25 @@ class V34bHarnessVectors(unittest.TestCase):
         store._q.q(
             "UPDATE operation_records SET outcome_json=%s WHERE"
             " operation_id=%s", (json.dumps(tampered), "0f" * 16),
+            "exec")
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.scrub(comp.token, {
+                "raw_ref_handle": _Ok(), "comparison_buffer": _Ok()},
+                erase={"operation_id": "0f" * 16,
+                       "coverage_id": "facts-live-zero"})
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
+        store._q.q(
+            "UPDATE operation_records SET outcome_json=%s WHERE"
+            " operation_id=%s", (good_json, "0f" * 16), "exec")
+        # SECOND CYCLE (thirteenth fold): a positive-but-contradictory
+        # report (commit_revision drift, decode still coherent) also
+        # REFUSES with NOTHING recorded
+        drifted = json.loads(good_json)
+        drifted["report"]["commit_revision"] = 999
+        store._q.q(
+            "UPDATE operation_records SET outcome_json=%s WHERE"
+            " operation_id=%s", (json.dumps(drifted), "0f" * 16),
             "exec")
         with self.assertRaises(f.HarnessRefusedError):
             harness.scrub(comp.token, {
