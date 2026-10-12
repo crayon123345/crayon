@@ -181,3 +181,37 @@ class NumericMatchTests(unittest.TestCase):
         s = make_retry(lambda a, b: dict(HIGH))
         self.assertFalse(s("the flight leaves at 7 pm",
                            "the flight leaves at 9 pm from the north terminal."))
+
+
+class CountVetoTests(unittest.TestCase):
+    def test_frequency_count_mismatch_refused(self):
+        # ut02 class: "once daily" vs "two pills every morning".
+        s = make_retry(lambda a, b: dict(HIGH))
+        self.assertFalse(s("the pills are taken once daily",
+                           "take two pills every morning."))
+
+    def test_matching_count_verified(self):
+        s = make_retry(lambda a, b: dict(HIGH))
+        self.assertTrue(s("the recipe uses two cups of flour",
+                          "the recipe needs 2 cups of flour and a pinch of salt."))
+
+    def test_aggregation_falls_through_to_model(self):
+        # "one tablet in the morning and one at night" has no single
+        # count before a shared noun - the model decides (and here says
+        # yes): the veto must NOT fire on aggregation.
+        def nli(premise, hypothesis):
+            return dict(HIGH) if "morning" in premise and "night" in premise else dict(LOW)
+        s = make_retry(nli)
+        self.assertTrue(s("the medicine is taken twice a day",
+                          "take one tablet in the morning. take one more at night."))
+
+    def test_time_expressions_not_counts(self):
+        s = make_retry(lambda a, b: dict(HIGH))
+        self.assertTrue(s("the concert starts at 7 pm",
+                          "doors open at 6 and the concert begins at 7 pm sharp."))
+
+    def test_different_noun_no_veto(self):
+        # premise counts something the claim never mentions: no veto.
+        s = make_retry(lambda a, b: dict(HIGH))
+        self.assertTrue(s("the museum is free for children",
+                          "the museum, which has 4 floors, is free for children."))
