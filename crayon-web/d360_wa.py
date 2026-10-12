@@ -1,7 +1,8 @@
 """360dialog WhatsApp sandbox front-end for Crayon: same brain as the web app, no code execution.
 Dormant unless D360_API_KEY is set (key comes from sending START to +551146733492 on WhatsApp).
-Optional D360_HOOK_SECRET: when set, the webhook URL must be registered with ?s=<secret> and
-requests without it are ignored - stops strangers from driving the bot through the public URL."""
+D360_HOOK_SECRET is REQUIRED when the lane is enabled (fail closed: no secret -> 503, no
+handler): the webhook URL must be registered with ?s=<secret> and requests without it are
+rejected - stops strangers from driving the bot through the public URL."""
 import asyncio, hmac, os, re, time
 from collections import OrderedDict
 import httpx
@@ -150,8 +151,17 @@ async def d360_test_send(req: Request):
 async def webhook(req: Request):
     if not enabled():
         return JSONResponse({"ok": False}, status_code=404)
+    # Fail CLOSED: an enabled lane with no D360_HOOK_SECRET accepts nothing.
+    # An unauthenticated webhook would let anyone drive the bot through the
+    # public URL. Constant-time compare; the secret travels as ?s= on the
+    # registered webhook URL (vendor registration mechanism).
     secret = os.environ.get("D360_HOOK_SECRET", "").strip()
-    if secret and req.query_params.get("s", "") != secret:
+    if not secret:
+        return JSONResponse({"ok": False, "error": "D360_HOOK_SECRET not set"}, status_code=503)
+    # compare_digest on str raises TypeError for non-ASCII; encode both
+    # operands to UTF-8 bytes so a unicode secret or probe can never 500 -
+    # a wrong secret must fail closed, not crash.
+    if not hmac.compare_digest(req.query_params.get("s", "").encode("utf-8"), secret.encode("utf-8")):
         return JSONResponse({"ok": False}, status_code=403)
     try:
         body = await req.json()
