@@ -1,17 +1,24 @@
 """Deterministic public lookup for explicit search and changing-data requests.
 
-Step A (flight-escalation contract, review-#1 fold): lookup() returns a
-structured LookupResult. The flight request is NORMALIZED BEFORE any
-network attempt and is preserved on EVERY exit (including search/research
-failures). ALL flight requests pass the task validator; an incomplete or
-unsupported request is a clarification/not-verified result, NEVER a
-generic verified one. Escalation eligibility is reserved for COMPLETE,
-SUPPORTED flight asks whose quick path failed with content/search/source
-failure (denial/unreadable) - never for missing fields, invalid dates,
-conflicts, or unsupported expressions. The static evidence guard is
-STEP-A STATIC-ONLY: fetched page text can never prove dated available
-inventory; the positive validated-inventory contract is reserved for the
-interactive browser adapter (steps B/C).
+Step A (flight-escalation contract, review-#2 fold): lookup() returns a
+structured LookupResult. The flight request is normalized and RESOLVED
+BEFORE any network attempt: an incomplete or unsupported request is a
+clarification result with NO search/research call, NEVER a generic
+verified one and never a search-failure report. A COMPLETE, SUPPORTED
+flight ask is preserved on EVERY exit (search/research/content failure)
+with its route/date/binding and failure code; escalation eligibility is
+reserved for exactly those complete+supported asks failing with
+content/search/source denial - never for missing fields, unparsed or
+unsupported constraints, invalid dates, or conflicts. Supplied
+constraints that cannot be honored (spelled-out passenger counts,
+children/infants, negated-only cabins, unparseable returns) are marked
+unsupported and clarified, NEVER silently defaulted to 1 adult / economy
+/ one-way. The static evidence guard is STEP-A STATIC-ONLY: fetched page
+text can never prove dated available inventory; the positive
+validated-inventory contract is reserved for the interactive browser
+adapter (steps B/C). News wrapper behavior is preserved but failure
+prose is never upgraded to verified; mixed news+flight asks are
+flight-gated.
 """
 import re
 from dataclasses import dataclass, field
@@ -32,60 +39,111 @@ FAILURE_UNSUPPORTED = "request_unsupported"
 _FAILURE_CODES = frozenset({
     "", FAILURE_SEARCH, FAILURE_SOURCES, FAILURE_CONTENT,
     FAILURE_INCOMPLETE, FAILURE_UNSUPPORTED})
+# eligibility is ONLY ever meaningful for denial/unreadable failures of a
+# complete, supported request
+_ELIGIBLE_FAILURES = frozenset(
+    {FAILURE_CONTENT, FAILURE_SEARCH, FAILURE_SOURCES})
+
+
+def _deep_freeze(value):
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(v) for v in value)
+    if isinstance(value, dict):
+        return MappingProxyType({k: _deep_freeze(v) for k, v in value.items()})
+    return value
 
 
 @dataclass(frozen=True)
 class LookupResult:
     """Structured result of one quick public lookup attempt (attempt 1).
 
-    Invariants (enforced): status/failure_code are closed enums; a
-    verified result carries no failure code; escalation eligibility
-    requires a non-verified status with a failure code; normalized is an
-    immutable mapping; attempted_sources/evidence are tuples.
+    Invariants (enforced in __post_init__):
+    - status and failure_code are closed enums; escalation_eligible is bool
+    - a verified result carries no failure code and is never eligible
+    - eligibility requires a non-verified status AND a failure code in
+      _ELIGIBLE_FAILURES (content/search/sources denial)
+    - normalized is DEEP immutable (lists -> tuples, dicts -> read-only
+      proxies, recursively)
+    - a flight-kind normalized request: non-verified results carry a
+      failure code; an eligible result has NO missing/unsupported fields
+      (eligibility implies complete+supported by construction)
     """
     status: str
     text: str
     checked_at: str
     failure_code: str = ""
     normalized: dict = field(default_factory=dict)
-    attempted_sources: tuple = ()
-    evidence: tuple = ()
+    search_leads: tuple = ()   # raw result URLs: LEADS, not attempt receipts
+    evidence: tuple = ()       # fetched/used page URLs only
     escalation_eligible: bool = False
 
     def __post_init__(self):
         if self.status not in (STATUS_VERIFIED, STATUS_INSUFFICIENT,
                                STATUS_UNAVAILABLE):
             raise ValueError("bad status")
+        if not isinstance(self.escalation_eligible, bool):
+            raise ValueError("escalation_eligible must be bool")
         if self.failure_code not in _FAILURE_CODES:
             raise ValueError("bad failure_code")
-        if self.status == STATUS_VERIFIED and self.failure_code:
-            raise ValueError("verified carries no failure code")
+        if self.status == STATUS_VERIFIED and (
+                self.failure_code or self.escalation_eligible):
+            raise ValueError("verified carries no failure/eligibility")
         if self.escalation_eligible and (
-                self.status == STATUS_VERIFIED or not self.failure_code):
-            raise ValueError("eligibility requires a non-verified failure")
-        object.__setattr__(self, "normalized",
-                           MappingProxyType(dict(self.normalized)))
-        object.__setattr__(self, "attempted_sources",
-                           tuple(self.attempted_sources))
+                self.status == STATUS_VERIFIED
+                or self.failure_code not in _ELIGIBLE_FAILURES):
+            raise ValueError("eligibility requires a denial/unreadable failure")
+        frozen = _deep_freeze(dict(self.normalized))
+        object.__setattr__(self, "normalized", frozen)
+        object.__setattr__(self, "search_leads", tuple(self.search_leads))
         object.__setattr__(self, "evidence", tuple(self.evidence))
+        if frozen.get("kind") == "flight":
+            if self.status != STATUS_VERIFIED and not self.failure_code:
+                raise ValueError("non-verified flight result needs a failure code")
+            if self.escalation_eligible and (
+                    frozen.get("missing") or frozen.get("unsupported")):
+                raise ValueError("eligibility requires a complete, supported request")
 
 
 # --- flight request normalization --------------------------------------
 
 _FLIGHT_WORD = re.compile(r'(?i)\b(?:flights?|airfares?|fares?)\b')
+# A route is two city names; the destination capture STOPS at any supplied
+# constraint word (lookahead - never consumed), so constraints never
+# contaminate the city.
+_ROUTE_END = (
+    r'(?=\s+(?:on\b|for\b|tomorrow\b|today\b|tonight\b|day\s+after\b|'
+    r'next\b|last\b|this\b|return(?:ing)?\b|round[- ]?trip\b|one[- ]?way\b|'
+    r'non[- ]?stop\b|direct\b|economy\b|business\b|first\b|premium\b|'
+    r'class\b|in\b|not\b|no\b|and\b|one\b|two\b|three\b|four\b|five\b|'
+    r'six\b|seven\b|eight\b|nine\b|\d)'
+    r'|\s*$|\s*[,\.;:!?])')
 _ROUTE_RE = re.compile(
-    r'(?i)\bfrom\s+([a-zA-Z][a-zA-Z .]+?)\s+to\s+([a-zA-Z][a-zA-Z .]+?)'
-    r'(?:\s+on\b|\s+for\b|\s+tomorrow\b|\s+today\b|\s+next\b|\s+last\b|[.,!?]|$)')
+    r'(?i)\bfrom\s+([a-zA-Z][a-zA-Z .]{1,38}?)\s+(?:to|into)\s+'
+    r'([a-zA-Z][a-zA-Z .]{1,38}?)' + _ROUTE_END)
 _BARE_ROUTE_RE = re.compile(
-    r'(?i)\b([a-zA-Z][a-zA-Z .]+?)\s+to\s+([a-zA-Z][a-zA-Z .]+?)'
-    r'(?:\s+on\b|\s+for\b|\s+tomorrow\b|\s+today\b|\s+next\b|\s+last\b|[.,!?]|$)')
+    r'(?i)\b([a-zA-Z][a-zA-Z .]{1,38}?)\s+(?:to|into)\s+'
+    r'([a-zA-Z][a-zA-Z .]{1,38}?)' + _ROUTE_END)
 _ISO_DATE_RE = re.compile(r'\b(20\d\d)-(\d{1,2})-(\d{1,2})\b')
+_REL_RE = re.compile(r'(?i)\b(tomorrow|today|tonight)\b')
 _NEXT_REL_RE = re.compile(
     r'(?i)\bnext\s+(?:week|month|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|'
     r'thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b')
+_NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+              "six": 6, "seven": 7, "eight": 8, "nine": 9}
 _PAX_RE = re.compile(
-    r'(?i)\b(\d+)\s*(?:adults?|passengers?|people|travell?ers)\b')
-_CABIN_RE = re.compile(r'(?i)\b(business|first|premium economy|economy)\b')
+    r'(?i)\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine)\s+'
+    r'(?:adults?|passengers?|people|travell?ers?|tickets?|seats?)\b')
+_PAX_WORD_RE = re.compile(
+    r'(?i)\b(?:adults?|passengers?|travell?ers?)\b')
+_KID_RE = re.compile(r'(?i)\b(?:children|child|kids?|infants?)\b')
+_CABIN_RE = re.compile(r'(?i)\b(premium economy|business|first|economy)\b')
+_NONSTOP_RE = re.compile(r'(?i)\b(?:non[- ]?stop|direct)\b')
+_RETURN_ISO_RE = re.compile(
+    r'(?i)\breturn(?:ing)?\s+(?:on\s+)?(20\d\d-\d{1,2}-\d{1,2})\b')
+_RETURN_NEXT_RE = re.compile(
+    r'(?i)\breturn(?:ing)?\s+(?:on\s+)?next\s+\w+\b')
+_RETURN_REL_RE = re.compile(
+    r'(?i)\breturn(?:ing)?\s+(?:on\s+)?(tomorrow|today)\b')
 
 # resolved IATA codes are a NORMALIZATION aid only, never evidence
 _IATA = {
@@ -100,8 +158,8 @@ _IATA = {
 
 _STOP_ORIGIN = re.compile(
     r'(?i)^(?:cheapest|cheap|find|book|search|show|get|flight|flights|fare|'
-    r'fares|airfare|airfares|a|an|the|one[- ]way|round[- ]trip|return|'
-    r'tomorrow|today|on)\s+')
+    r'fares|airfare|airfares|latest|news|tickets?|please|me|a|an|the|'
+    r'one[- ]way|round[- ]trip|return|tomorrow|today|on)\s+')
 
 
 def _city(raw):
@@ -114,43 +172,91 @@ def _city(raw):
     return name or None
 
 
+def _negated(text, start):
+    """True when the match at `start` is immediately preceded by not/no
+    (any whitespace run, including newlines)."""
+    return bool(re.search(r'(?i)\b(?:not|no)\s+$', text[:start]))
+
+
+def _unnegated(pattern, text):
+    for m in pattern.finditer(text):
+        if not _negated(text, m.start()):
+            return m
+    return None
+
+
 def _parse_date(text, now_local):
     """Return (iso_date_or_None, state, note). state: resolved | absent |
-    needs_clock | invalid | unsupported | conflict. An EXPLICIT ISO date
-    is validated against the real calendar INDEPENDENT of the clock and
-    beats relative words (including negated ones); a relative word in
-    direct conflict with the explicit date is a conflict."""
-    iso = _ISO_DATE_RE.search(text)
-    rel_tomorrow = bool(re.search(r'(?i)(?<!not )\btomorrow\b', text))
-    rel_today = bool(re.search(r'(?i)(?<!not )\btoday\b', text))
-    if iso:
+    needs_clock | invalid | unsupported | conflict. An EXPLICIT,
+    non-negated ISO date is validated against the real calendar
+    INDEPENDENT of the clock and beats relative words (including negated
+    ones); a non-negated relative word alongside the explicit date is a
+    CONFLICT (clarify, never silently pick one)."""
+    explicit = None
+    for m in _ISO_DATE_RE.finditer(text):
+        if _negated(text, m.start()):
+            continue
         try:
-            d = _date(int(iso.group(1)), int(iso.group(2)),
-                      int(iso.group(3)))
+            explicit = _date(int(m.group(1)), int(m.group(2)),
+                             int(m.group(3)))
         except ValueError:
-            return None, "invalid", iso.group(0)
-        if rel_tomorrow or rel_today:
-            return d.isoformat(), "conflict", "explicit-vs-relative"
-        return d.isoformat(), "resolved", ""
+            return None, "invalid", m.group(0)
+        break
+    rel = _unnegated(_REL_RE, text)
+    if explicit is not None:
+        if rel:
+            return explicit.isoformat(), "conflict", "explicit-vs-relative"
+        return explicit.isoformat(), "resolved", ""
     if _NEXT_REL_RE.search(text):
         return None, "unsupported", "next-relative"
-    if rel_tomorrow or rel_today:
+    if rel:
         if now_local is None:
             return None, "needs_clock", "relative-without-clock"
         base = now_local.date()
-        return ((base + timedelta(days=1)).isoformat() if rel_tomorrow
+        return ((base + timedelta(days=1)).isoformat()
+                if rel.group(1).lower() == "tomorrow"
                 else base.isoformat()), "resolved", ""
     return None, "absent", ""
+
+
+def _parse_return_date(text, now_local, unsupported):
+    """Return (return_date_or_None, returning). An explicit return date is
+    calendar-validated; 'returning next Friday' is unsupported; 'returning
+    tomorrow' resolves from the caller clock; a bare round-trip/return ask
+    with no date leaves return_date MISSING (clarified, never dropped)."""
+    m = _RETURN_ISO_RE.search(text)
+    if m and not _negated(text, m.start()):
+        try:
+            return _date(*map(int, m.group(1).split('-'))).isoformat(), True
+        except ValueError:
+            unsupported.append("date:return-invalid(" + m.group(1) + ")")
+            return None, True
+    if _RETURN_NEXT_RE.search(text):
+        unsupported.append("date:return-unsupported(next-relative)")
+        return None, True
+    rm = _RETURN_REL_RE.search(text)
+    if rm and not _negated(text, rm.start()):
+        if now_local is None:
+            return None, True  # missing (needs clock)
+        base = now_local.date()
+        return ((base + timedelta(days=1)).isoformat()
+                if rm.group(1).lower() == "tomorrow"
+                else base.isoformat()), True
+    return None, bool(re.search(r'(?i)\breturn(?:ing)?\b', text))
 
 
 def flight_request(text, now_local=None):
     """Parse a flight fare ask into a normalized request dict, or None.
 
     now_local: the caller-resolved USER-LOCAL datetime; needed ONLY for
-    relative dates. Explicit ISO dates resolve without it. Passengers and
-    cabin parse from the text; roundtrip/return needs a return date
-    (missing); multi-city and next-relative dates are UNSUPPORTED - never
-    silently coerced to 1 adult / economy / one-way.
+    relative dates. Explicit ISO dates resolve without it. EVERY supplied
+    constraint is either honored in the normalized dict or marked
+    missing/unsupported - NEVER silently defaulted: spelled-out passenger
+    counts parse, children/infants and out-of-range counts are
+    unsupported, negated cabins/nonstop do not set the positive flag, a
+    negated-only cabin is unsupported, and round-trip asks carry a parsed
+    or MISSING return date. Multi-city and next-relative dates are
+    UNSUPPORTED.
     """
     if not _FLIGHT_WORD.search(text):
         return None
@@ -158,21 +264,45 @@ def flight_request(text, now_local=None):
     origin = _city(m.group(1)) if m else None
     destination = _city(m.group(2)) if m else None
     date, date_state, date_note = _parse_date(text, now_local)
-    pax = _PAX_RE.search(text)
-    cabin = _CABIN_RE.search(text)
-    roundtrip = bool(re.search(r'(?i)\b(?:round[- ]trip|return)\b', text))
-    nonstop = bool(re.search(r'(?i)\b(?:non[- ]?stop|direct)\b', text))
     unsupported = []
     if date_state in ("invalid", "unsupported", "conflict"):
         unsupported.append("date:" + date_state +
                            ("(" + date_note + ")" if date_note else ""))
+    return_date, returning = _parse_return_date(text, now_local,
+                                                unsupported)
+    roundtrip = bool(re.search(r'(?i)\bround[- ]?trip\b', text)) or returning
+    if return_date and date and return_date < date:
+        unsupported.append("date:return-order(before-departure)")
+    pax_m = _PAX_RE.search(text)
+    passengers = 1
+    if pax_m:
+        raw = pax_m.group(1).lower()
+        n = int(raw) if raw.isdigit() else _NUM_WORDS.get(raw, 0)
+        if n < 1 or n > 9:
+            unsupported.append("passengers:invalid(" + pax_m.group(1) + ")")
+        else:
+            passengers = n
+    elif _PAX_WORD_RE.search(text):
+        unsupported.append("passengers:unparsed")
+    if _KID_RE.search(text):
+        unsupported.append("passengers:children-infants")
+    cabin_m = _unnegated(_CABIN_RE, text)
+    if cabin_m:
+        cabin = cabin_m.group(1).lower()
+    elif _CABIN_RE.search(text):
+        cabin = None
+        unsupported.append("cabin:only-negated")
+    else:
+        cabin = "economy"
+    nonstop = bool(_unnegated(_NONSTOP_RE, text))
     if re.search(r'(?i)\bmulti[- ]?city\b', text):
         unsupported.append("multi-city")
     missing = [k for k, v in (("origin", origin), ("destination", destination))
                if not v]
     if date_state in ("absent", "needs_clock"):
         missing.append("date")
-    if roundtrip:
+    if roundtrip and not return_date and not any(
+            u.startswith("date:return") for u in unsupported):
         missing.append("return_date")
     return {
         "kind": "flight",
@@ -182,8 +312,9 @@ def flight_request(text, now_local=None):
         "destination_iata": _IATA.get(destination or "", ""),
         "date": date,
         "date_state": date_state,
-        "passengers": int(pax.group(1)) if pax else 1,
-        "cabin": cabin.group(1).lower() if cabin else "economy",
+        "return_date": return_date,
+        "passengers": passengers,
+        "cabin": cabin,
         "trip": "roundtrip" if roundtrip else "oneway",
         "nonstop": nonstop,
         "missing": missing,
@@ -213,13 +344,13 @@ def validate_static_flight_evidence(norm, page_texts):
 
 
 def _flight_eligible(norm, failure_code):
-    """Escalation is appropriate ONLY for a COMPLETE, SUPPORTED flight ask
-    whose quick path failed with denial/unreadable/unverified content -
-    never for missing fields or unsupported expressions."""
+    """Escalation is offered ONLY for a COMPLETE, SUPPORTED flight request
+    whose quick path failed with a denial/unreadable failure (content,
+    search or sources) - never for missing fields or unsupported
+    expressions. Enforced again by the LookupResult invariant."""
     return (bool(norm) and norm.get("kind") == "flight"
             and not norm.get("missing") and not norm.get("unsupported")
-            and failure_code in (FAILURE_CONTENT, FAILURE_SEARCH,
-                                 FAILURE_SOURCES))
+            and failure_code in _ELIGIBLE_FAILURES)
 
 
 def requested(text):
@@ -240,16 +371,30 @@ def _flight_reply(norm, when):
                                    norm["destination"].title())
     datebit = " on " + norm["date"] if norm.get("date") else ""
     ask = ""
-    unsupported = norm.get("unsupported") or []
-    missing = norm.get("missing") or []
+    unsupported = list(norm.get("unsupported") or [])
+    missing = list(norm.get("missing") or [])
     if any(u.startswith("date:conflict") for u in unsupported):
         ask = " You gave both an exact date and a relative one - tell me which departure date to use."
     elif any(u.startswith("date:invalid") for u in unsupported):
         ask = " That date is not a real calendar date - give me an exact date (YYYY-MM-DD) or say today/tomorrow."
+    elif any(u.startswith("date:return-invalid") for u in unsupported):
+        ask = " That return date is not a real calendar date - give me an exact return date (YYYY-MM-DD)."
+    elif any(u.startswith("date:return-order") for u in unsupported):
+        ask = " The return date is before the departure date - give me the correct dates."
     elif any(u.startswith("date:unsupported") for u in unsupported):
         ask = " I can't resolve that relative date yet - give me an exact date (YYYY-MM-DD) or say today/tomorrow."
+    elif any(u.startswith("date:return-unsupported") for u in unsupported):
+        ask = " I can't resolve that relative return date yet - give me an exact return date (YYYY-MM-DD)."
     elif "multi-city" in unsupported:
         ask = " I can only check one-way or return trips between two cities."
+    elif any(u.startswith("passengers:invalid") for u in unsupported):
+        ask = " That passenger count does not look right - how many adults (1-9)?"
+    elif "passengers:unparsed" in unsupported:
+        ask = " How many adults are travelling?"
+    elif "passengers:children-infants" in unsupported:
+        ask = " I can only price adult seats right now - how many adults, without children or infants?"
+    elif "cabin:only-negated" in unsupported:
+        ask = " Tell me the cabin you do want - economy, premium economy, business or first."
     elif "date" in missing:
         ask = " Tell me the departure date and I will check that exact day."
     elif "origin" in missing or "destination" in missing:
@@ -262,17 +407,30 @@ def _flight_reply(norm, when):
             % (route, datebit, ask, when))
 
 
+_NEWS_FAILED = ("could not", "cannot", "no dated news", "no news",
+                "public lookup failed", "no readable sources",
+                "the pages i read", "unavailable", "failed", "no results")
+
+
 def lookup(text, now_local=None):
-    """One structured quick-lookup attempt (attempt 1). The flight request
-    is normalized BEFORE the attempt and preserved on EVERY exit."""
+    """One structured quick-lookup attempt (attempt 1). A flight request is
+    normalized and RESOLVED BEFORE the attempt: incomplete/unsupported
+    asks return a clarification result with NO network call; complete,
+    supported asks are preserved on EVERY failure exit."""
     when = datetime.now(timezone.utc).isoformat(timespec='seconds')
     flight = flight_request(text, now_local)
+    if flight is not None and (flight["missing"] or flight["unsupported"]):
+        return LookupResult(
+            STATUS_INSUFFICIENT, _flight_reply(flight, when), when,
+            FAILURE_INCOMPLETE if flight["missing"] else FAILURE_UNSUPPORTED,
+            flight, (), escalation_eligible=False)
     norm = flight if flight else {}
-    if re.search(r'(?i)\bnews\b',text):
+    if flight is None and re.search(r'(?i)\bnews\b',text):
         import cr_group
         out = cr_group.answer({'text':'@crayon_v1_bot '+text,'source_links':True})
         # preserve wrapper behavior WITHOUT upgrading unverified news prose
-        if not (out or '').strip() or out.startswith(('I could not','The pages I read')):
+        low = (out or '').lower()
+        if not low.strip() or any(mk in low for mk in _NEWS_FAILED):
             return LookupResult(STATUS_INSUFFICIENT, out, when,
                                 FAILURE_CONTENT, norm)
         return LookupResult(STATUS_VERIFIED, out, when, "", norm)
@@ -286,7 +444,7 @@ def lookup(text, now_local=None):
                 when, FAILURE_SOURCES, norm, (),
                 escalation_eligible=_flight_eligible(flight, FAILURE_SOURCES))
     else:
-        focus=None
+        focus=None;pages=[]
     try:results=results if focus else W.search(text[:400],5)
     except Exception:
         return LookupResult(STATUS_UNAVAILABLE,
@@ -294,11 +452,11 @@ def lookup(text, now_local=None):
             when, FAILURE_SEARCH, norm, (),
             escalation_eligible=_flight_eligible(flight, FAILURE_SEARCH))
     # Search results are leads, never page evidence. Fetch exact destinations.
-    pages=pages if focus else []
     for row in ([] if focus else results[:5]):
         try:pages.append(W.fetch(row['url']))
         except Exception:pass
-    attempted = tuple(r.get('url','') for r in results[:5] if r.get('url','').startswith('https://'))
+    leads = tuple(r.get('url','') for r in results[:5] if r.get('url','').startswith('https://'))
+    fetched = tuple(p.get('url','') for p in pages if p.get('url','').startswith('https://'))
     if pages:
         import cr_citations,cr_llm as L,json
         try:draft=L.generate([L.user('Question: '+text+'\nUntrusted fetched evidence: '+json.dumps(pages))],system='Answer from fetched evidence only. Answer first, concise. For fares and prices, extract advertised amounts from fetched page text with airline/date only when explicitly present. Label advertised route starting fares, never guaranteed inventory, cheapest date, final total or a booking quote. Current weather/price must have place, date/time and source. Never use seasonal averages as current conditions. No invented facts.',tools=None,max_tokens=1000).get('text','')
@@ -309,27 +467,24 @@ def lookup(text, now_local=None):
             if flight:
                 # EVERY flight request goes through the task validator;
                 # static pages never verify a fare (step-A static-only
-                # guard); incomplete/unsupported asks are clarifications,
-                # NEVER a generic verified result
+                # guard); only complete+supported asks reach this branch
                 validate_static_flight_evidence(flight, pages)
                 return LookupResult(
                     STATUS_INSUFFICIENT, _flight_reply(flight, when), when,
-                    FAILURE_INCOMPLETE if (flight["missing"] or flight["unsupported"]) else FAILURE_CONTENT,
-                    flight, attempted,
+                    FAILURE_CONTENT,
+                    flight, leads, fetched,
                     escalation_eligible=_flight_eligible(flight, FAILURE_CONTENT))
             return LookupResult(STATUS_VERIFIED, checked+'\n\nChecked: '+when,
-                                when, "", norm, attempted,
-                                evidence=attempted)
+                                when, "", norm, leads,
+                                evidence=fetched)
     if flight:
-        incomplete = bool(flight["missing"] or flight["unsupported"])
         return LookupResult(
             STATUS_INSUFFICIENT, _flight_reply(flight, when), when,
-            FAILURE_INCOMPLETE if incomplete else FAILURE_CONTENT,
-            flight, attempted,
-            escalation_eligible=False if incomplete else _flight_eligible(flight, FAILURE_CONTENT))
+            FAILURE_CONTENT, flight, leads, fetched,
+            escalation_eligible=_flight_eligible(flight, FAILURE_CONTENT))
     return LookupResult(STATUS_INSUFFICIENT,
         lead_reply(text,results)+'\n\nChecked: '+when+'\nNo current number is verified.',
-        when, FAILURE_CONTENT, norm, attempted)
+        when, FAILURE_CONTENT, norm, leads)
 
 
 def answer(text):
