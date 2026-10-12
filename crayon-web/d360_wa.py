@@ -127,9 +127,14 @@ async def d360_test_send(req: Request):
         body = await req.json()
     except Exception:
         body = {}
-    to = str((body or {}).get("to", "")).strip()
-    if not re.fullmatch(r"\+?[0-9]{8,15}", to):
-        return JSONResponse({"error": "to must be an E.164-style number"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    to = body.get("to", "")
+    # Canonical E.164-style: optional leading '+', first digit 1-9, 8-15
+    # digits total. Value must be a JSON string (no numeric coercion) and is
+    # passed to the provider unchanged.
+    if not isinstance(to, str) or not re.fullmatch(r"\+?[1-9][0-9]{7,14}", to.strip()):
+        return JSONResponse({"error": "to must be an E.164-style number string"}, status_code=400)
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(BASE + "/v1/messages",
                          headers={"D360-API-KEY": key(), "Content-Type": "application/json"},

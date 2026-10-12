@@ -82,3 +82,27 @@ def test_test_send_without_key_503(client, monkeypatch):
                     headers={"x-admin-token": "admintok"})
     assert r.status_code == 503
     assert not _FakeHTTP.calls
+
+
+def test_test_send_rejects_non_object_body(client):
+    for bad in (["x"], "x", 1, True):
+        r = client.post("/setup/d360-test-send", json=bad,
+                        headers={"x-admin-token": "admintok"})
+        assert r.status_code == 400, repr(bad)
+    assert not _FakeHTTP.calls
+
+
+def test_test_send_rejects_non_e164_shapes(client):
+    for bad in ("00000000", "+012345678", 12345678, "+1234567890123456", True):
+        r = client.post("/setup/d360-test-send", json={"to": bad},
+                        headers={"x-admin-token": "admintok"})
+        assert r.status_code == 400, repr(bad)
+    assert not _FakeHTTP.calls
+
+
+def test_test_send_accepts_digits_only_without_plus(client):
+    r = client.post("/setup/d360-test-send", json={"to": "18775556666"},
+                    headers={"x-admin-token": "admintok"})
+    assert r.status_code == 200
+    posts = [c for c in _FakeHTTP.calls if c[0] == "POST"]
+    assert len(posts) == 1 and posts[0][2]["to"] == "18775556666"
