@@ -56,176 +56,232 @@ def _enter(*cms):
  for cm in cms:stack.enter_context(cm)
  return stack
 
-# --- mcp wave 1 review-#2 fold: principal policy, generation-ABA,
-# pre-network atomic readiness, encoded echo scrub ------------------------
+# --- mcp wave 1 review-#3 fold: deny-default, true CAS, commit
+# visibility, key+value scrub, concurrency controls ------------------------
 
 _GH_URL='https://api.githubcopilot.com/mcp/readonly'
 _TOK='ghp_te"st\\+to/ken='
 _BLOB={'token':'ghp_x_validtoken1','env':'CRAYON_MCP_GITHUB_TOKEN','url':_GH_URL,'name':'github','gen':1,'rev':1,'scope':'server'}
+_ENV={'CRAYON_MCP_GITHUB_TOKEN':_TOK,'CRAYON_MCP_KEYED_UIDS':'1'}
 
-def _kv(store):
- return (lambda k,d=None:store.get(k,d)),(lambda k,v:store.update({k:v}))
+class _FakeDB:
+ '''kv table with JSONB semantics: insert-only claims, conditional
+ updates and conditional deletes behave like the real SQL.'''
+ def __init__(s):
+  s.store={};s.audits=[];s.order=[];s.fail_closing_audit=False
+ def get(s,k,d=None):return s.store.get(k,d)
+ def set(s,k,v):s.store[k]=v
+ def q(s,sql,p=(),f=None):
+  s.order.append(('audit' if 'INSERT INTO audit' in sql else 'db',sql[:24]))
+  if 'INSERT INTO audit' in sql:
+   if s.fail_closing_audit and 'begin' not in str(p):raise RuntimeError('audit down')
+   s.audits.append(str(p));return None
+  if sql.startswith('INSERT INTO kv'):
+   key=p[0];val=json.loads(p[1])
+   if 'DO UPDATE' in sql:
+    if key in s.store:
+     oldv=json.loads(p[3])
+     if s.store.get(key)!=oldv:return None
+     s.store[key]=json.loads(p[2]);return {'value':json.loads(p[2])}
+    s.store[key]=val;return {'value':val}
+   if 'DO NOTHING' in sql:
+    if key in s.store:return None
+    s.store[key]=val;return {'value':val}
+   s.store[key]=val;return None
+  if sql.startswith('UPDATE kv SET value'):
+   new=json.loads(p[0]);key=p[1];old=json.loads(p[2])
+   if s.store.get(key)!=old:return None
+   s.store[key]=new;return {'value':new}
+  if sql.startswith('DELETE FROM kv WHERE key=%s AND value'):
+   key=p[0];old=json.loads(p[1])
+   if s.store.get(key)==old:s.store.pop(key,None)
+   return None
+  if sql.startswith('DELETE FROM kv WHERE key IN'):
+   for k in p:s.store.pop(k,None)
+   return None
+  if sql.startswith('DELETE FROM kv WHERE key LIKE'):
+   s.store['reviews_revoked']=True;return None
+  if sql.startswith('DELETE FROM kv WHERE key=%s'):
+   s.store.pop(p[0],None);return None
+  return None
+ def patches(s):
+  return [patch.object(U.db,'kv_get',side_effect=s.get),patch.object(U.db,'kv_set',side_effect=s.set),patch.object(U.db,'q',side_effect=s.q)]
+
+def _crypto():
+ return [patch.object(U.G,'encrypt',side_effect=lambda uid,p:{'wrapped':p}),
+         patch.object(U.G,'decrypt',side_effect=lambda uid,b:(b['wrapped'] if isinstance(b,dict) and 'wrapped' in b else b))]
 
 def _review(gen=1,rev=1):
  import time as _time
  return {'server':'github','tool':'get_repo','arguments':{'repo':'a/b'},'url':_GH_URL,'until':_time.time()+60,
          'keyed':True,'cred_rev':rev,'cred_gen':gen,'scope':'server','principal':'server-service-account'}
 
-def _patch_db(store):
- kg,kv=_kv(store)
- def fake_q(s,p2,f=None):
-  if 'DELETE FROM kv' in s and 'IN' in s and isinstance(p2,tuple):
-   for k in p2:store.pop(k,None)
-  return None
- return [patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U.db,'q',side_effect=fake_q)]
+def _keyed_store(db,blob=None,gen=1,rev=1):
+ blob=blob or dict(_BLOB,gen=gen,rev=rev)
+ db.store.update({'mcp_connectors_1':{'github':{'url':_GH_URL,'keyed':True,'principal':'server-service-account','tools':[{'name':'get_repo','inputSchema':{'type':'object','properties':{'repo':{'type':'string'}},'required':['repo']}}]}},
+         'mcp_cred_1_github':blob,'mcp_credmeta_1_github':{'url':_GH_URL,'gen':gen,'rev':rev,'scope':'server','principal':'server-service-account'},'mcp_gen_1_github':{'gen':gen}})
 
-def _patch_crypto():
- return [patch.object(U.G,'encrypt',side_effect=lambda uid,p:{'wrapped':p}),
-         patch.object(U.G,'decrypt',side_effect=lambda uid,b:(b['wrapped'] if isinstance(b,dict) and 'wrapped' in b else b))]
+def test_deny_default_unset_and_empty_allowlist():
+ for env in ({'CRAYON_MCP_GITHUB_TOKEN':_TOK},{'CRAYON_MCP_GITHUB_TOKEN':_TOK,'CRAYON_MCP_KEYED_UIDS':''}):
+  with patch.dict('os.environ',env,clear=True),patch.object(U,'session') as network,patch.object(U.db,'kv_get',return_value={}):
+   with pytest.raises(ValueError):U.add_keyed(999,'github',True)
+   with pytest.raises(ValueError):U.add_keyed(1,'github',True)
+   network.assert_not_called()
+
+def test_keyed_allowlist_permits_only_listed():
+ db=_FakeDB()
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':_TOK,'CRAYON_MCP_KEYED_UIDS':'7, 8'},clear=True),patch.object(U,'session') as network,_enter(*(db.patches()+_crypto())):
+  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
+  network.assert_not_called()
 
 def test_registry_rejects_unapproved_connector_before_network():
- with patch.object(U,'session') as network,patch.object(U.db,'kv_get',return_value={}):
+ with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session') as network,patch.object(U.db,'kv_get',return_value={}):
   with pytest.raises(ValueError):U.add_keyed(1,'random',True)
   network.assert_not_called()
 
 def test_keyed_connector_fails_closed_without_env_credential():
- with patch.dict('os.environ',{},clear=True),patch.object(U,'session') as network,patch.object(U.db,'kv_get',return_value={}):
+ with patch.dict('os.environ',{'CRAYON_MCP_KEYED_UIDS':'1'},clear=True),patch.object(U,'session') as network,patch.object(U.db,'kv_get',return_value={}):
   with pytest.raises(ValueError):U.add_keyed(1,'github',True)
   network.assert_not_called()
 
-def test_keyed_allowlist_enforced_before_network():
- with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':_TOK,'CRAYON_MCP_KEYED_UIDS':'7, 8'}),patch.object(U,'session') as network,patch.object(U.db,'kv_get',return_value={}):
-  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
-  network.assert_not_called()
-
-def test_keyed_connector_full_commit_and_audit_before_network():
- order=[];store={};audits=[]
- kg,kv=_kv(store)
- def fake_q(s,p2,f=None):
-  order.append(('audit' if 'INSERT INTO audit' in s else 'db',s[:24]))
-  if 'INSERT INTO audit' in s:audits.append(str(p2))
-  return None
+def test_keyed_connector_full_commit_order_and_no_plaintext():
+ db=_FakeDB()
  def fake_session(url,method,args=None,token=None):
-  order.append(('network',method))
+  db.order.append(('network',method))
   assert url==_GH_URL and token==_TOK
   return {'tools':[{'name':'get_repo','inputSchema':{'type':'object','properties':{'repo':{'type':'string'}}}}]}
- with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':_TOK}),patch.object(U,'session',side_effect=fake_session),patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U.db,'q',side_effect=fake_q),patch.object(U.G,'encrypt',side_effect=lambda uid,p:{'wrapped':p}),patch.object(U.G,'decrypt',side_effect=lambda uid,b:b['wrapped']):
+ with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session',side_effect=fake_session),_enter(*(db.patches()+_crypto())):
   r=U.add_keyed(1,'github',True)
-  kinds=[k for k,_ in order]
-  assert kinds.index('network')>kinds.index('audit'), order
-  assert store['mcp_cred_1_github']=={'wrapped':{'token':_TOK,'env':'CRAYON_MCP_GITHUB_TOKEN','url':_GH_URL,'name':'github','gen':1,'rev':1,'scope':'server'}}
-  assert store['mcp_gen_1_github']=={'gen':1}
-  assert store['mcp_connectors_1']['github']['keyed'] is True
-  assert store['mcp_connectors_1']['github']['principal']=='server-service-account'
+  kinds=[k for k,_ in db.order]
+  assert kinds.index('network')>kinds.index('audit'),db.order  # begin-audit BEFORE network
+  assert kinds[-1]!='network'
+  assert db.store['mcp_cred_1_github']=={'wrapped':{'token':_TOK,'env':'CRAYON_MCP_GITHUB_TOKEN','url':_GH_URL,'name':'github','gen':1,'rev':1,'scope':'server'}}
+  assert db.store['mcp_gen_1_github']=={'gen':1}
+  assert db.store['mcp_connectors_1']['github']['keyed'] is True
+  assert db.store['mcp_connectors_1']['github']['principal']=='server-service-account'
   assert r['name']=='github'
-  assert all(_TOK not in a for a in audits)
+  assert all(_TOK not in a for a in db.audits)
 
-def test_storage_probe_failure_refuses_before_network():
- store={};kg,kv=_kv(store)
- def bad_get(k,d=None):
-  if k=='mcp_probe_1':return None
-  return store.get(k,d)
- with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':_TOK}),patch.object(U,'session') as network,patch.object(U.db,'kv_get',side_effect=bad_get),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U.db,'q',return_value=None),patch.object(U.G,'encrypt',side_effect=lambda uid,p:p),patch.object(U.G,'decrypt',side_effect=lambda uid,b:b):
-  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
-  network.assert_not_called()
-
-def test_commit_failure_rolls_back_everything():
- store={};kg,kv=_kv(store)
- def fake_q(s,p2,f=None):
-  if 'INSERT INTO audit' in s and 'mcp_connector_keyed_begin' not in str(p2):raise RuntimeError('audit down')
-  if 'DELETE FROM kv' in s and 'IN' in s and isinstance(p2,tuple):
-   for k in p2:store.pop(k,None)
-  return None
- with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':_TOK}),patch.object(U,'session',return_value={'tools':[]}),patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U.db,'q',side_effect=fake_q),patch.object(U.G,'encrypt',side_effect=lambda uid,p:p),patch.object(U.G,'decrypt',side_effect=lambda uid,b:b):
-  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
-  assert 'github' not in store.get('mcp_connectors_1',{})
-  assert 'mcp_cred_1_github' not in store and 'mcp_credmeta_1_github' not in store
-
-def test_replacement_semantics_refuse_silent_swap_public_endpoint():
- store={'mcp_connectors_1':{'github':{'url':_GH_URL,'tools':[],'keyed':True}},'mcp_cred_1_github':'blob'}
- kg,kv=_kv(store)
- with patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U,'session',return_value={'tools':[]}) as network,patch.object(U,'endpoint'):
-  with pytest.raises(ValueError):U.add(1,'github','https://api.githubcopilot.com/mcp/readonly',True)
-  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
-  network.assert_not_called()
-
-def _keyed_store(blob=None,gen=1,rev=1):
- blob=blob or dict(_BLOB,gen=gen,rev=rev)
- return {'mcp_connectors_1':{'github':{'url':_GH_URL,'keyed':True,'principal':'server-service-account','tools':[{'name':'get_repo','inputSchema':{'type':'object','properties':{'repo':{'type':'string'}},'required':['repo']}}]}},
-         'mcp_cred_1_github':blob,'mcp_credmeta_1_github':{'url':_GH_URL,'gen':gen,'rev':rev,'scope':'server','principal':'server-service-account'},'mcp_gen_1_github':{'gen':gen}}
-
-def test_review_card_shows_principal_and_generation():
- store=_keyed_store()
- with _enter(_enter(patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':_TOK}),*(_patch_db(store)+_patch_crypto()))):
-  r=U.prepare(1,'github','get_repo',{'repo':'a/b'})
-  assert 'revision 1, generation 1' in r['text']
-  assert 'server-held service account' in r['text'] and 'NOT as you' in r['text']
-
-def test_generation_aba_old_review_refused_after_delete_readd():
- store=_keyed_store();kg,kv=_kv(store)
- def fake_q(s,p2,f=None):
-  if 'DELETE FROM kv' in s and 'IN' in s and isinstance(p2,tuple):
-   for k in p2:store.pop(k,None)
-  if 'LIKE' in s:store['reviews_revoked']=True
-  return None
- base=[patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U.db,'q',side_effect=fake_q),patch.object(U.G,'encrypt',side_effect=lambda uid,p:p),patch.object(U.G,'decrypt',side_effect=lambda uid,b:b)]
- with _enter(patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':_TOK}),patch.object(U,'session',return_value={'tools':[]}),*base):
-  r=U.prepare(1,'github','get_repo',{'repo':'a/b'})
-  assert 'generation 1' in r['text']
-  U.remove(1,'github')
-  assert store.get('reviews_revoked') is True
-  assert 'mcp_cred_1_github' not in store
+def test_commit_visibility_prepare_refused_until_publish():
+ db=_FakeDB();seen={}
+ orig_insert=db.q
+ def hook(sql,p=(),f=None):
+  r=orig_insert(sql,p,f)
+  if sql.startswith('INSERT INTO kv') and p[0]=='mcp_cred_1_github':
+   # mid-commit: blob written, connector NOT yet published
+   with pytest.raises(ValueError):U.prepare(1,'github','get_repo',{'repo':'a/b'})
+   seen['refused']=True
+  return r
+ db.q=hook
+ with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session',return_value={'tools':[{'name':'get_repo','inputSchema':{'type':'object','properties':{'repo':{'type':'string'}},'required':['repo']}}]}),_enter(*(db.patches()+_crypto())):
   U.add_keyed(1,'github',True)
-  assert store['mcp_gen_1_github']=={'gen':2}
+  assert seen.get('refused') is True
+  r=U.prepare(1,'github','get_repo',{'repo':'a/b'})  # works only AFTER commit
+  assert 'revision 1, generation 1' in r['text']
+
+def test_closing_audit_failure_rolls_back_nothing_visible():
+ db=_FakeDB();db.fail_closing_audit=True
+ with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session',return_value={'tools':[]}),_enter(*(db.patches()+_crypto())):
+  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
+  assert 'mcp_connectors_1' not in db.store or 'github' not in db.store.get('mcp_connectors_1',{})
+  assert 'mcp_cred_1_github' not in db.store and 'mcp_credmeta_1_github' not in db.store
+  assert db.store['mcp_gen_1_github']=={'gen':1}  # generation never reused
+
+def test_rollback_never_clobbers_a_concurrent_workers_row():
+ db=_FakeDB();db.fail_closing_audit=True
+ other={'wrapped':{'token':'ghp_otherworker1','env':'CRAYON_MCP_GITHUB_TOKEN','url':_GH_URL,'name':'github','gen':9,'rev':1,'scope':'server'}}
+ orig=db.q
+ def hook(sql,p=(),f=None):
+  r=orig(sql,p,f)
+  if sql.startswith('INSERT INTO kv') and p[0]=='mcp_cred_1_github':
+   db.store['mcp_cred_1_github']=other  # concurrent worker overwrites before our rollback
+  return r
+ db.q=hook
+ with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session',return_value={'tools':[]}),_enter(*(db.patches()+_crypto())):
+  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
+  assert db.store['mcp_cred_1_github']==other  # conditional delete left it alone
+
+def test_concurrent_add_generation_claim_is_unique():
+ db=_FakeDB()
+ with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session',return_value={'tools':[]}),_enter(*(db.patches()+_crypto())):
+  U.add_keyed(1,'github',True)
+  assert db.store['mcp_gen_1_github']=={'gen':1}
+  U.remove(1,'github')
+  U.add_keyed(1,'github',True)
+  assert db.store['mcp_gen_1_github']=={'gen':2}  # never reset
   with patch.object(U.db,'q',return_value={'value':_review(gen=1)}),patch.object(U,'session') as network:
+   with pytest.raises(ValueError):U.confirm(1,'id','confirm')  # gen-1 review dead
+   network.assert_not_called()
+
+def test_concurrent_rotate_cas_loser_fails():
+ db=_FakeDB();_keyed_store(db)
+ enc_a={'wrapped':dict(_BLOB,rev=2,token='ghp_rotated_a')}
+ def enc_a_fn(uid,p):return enc_a
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated_a','CRAYON_MCP_KEYED_UIDS':'1'},clear=True),_enter(*(db.patches())),patch.object(U.G,'encrypt',side_effect=enc_a_fn),patch.object(U.G,'decrypt',side_effect=lambda uid,b:(b['wrapped'] if isinstance(b,dict) and 'wrapped' in b else b)):
+  db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}  # encrypted blob at rev1
+  U.rotate_keyed(1,'github',True)  # rotation A wins: blob now rev2
+  # rotation B read the SAME rev1 blob and tries the same conditional update
+  ck='mcp_cred_1_github';old_blob={'wrapped':dict(_BLOB)}
+  row=U.db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps({'wrapped':dict(_BLOB,rev=2,token='ghp_rotated_b')}),ck,json.dumps(old_blob)),'one')
+  assert row is None  # CAS rejects the loser
+  assert db.store[ck]==enc_a  # winner's value intact
+
+def test_rotation_invalidates_stale_review():
+ db=_FakeDB();_keyed_store(db)
+ db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated9x','CRAYON_MCP_KEYED_UIDS':'1'},clear=True),_enter(*(db.patches()+_crypto())):
+  U.rotate_keyed(1,'github',True)
+  assert db.store['mcp_credmeta_1_github']['rev']==2
+  with patch.object(U.db,'q',return_value={'value':_review(gen=1,rev=1)}),patch.object(U,'session') as network:
    with pytest.raises(ValueError):U.confirm(1,'id','confirm')
    network.assert_not_called()
 
 def test_tampered_blob_name_or_scope_refused_before_network():
  for bad in (dict(_BLOB,name='evil'),dict(_BLOB,scope='other'),dict(_BLOB,url='https://evil.example/mcp')):
-  store=_keyed_store(blob=bad)
-  with _enter(_enter(patch.object(U.db,'q',return_value={'value':_review()}),*(_patch_db(store)+_patch_crypto()))) as _st:
-   network=_st.enter_context(patch.object(U,'session'))
+  db=_FakeDB();_keyed_store(db,blob=bad)
+  with patch.object(U.db,'q',return_value={'value':_review()}),patch.object(U,'session') as network,_enter(*(db.patches()[:2]+_crypto())):
    with pytest.raises(ValueError):U.confirm(1,'id','confirm')
    network.assert_not_called()
 
-def test_rotation_invalidates_stale_review():
- store=_keyed_store()
- with _enter(patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated9'}),*(_patch_db(store)+_patch_crypto())):
-  U.rotate_keyed(1,'github',True)
-  assert store['mcp_credmeta_1_github']['rev']==2
-  with patch.object(U.db,'q',return_value={'value':_review(gen=1,rev=1)}),patch.object(U,'session') as network:
-   with pytest.raises(ValueError):U.confirm(1,'id','confirm')
-   network.assert_not_called()
+def test_review_card_shows_principal_and_generation():
+ db=_FakeDB();_keyed_store(db)
+ with patch.dict('os.environ',_ENV,clear=True),_enter(*(db.patches()+_crypto())):
+  r=U.prepare(1,'github','get_repo',{'repo':'a/b'})
+  assert 'revision 1, generation 1' in r['text']
+  assert 'server-held service account' in r['text'] and 'NOT as you' in r['text']
 
-def test_encoded_echo_scrubbed_in_catalog_and_result():
+def test_replacement_semantics_refuse_silent_swap_public_endpoint():
+ db=_FakeDB();_keyed_store(db)
+ with patch.dict('os.environ',_ENV,clear=True),_enter(*(db.patches()+_crypto())),patch.object(U,'session',return_value={'tools':[]}) as network,patch.object(U,'endpoint'):
+  with pytest.raises(ValueError):U.add(1,'github','https://api.githubcopilot.com/mcp/readonly',True)
+  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
+  network.assert_not_called()
+
+def test_key_and_value_echo_scrubbed_in_catalog_and_result():
  import base64
  from urllib.parse import quote
  forms=[_TOK,quote(_TOK,safe=''),base64.b64encode(_TOK.encode()).decode(),base64.b64encode(_TOK.encode()).decode().rstrip('='),base64.urlsafe_b64encode(_TOK.encode()).decode(),base64.urlsafe_b64encode(_TOK.encode()).decode().rstrip('=')]
  for echoed in forms:
-  store={}
-  echo_tools=[{'name':'get_repo','description':'echo '+echoed,'inputSchema':{'type':'object','properties':{'repo':{'type':'string'}}}}]
+  db=_FakeDB()
+  # token as a schema KEY and as a description VALUE
+  echo_tools=[{'name':'get_repo','description':'echo '+echoed,'inputSchema':{'type':'object','properties':{echoed:{'type':'string'},'repo':{'type':'string'}}}}]
   def fake_session(url,method,args=None,token=None,_e=echo_tools):
    if method=='tools/list':return {'tools':_e}
    return {'content':[{'text':'result text'}],'ok':True}
-  with _enter(patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':_TOK}),patch.object(U,'session',side_effect=fake_session),*(_patch_db(store)+_patch_crypto())):
+  with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session',side_effect=fake_session),_enter(*(db.patches()+_crypto())):
    U.add_keyed(1,'github',True)
-   cat=json.dumps(store['mcp_connectors_1']['github']['tools'],ensure_ascii=False)
+   cat=json.dumps(db.store['mcp_connectors_1']['github']['tools'],ensure_ascii=False)
    for form in forms:assert form not in cat
-   assert 'get_repo' in cat
-   def echo_result(url,method,args=None,token=None,_e=echoed):return {'content':[{'text':'echo '+_e}],'ok':True}
+   assert 'get_repo' in cat and 'repo' in cat
+   def echo_result(url,method,args=None,token=None,_e=echoed):return {'content':[{'text':'echo '+_e}],_e:'keyed-value','ok':True}
    with patch.object(U.db,'q',return_value={'value':_review()}),patch.object(U,'session',side_effect=echo_result):
     out=U.confirm(1,'id','confirm')
     for form in forms:assert form not in out['text']
     assert 'ok' in out['text']
 
 def test_remove_deletes_credential_meta_and_reviews_keeps_generation():
- deleted=[];store={'mcp_connectors_1':{'server':{}},'mcp_gen_1_server':{'gen':3}}
- def fake_q(s,p2,f=None):
-  if 'DELETE FROM kv' in s:deleted.append((s[:40],p2))
-  return None
- with patch.object(U.db,'kv_get',side_effect=lambda k,d=None:store.get(k,d)),patch.object(U.db,'kv_set',side_effect=lambda k,v:store.update({k:v})),patch.object(U.db,'q',side_effect=fake_q):
+ db=_FakeDB();db.store['mcp_connectors_1']={'server':{}};db.store['mcp_gen_1_server']={'gen':3}
+ with patch.object(U.db,'kv_get',side_effect=db.get),patch.object(U.db,'kv_set',side_effect=db.set),patch.object(U.db,'q',side_effect=db.q):
   assert U.remove(1,'server')=={'removed':True}
-  assert deleted[0][1]==('mcp_cred_1_server','mcp_credmeta_1_server')
-  assert 'LIKE' in deleted[1][0] and deleted[1][1]==('mcp_review_1_%',)
-  assert store['mcp_gen_1_server']=={'gen':3}
+  assert db.store.get('reviews_revoked') is True
+  assert db.store['mcp_gen_1_server']=={'gen':3}

@@ -53,7 +53,14 @@ def _scrub_obj(obj, token):
     if isinstance(obj, list):
         return [_scrub_obj(v, token) for v in obj]
     if isinstance(obj, dict):
-        return {k: _scrub_obj(v, token) for k, v in obj.items()}
+        out = {}
+        for k, v in obj.items():
+            # A dictionary KEY carrying the credential is DROPPED, not
+            # redacted into a collision with a literal "[redacted-key]".
+            if isinstance(k, str) and any(f and f in k for f in _scrub_forms(token)):
+                continue
+            out[k] = _scrub_obj(v, token)
+        return out
     return obj
 def _checked_audit(uid, event, detail):
     '''Audit that GATES the action: db.audit swallows failures, so keyed
@@ -70,15 +77,15 @@ def _storage_preflight(uid):
         raise ValueError('Credential storage unavailable.')
     db.q('DELETE FROM kv WHERE key=%s', (k,), 'none')
 def _principal_allowed(uid, name):
-    '''Explicit principal policy: keyed connectors run as the server
-    service account, not as the user. When CRAYON_MCP_KEYED_UIDS is set
-    (comma-separated), only those user ids may register/rotate/call
-    keyed connectors; unset means any user may attach the shared server
-    credential and every surface carries the service-account notice.'''
+    """Explicit bounded operator policy: keyed connectors run as the
+    server service account, spending shared server-held credits.
+    CRAYON_MCP_KEYED_UIDS (comma-separated user ids) is the operator's
+    grant. UNSET OR EMPTY MEANS DENY FOR EVERY USER - there is no
+    default allowance over the shared service identity."""
     import os
-    allow = os.environ.get('CRAYON_MCP_KEYED_UIDS', '')
-    if allow and str(uid) not in {a.strip() for a in allow.split(',')}:
-        raise ValueError('This user is not in the keyed-connector allowlist.')
+    allow = {a.strip() for a in os.environ.get('CRAYON_MCP_KEYED_UIDS', '').split(',') if a.strip()}
+    if str(uid) not in allow:
+        raise ValueError('Keyed connectors are not enabled for this user.')
 def endpoint(url):
  p=urlsplit(url)
  from cr_web import _safe_host
@@ -156,68 +163,94 @@ def _catalog(url,token):
   if len(json.dumps(t))>12000:continue
   safe.append({k:t[k] for k in ('name','description','inputSchema','annotations') if k in t})
  return [_scrub_obj(t,token) for t in safe]
-def _rollback_keyed(uid,name):
- db.q('DELETE FROM kv WHERE key IN (%s,%s)',(_cred_key(uid,name),_cred_meta_key(uid,name)),'none')
- c=connectors(uid);c.pop(name,None);db.kv_set('mcp_connectors_'+str(uid),c)
+def _rollback_keyed(uid,name,cred_val=None,meta_val=None):
+    # CONDITIONAL deletes: only rows still holding exactly what THIS call
+    # wrote are removed - a concurrent worker's row is never clobbered.
+    # The generation claim is kept: generations are never reused.
+    if cred_val is not None:
+        db.q('DELETE FROM kv WHERE key=%s AND value=%s::jsonb',(_cred_key(uid,name),json.dumps(cred_val)),'none')
+    if meta_val is not None:
+        db.q('DELETE FROM kv WHERE key=%s AND value=%s::jsonb',(_cred_meta_key(uid,name),json.dumps(meta_val)),'none')
+def _claim_generation(uid,name):
+    # Atomic, durable generation claim. The counter survives remove() and
+    # is never reused, so a delete/re-add can never resurrect an old review.
+    gk=_gen_key(uid,name)
+    row=db.q("INSERT INTO kv(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING RETURNING value",(gk,json.dumps({'gen':1})),'one')
+    if row:return 1
+    cur=(db.kv_get(gk) or {}).get('gen',0)
+    row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps({'gen':cur+1}),gk,json.dumps({'gen':cur})),'one')
+    if not row:raise ValueError('Connector state changed - retry.')
+    return cur+1
 def add_keyed(uid,name,accept):
- '''Registry-approved connector with a server-env bearer credential.
- Order is fail-closed and atomic: registry/principal/env/crypto/storage
- preflight and a CHECKED begin-audit all run BEFORE any network; the
- credential, generation and connector (already keyed) are committed
- together; ANY storage or closing-audit failure rolls the whole
- connector back - no anonymous partial state is ever left behind.'''
- if accept is not True:raise ValueError(NOTICE)
- entry=_REGISTRY.get(name)
- if not entry:raise ValueError('Connector not in the approved registry.')
- if name in connectors(uid) or db.kv_get(_cred_key(uid,name)):raise ValueError('Connector exists - use rotate_keyed or remove first.')
- c=connectors(uid)
- if len(c)>=5:raise ValueError('At most5connectors.')
- _principal_allowed(uid,name)
- token=_read_env_credential(entry['env'])  # fail closed BEFORE any network
- _crypto_preflight(uid)
- _storage_preflight(uid)
- url=entry['url'];gen=(db.kv_get(_gen_key(uid,name)) or {}).get('gen',0)+1;rev=1
- _checked_audit(uid,'mcp_connector_keyed_begin',json.dumps({'name':name,'url':url,'env':entry['env'],'gen':gen,'rev':rev}))
- safe=_catalog(url,token)  # network happens only after every gate above
- blob={'token':token,'env':entry['env'],'url':url,'name':name,'gen':gen,'rev':rev,'scope':'server'}
- meta={'url':url,'gen':gen,'rev':rev,'scope':'server','principal':entry['principal']}
- try:
-  db.kv_set(_cred_key(uid,name),G.encrypt(uid,blob))
-  db.kv_set(_cred_meta_key(uid,name),meta)
-  db.kv_set(_gen_key(uid,name),{'gen':gen})
-  c[name]={'url':url,'tools':safe,'keyed':True,'intent':entry['intent'],'principal':entry['principal'],'consent_at':int(time.time()),'notice':NOTICE}
-  db.kv_set('mcp_connectors_'+str(uid),c)
-  _checked_audit(uid,'mcp_connector_keyed',json.dumps({'name':name,'url':url,'env':entry['env'],'gen':gen,'rev':rev}))
- except Exception:
-  _rollback_keyed(uid,name)
-  raise ValueError('Credential storage or audit unavailable - connector not saved.') from None
- return {'name':name,'url':url,'tools':[t.get('name') for t in safe],'keyed':True}
+    # Registry-approved connector with a server-env bearer credential.
+    # Fail-closed, deny-by-default, atomic with commit visibility:
+    # registry/principal/env/crypto/storage preflight and a CHECKED
+    # begin-audit all run BEFORE any network; the credential and meta are
+    # written INSERT-ONLY (a concurrent registration fails instead of
+    # clobbering); the CHECKED closing audit lands BEFORE the connector
+    # row is published by a CAS update, so the connector is never usable
+    # before commit+audit succeed; failures roll back only this call's rows.
+    if accept is not True:raise ValueError(NOTICE)
+    entry=_REGISTRY.get(name)
+    if not entry:raise ValueError('Connector not in the approved registry.')
+    if name in connectors(uid) or db.kv_get(_cred_key(uid,name)):raise ValueError('Connector exists - use rotate_keyed or remove first.')
+    c=connectors(uid)
+    if len(c)>=5:raise ValueError('At most5connectors.')
+    _principal_allowed(uid,name)
+    token=_read_env_credential(entry['env'])  # fail closed BEFORE any network
+    _crypto_preflight(uid)
+    _storage_preflight(uid)
+    url=entry['url'];gen=_claim_generation(uid,name);rev=1
+    _checked_audit(uid,'mcp_connector_keyed_begin',json.dumps({'name':name,'url':url,'env':entry['env'],'gen':gen,'rev':rev}))
+    safe=_catalog(url,token)  # network happens only after every gate above
+    blob={'token':token,'env':entry['env'],'url':url,'name':name,'gen':gen,'rev':rev,'scope':'server'}
+    meta={'url':url,'gen':gen,'rev':rev,'scope':'server','principal':entry['principal']}
+    enc=G.encrypt(uid,blob)
+    ck=_cred_key(uid,name);mk=_cred_meta_key(uid,name)
+    row=db.q("INSERT INTO kv(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING RETURNING value",(ck,json.dumps(enc)),'one')
+    if not row:raise ValueError('Connector state changed - retry.')
+    try:
+        row=db.q("INSERT INTO kv(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING RETURNING value",(mk,json.dumps(meta)),'one')
+        if not row:raise ValueError('Connector state changed - retry.')
+        _checked_audit(uid,'mcp_connector_keyed',json.dumps({'name':name,'url':url,'env':entry['env'],'gen':gen,'rev':rev}))
+        # PUBLISH LAST, by CAS: the connector becomes visible only now.
+        cc='mcp_connectors_'+str(uid);old=connectors(uid)
+        new=dict(old);new[name]={'url':url,'tools':safe,'keyed':True,'intent':entry['intent'],'principal':entry['principal'],'consent_at':int(time.time()),'notice':NOTICE}
+        # Single-statement conditional upsert: inserts only if the row is
+        # absent; on conflict, updates only if the live row still equals
+        # what we read. A concurrent publisher loses and retries.
+        row=db.q("INSERT INTO kv(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=%s::jsonb WHERE kv.value=%s::jsonb RETURNING value",(cc,json.dumps(new),json.dumps(new),json.dumps(old)),'one')
+        if not row:raise ValueError('Connector state changed - retry.')
+    except Exception:
+        _rollback_keyed(uid,name,cred_val=enc,meta_val=meta)
+        raise ValueError('Credential storage or audit unavailable - connector not saved.') from None
+    return {'name':name,'url':url,'tools':[t.get('name') for t in safe],'keyed':True}
 def rotate_keyed(uid,name,accept):
- '''Explicit rotation with CAS: re-reads the registry env var, bumps the
- revision, keeps the generation, and aborts if the stored state changed
- underneath. Reviews pinned to an older revision are refused.'''
- if accept is not True:raise ValueError(NOTICE)
- entry=_REGISTRY.get(name);c=connectors(uid).get(name)
- if not entry or not c or not c.get('keyed'):raise ValueError('No such keyed connector.')
- _principal_allowed(uid,name)
- token=_read_env_credential(entry['env'])
- _crypto_preflight(uid);_storage_preflight(uid)
- old_blob=db.kv_get(_cred_key(uid,name));old_meta=db.kv_get(_cred_meta_key(uid,name))
- try:old=G.decrypt(uid,old_blob)
- except Exception:raise ValueError('Credential unavailable - reconnect the connector.') from None
- gen=old.get('gen',1);rev=old.get('rev',0)+1
- new_blob={'token':token,'env':entry['env'],'url':entry['url'],'name':name,'gen':gen,'rev':rev,'scope':'server'}
- if db.kv_get(_cred_key(uid,name))!=old_blob or db.kv_get(_cred_meta_key(uid,name))!=old_meta:
-  raise ValueError('Credential changed during rotation - retry.')
- try:
-  db.kv_set(_cred_key(uid,name),G.encrypt(uid,new_blob))
-  db.kv_set(_cred_meta_key(uid,name),{'url':entry['url'],'gen':gen,'rev':rev,'scope':'server','principal':entry['principal']})
-  _checked_audit(uid,'mcp_connector_rotated',json.dumps({'name':name,'url':entry['url'],'gen':gen,'rev':rev}))
- except Exception:
-  if old_blob:db.kv_set(_cred_key(uid,name),old_blob)
-  if old_meta:db.kv_set(_cred_meta_key(uid,name),old_meta)
-  raise ValueError('Audit store unavailable - rotation not saved.') from None
- return {'name':name,'rev':rev,'gen':gen}
+    # Explicit rotation with TRUE compare-and-swap: one conditional UPDATE
+    # on the encrypted blob row. Two concurrent rotations from the same
+    # state cannot both succeed; the loser raises instead of overwriting.
+    # Reviews pinned to the old revision are refused.
+    if accept is not True:raise ValueError(NOTICE)
+    entry=_REGISTRY.get(name);c=connectors(uid).get(name)
+    if not entry or not c or not c.get('keyed'):raise ValueError('No such keyed connector.')
+    _principal_allowed(uid,name)
+    token=_read_env_credential(entry['env'])
+    _crypto_preflight(uid);_storage_preflight(uid)
+    ck=_cred_key(uid,name)
+    old_blob=db.kv_get(ck)
+    try:old=G.decrypt(uid,old_blob)
+    except Exception:raise ValueError('Credential unavailable - reconnect the connector.') from None
+    gen=old.get('gen',1);rev=old.get('rev',0)+1
+    new_enc=G.encrypt(uid,{'token':token,'env':entry['env'],'url':entry['url'],'name':name,'gen':gen,'rev':rev,'scope':'server'})
+    row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(new_enc),ck,json.dumps(old_blob)),'one')
+    if not row:raise ValueError('Credential changed during rotation - retry.')
+    try:
+        db.kv_set(_cred_meta_key(uid,name),{'url':entry['url'],'gen':gen,'rev':rev,'scope':'server','principal':entry['principal']})
+        _checked_audit(uid,'mcp_connector_rotated',json.dumps({'name':name,'url':entry['url'],'gen':gen,'rev':rev}))
+    except Exception:
+        db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(old_blob),ck,json.dumps(new_enc)),'one')
+        raise ValueError('Audit store unavailable - rotation not saved.') from None
+    return {'name':name,'rev':rev,'gen':gen}
 def _keyed_credential(uid,name,url):
  '''Fail-closed credential load. The encrypted blob is the AUTHENTICATED
  record: name, endpoint and scope must all match, and a missing or
