@@ -3,7 +3,7 @@ Dormant unless D360_API_KEY is set (key comes from sending START to +55114673349
 D360_HOOK_SECRET is REQUIRED when the lane is enabled (fail closed: no secret -> 503, no
 handler): the webhook URL must be registered with ?s=<secret> and requests without it are
 rejected - stops strangers from driving the bot through the public URL."""
-import asyncio, hmac, os, time
+import asyncio, hmac, os, re, time
 from collections import OrderedDict
 import httpx
 from fastapi import APIRouter, Request
@@ -100,6 +100,9 @@ async def handle(wa_id: str, text: str):
 
 @router.get("/setup/d360-status")
 async def d360_status(req: Request):
+    # READ-ONLY status. A GET must never cause a provider send: any client,
+    # prefetcher or crawler able to replay the admin header could otherwise
+    # trigger WhatsApp messages to arbitrary numbers via ?to=.
     tok = os.environ.get("ADMIN_TOKEN", "")
     if not tok or not hmac.compare_digest(str(req.headers.get("x-admin-token", "")), tok):
         return JSONResponse({"error": "no"}, status_code=403)
@@ -109,14 +112,39 @@ async def d360_status(req: Request):
     async with httpx.AsyncClient(timeout=20) as c:
         g = await c.get(BASE + "/v1/configs/webhook", headers={"D360-API-KEY": key()})
         out["webhook_get"] = {"status": g.status_code, "body": g.text[:200]}
-        to = str(req.query_params.get("to", "")).strip()
-        if to:
-            r = await c.post(BASE + "/v1/messages",
-                             headers={"D360-API-KEY": key(), "Content-Type": "application/json"},
-                             json={"messaging_product": "whatsapp", "recipient_type": "individual", "to": to,
-                                   "type": "text", "text": {"body": "Crayon test: WhatsApp send path works."}})
-            out["send"] = {"status": r.status_code, "body": r.text[:300]}
     return JSONResponse(out)
+
+
+@router.post("/setup/d360-test-send")
+async def d360_test_send(req: Request):
+    # The send probe lives here, behind POST + the admin token + a strict
+    # recipient shape - never on the GET status route.
+    tok = os.environ.get("ADMIN_TOKEN", "")
+    if not tok or not hmac.compare_digest(str(req.headers.get("x-admin-token", "")), tok):
+        return JSONResponse({"error": "no"}, status_code=403)
+    if not enabled():
+        return JSONResponse({"error": "D360_API_KEY not set"}, status_code=503)
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    to = body.get("to", "")
+    if not isinstance(to, str):
+        return JSONResponse({"error": "to must be an E.164-style number string"}, status_code=400)
+    # Canonical E.164-style: optional leading '+', first digit 1-9, 8-15
+    # digits total. Surrounding whitespace is stripped and the CANONICAL
+    # value is what is validated and sent to the provider.
+    to = to.strip()
+    if not re.fullmatch(r"\+?[1-9][0-9]{7,14}", to):
+        return JSONResponse({"error": "to must be an E.164-style number string"}, status_code=400)
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post(BASE + "/v1/messages",
+                         headers={"D360-API-KEY": key(), "Content-Type": "application/json"},
+                         json={"messaging_product": "whatsapp", "recipient_type": "individual", "to": to,
+                               "type": "text", "text": {"body": "Crayon test: WhatsApp send path works."}})
+    return JSONResponse({"send": {"status": r.status_code, "body": r.text[:300]}})
 
 
 @router.post("/whatsapp/d360")
