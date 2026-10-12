@@ -734,3 +734,44 @@ def test_cardinality_refusals_are_ineligible_end_to_end(monkeypatch):
         r = cr_live.lookup(ask, NOW_LOCAL)
         assert r.status == cr_live.STATUS_INSUFFICIENT, ask
         assert r.escalation_eligible is False, ask
+
+
+# --- review-#8: unknown endpoints clarify, never complete ----------------
+
+@pytest.mark.parametrize("ask,missing", [
+    ("flight Delhi to Surat wheelchair tomorrow", ["destination"]),
+    ("flight Delhi to Surat overnight tomorrow", ["destination"]),
+    ("flight Delhi to Surat cheap tomorrow", ["destination"]),
+    ("flight Surat to Bhopal tomorrow", ["origin", "destination"]),
+    ("flight Surat to Kolkata wheelchair assistance tomorrow", ["origin"]),
+])
+def test_unknown_endpoints_clarify_never_complete(ask, missing):
+    n = cr_live.flight_request(ask, NOW_LOCAL)
+    assert "route:unresolved" in n["unsupported"], ask
+    assert n["missing"] == missing, ask
+
+
+def test_unknown_route_is_ineligible_end_to_end(monkeypatch):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    r = cr_live.lookup("flight Surat to Bhopal tomorrow", NOW_LOCAL)
+    assert r.status == cr_live.STATUS_INSUFFICIENT
+    assert r.escalation_eligible is False
+    assert "exact origin and destination" in r.text
+
+
+def test_nonstop_word_cannot_overlap_an_endpoint():
+    n = cr_live.flight_request(
+        "flight Surat nonstop to Bhopal tomorrow", NOW_LOCAL)
+    assert n["origin"] != "surat nonstop"
+    assert "route:unresolved" in n["unsupported"]
+
+
+@pytest.mark.parametrize("ask,route", [
+    ("cheapest flight tomorrow Delhi to Kolkata", ("delhi", "kolkata")),
+    ("flight New Delhi to Mumbai tomorrow", ("new delhi", "mumbai")),
+    ("flight from Kolkata to New Delhi on 2026-10-20", ("kolkata", "new delhi")),
+])
+def test_known_route_positives_stay_complete(ask, route):
+    n = cr_live.flight_request(ask, NOW_LOCAL)
+    assert (n["origin"], n["destination"]) == route
+    assert n["missing"] == [] and n["unsupported"] == []

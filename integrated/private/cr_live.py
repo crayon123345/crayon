@@ -1,6 +1,6 @@
 """Deterministic public lookup for explicit search and changing-data requests.
 
-Step A (flight-escalation contract, review-#6 fold): lookup() returns a
+Step A (flight-escalation contract, review-#8 fold): lookup() returns a
 structured LookupResult. The flight request is normalized and RESOLVED
 BEFORE any network attempt: an incomplete or unsupported request is a
 clarification result with NO search/research call, NEVER a generic
@@ -433,26 +433,50 @@ def flight_request(text, now_local=None):
     if not _FLIGHT_WORD.search(text):
         return None
     spans = []
+    unsupported = []
+    origin = None
+    destination = None
     km = _ROUTE_KNOWN_RE.search(text)
     if km:
         # exact known-city binding: the consumed span ENDS at the city
         spans.append(km.span())
         origin = km.group(1).lower()
         destination = km.group(2).lower()
-        m = None
     else:
-        m = _ROUTE_RE.search(text) or _BARE_ROUTE_RE.search(text)
-        if m:
-            spans.append(m.span())
-        origin = _city(m.group(1)) if m else None
-        destination = _city(m.group(2)) if m else None
+        # Unknown endpoints are NEVER completed on free-text prose: bind
+        # each known endpoint independently, mark the rest MISSING, and
+        # refuse the route (route:unresolved) - clarify, never guess
+        # where an unverified name ends.
+        conn = re.search(r'(?i)\s+(?:to|into)\s+', text)
+        if conn:
+            unsupported.append("route:unresolved")
+            spans.append(conn.span())
+            left = text[:conn.start()]
+            right = text[conn.end():]
+            om = re.search(r'(?i)(' + _KNOWN_CITY_ALT + r')\s*$', left)
+            if om:
+                origin = om.group(1).lower()
+                spans.append(om.span())
+            else:
+                lm = re.search(r'([a-zA-Z][a-zA-Z.-]{1,19})\s*$', left)
+                if lm:
+                    spans.append(lm.span())
+            dm = re.match(r'(?i)(' + _KNOWN_CITY_ALT + r')(?![a-z])', right)
+            if dm:
+                destination = dm.group(1).lower()
+                spans.append((conn.end() + dm.start(),
+                              conn.end() + dm.end()))
+            else:
+                rm = re.match(r'([a-zA-Z][a-zA-Z.-]{1,19})', right)
+                if rm:
+                    spans.append((conn.end() + rm.start(),
+                                  conn.end() + rm.end()))
     departure_text, ret_spans = _mask_return_clauses(text)
     spans += ret_spans
     for rx in (_ISO_DATE_RE, _REL_RE, _NEXT_REL_RE):
         for dm in rx.finditer(departure_text):
             spans.append(dm.span())  # negated spans consumed too
     date, date_state, date_note = _parse_date(departure_text, now_local)
-    unsupported = []
     if date_state in ("invalid", "unsupported", "conflict"):
         if date_note.startswith("alternatives("):
             unsupported.append("date:" + date_note)  # note carries its own ()
@@ -669,6 +693,9 @@ def _flight_reply(norm, when):
     elif any(u.startswith("constraint:") for u in unsupported):
         ask = (" I can't honor part of that request yet - I can only "
                "check route, dates, adults, cabin and one-way/return.")
+    elif "route:unresolved" in unsupported:
+        ask = (" I couldn't verify those city names - tell me the exact "
+               "origin and destination cities.")
     elif "date" in missing:
         ask = " Tell me the departure date and I will check that exact day."
     elif "origin" in missing or "destination" in missing:
