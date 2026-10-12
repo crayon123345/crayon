@@ -106,3 +106,15 @@ def test_test_send_accepts_digits_only_without_plus(client):
     assert r.status_code == 200
     posts = [c for c in _FakeHTTP.calls if c[0] == "POST"]
     assert len(posts) == 1 and posts[0][2]["to"] == "18775556666"
+
+
+def test_test_send_canonicalizes_whitespace(client):
+    for padded in (" +18775556666 ", "18775556666\n", "\t+18775556666", "  18775556666"):
+        _FakeHTTP.calls = []
+        r = client.post("/setup/d360-test-send", json={"to": padded},
+                        headers={"x-admin-token": "admintok"})
+        assert r.status_code == 200, repr(padded)
+        posts = [c for c in _FakeHTTP.calls if c[0] == "POST"]
+        assert len(posts) == 1
+        assert posts[0][2]["to"] in ("+18775556666", "18775556666")
+        assert posts[0][2]["to"] == padded.strip()

@@ -130,10 +130,13 @@ async def d360_test_send(req: Request):
     if not isinstance(body, dict):
         return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
     to = body.get("to", "")
+    if not isinstance(to, str):
+        return JSONResponse({"error": "to must be an E.164-style number string"}, status_code=400)
     # Canonical E.164-style: optional leading '+', first digit 1-9, 8-15
-    # digits total. Value must be a JSON string (no numeric coercion) and is
-    # passed to the provider unchanged.
-    if not isinstance(to, str) or not re.fullmatch(r"\+?[1-9][0-9]{7,14}", to.strip()):
+    # digits total. Surrounding whitespace is stripped and the CANONICAL
+    # value is what is validated and sent to the provider.
+    to = to.strip()
+    if not re.fullmatch(r"\+?[1-9][0-9]{7,14}", to):
         return JSONResponse({"error": "to must be an E.164-style number string"}, status_code=400)
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(BASE + "/v1/messages",
