@@ -1,6 +1,6 @@
 """Deterministic public lookup for explicit search and changing-data requests.
 
-Step A (flight-escalation contract, review-#10 fold): lookup() returns a
+Step A (flight-escalation contract, review-#11 fold): lookup() returns a
 structured LookupResult. The flight request is normalized and RESOLVED
 BEFORE any network attempt: an incomplete or unsupported request is a
 clarification result with NO search/research call, NEVER a generic
@@ -585,6 +585,43 @@ def flight_request(text, now_local=None):
     else:
         cabin = "economy"
     spans += [cm.span() for cm in _NEG_CABIN_RE.finditer(text)]
+    # semantic consistency: a selected value must NOT also be denied
+    denied_cabins = set()
+    for nm in _NEG_CABIN_RE.finditer(text):
+        cm = _CABIN_RE.search(nm.group(0))
+        if cm:
+            denied_cabins.add(cm.group(1).lower())
+    if cabin and cabin in denied_cabins:
+        unsupported.append("cabin:conflict(" + cabin + ")")
+    denied_dates = set()
+    unresolved_date_denial = False
+    for nm in _NEG_ISO_RE.finditer(departure_text):
+        dm = _ISO_DATE_RE.search(nm.group(0))
+        try:
+            denied_dates.add(
+                _date(*map(int, dm.group(0).split('-'))).isoformat())
+        except (ValueError, AttributeError):
+            pass
+    for nm in _NEG_REL_RE.finditer(departure_text):
+        rm = _REL_RE.search(nm.group(0))
+        if not rm:
+            continue
+        if now_local is None:
+            unresolved_date_denial = True
+            continue
+        base = now_local.date()
+        denied_dates.add((base + timedelta(days=1)).isoformat()
+                         if rm.group(1).lower() == "tomorrow"
+                         else base.isoformat())
+    if date and date in denied_dates:
+        unsupported.append("date:conflict(denied-value)")
+    elif date and unresolved_date_denial:
+        # a relative denial we cannot resolve against the same clock -
+        # conservatively refuse rather than risk a denied selection
+        unsupported.append("date:denial-unresolved")
+    if _NEG_RETURN_RE.search(text) and (return_date or roundtrip_word):
+        # 'no return' is incompatible with a positive return selection
+        unsupported.append("trip:conflict(no-return+return)")
     ns_m = _unnegated(_NONSTOP_RE, text)
     nonstop = bool(ns_m)
     if ns_m:
@@ -722,6 +759,8 @@ def _flight_reply(norm, when):
         ask = " You gave more than one departure date - tell me which one to use."
     elif any(u.startswith("date:unsupported") for u in unsupported):
         ask = " I can't resolve that relative date yet - give me an exact date (YYYY-MM-DD) or say today/tomorrow."
+    elif "date:denial-unresolved" in unsupported:
+        ask = " I couldn't resolve which day your negated date rules out - give me the exact departure date."
     elif any(u.startswith("date:return-alternatives") for u in unsupported):
         ask = " You gave more than one return date - tell me which one to use."
     elif any(u.startswith("date:return-unsupported") for u in unsupported):
@@ -741,6 +780,8 @@ def _flight_reply(norm, when):
     elif "passengers:children-infants" in unsupported:
         ask = (" I can't price trips with children or infants yet - "
                "child fares need ages, which this quick check can't handle.")
+    elif any(u.startswith("cabin:conflict") for u in unsupported):
+        ask = " You both asked for and excluded that cabin - tell me which cabin to use."
     elif "cabin:only-negated" in unsupported:
         ask = " Tell me the cabin you do want - economy, premium economy, business or first."
     elif any(u.startswith("time:preference") for u in unsupported):

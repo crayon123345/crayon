@@ -871,3 +871,36 @@ def test_denied_trip_and_pax_are_ineligible_end_to_end(monkeypatch, ask):
 def test_modeled_polarity_positives_stay_complete(ask):
     n = cr_live.flight_request(ask, NOW_LOCAL)
     assert n["missing"] == [] and n["unsupported"] == [], ask
+
+
+# --- review-#11: selected values must not be denied ----------------------
+
+@pytest.mark.parametrize("ask,marker", [
+    ("flight Delhi to Kolkata on 2026-10-20 no return returning 2026-10-25",
+     "trip:conflict(no-return+return)"),
+    ("flight Delhi to Kolkata tomorrow business not business",
+     "cabin:conflict(business)"),
+    ("flight Delhi to Kolkata tomorrow economy no economy",
+     "cabin:conflict(economy)"),
+    ("flight Delhi to Kolkata on 2026-10-20 not 2026-10-20",
+     "date:conflict(denied-value)"),
+    ("flight Delhi to Kolkata tomorrow not tomorrow",
+     "date:conflict(denied-value)"),
+])
+def test_selected_value_matching_a_denial_is_refused(ask, marker):
+    n = cr_live.flight_request(ask, NOW_LOCAL)
+    assert marker in n["unsupported"], ask
+
+
+def test_same_value_conflicts_are_ineligible_end_to_end(monkeypatch):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    r = cr_live.lookup("flight Delhi to Kolkata tomorrow not tomorrow",
+                       NOW_LOCAL)
+    assert r.status == cr_live.STATUS_INSUFFICIENT
+    assert r.escalation_eligible is False
+
+
+def test_unresolvable_relative_denial_refuses_without_clock():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata on 2026-10-20, not tomorrow", None)
+    assert "date:denial-unresolved" in n["unsupported"]
