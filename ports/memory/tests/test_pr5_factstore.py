@@ -2634,9 +2634,13 @@ class V34bHarnessVectors(unittest.TestCase):
         # contradicting the DURABLE owner epoch, and a nested first
         # page with a mismatched op/owner/commit/report_id/inventory
         # owner. Every forged row keeps the report op binding
-        # CONSISTENT with its row id so each refusal is attributable
-        # to the INTENDED field. A fabricated row with NEGATIVE owner/
-        # lifetime ids refuses at the exact-subject policy.
+        # CONSISTENT with its row id AND uses a VALID 32-hex id (an
+        # invalid id would refuse at _req_hex BEFORE the decode/join,
+        # confounding the receipt - fourteenth fold), and an UNCHANGED
+        # rewritten-row POSITIVE CONTROL clears, so each refusal is
+        # attributable to the INTENDED field. A fabricated row with
+        # NEGATIVE owner/lifetime ids refuses at the exact-subject
+        # policy.
         store, req, b, rid, provider, harness, proj, oconn = self._rig()
         json = __import__("json")
         r1, _ = run(store, put_req("9e" * 16, key="w2key"))
@@ -2685,30 +2689,30 @@ class V34bHarnessVectors(unittest.TestCase):
         # outcome+report epoch pair contradicting the DURABLE owner
         # epoch / nested first-page op, owner, commit, report_id, and
         # an inventory-entry owner
-        insert_forged("g9" * 16,
+        insert_forged("10" * 16,
                       lambda o: o["report"].__setitem__(
                           "commit_revision", 999))
-        insert_forged("h7" * 16,
+        insert_forged("11" * 16,
                       lambda o: o["report"].__setitem__("new_epoch",
                                                         999))
 
         def epoch_pair(o):
             o["new_epoch"] = 999
             o["report"]["new_epoch"] = 999
-        insert_forged("j3" * 16, epoch_pair)
-        insert_forged("k9" * 16,
+        insert_forged("12" * 16, epoch_pair)
+        insert_forged("13" * 16,
                       lambda o: o["report"]["first_page"].__setitem__(
                           "operation_id", "d4" * 16))
-        insert_forged("m7" * 16,
+        insert_forged("14" * 16,
                       lambda o: o["report"]["first_page"].__setitem__(
                           "owner", {"uid": 1, "lifetime_id": 2}))
-        insert_forged("n3" * 16,
+        insert_forged("15" * 16,
                       lambda o: o["report"]["first_page"].__setitem__(
                           "commit_revision", 999))
-        insert_forged("p9" * 16,
+        insert_forged("16" * 16,
                       lambda o: o["report"]["first_page"].__setitem__(
                           "report_id", "report:wipe:" + "e3" * 16))
-        insert_forged("q7" * 16,
+        insert_forged("17" * 16,
                       lambda o: o["report"]["first_page"]["ids"]
                       [0].__setitem__("owner",
                                       {"uid": 1, "lifetime_id": 2}))
@@ -2724,11 +2728,19 @@ class V34bHarnessVectors(unittest.TestCase):
             " 'wipe','applied',%s,'full',NULL,%s,1,%s,1,0,1)",
             ("f5" * 16, json.dumps(f5_obj), rev_w, rev_w), "exec")
         for op in ("ab" * 16, "cd" * 16, "e7" * 16, "a9" * 16,
-                   "b1" * 16, "c3" * 16, "f5" * 16, "g9" * 16,
-                   "h7" * 16, "j3" * 16, "k9" * 16, "m7" * 16,
-                   "n3" * 16, "p9" * 16, "q7" * 16):
+                   "b1" * 16, "c3" * 16, "f5" * 16, "10" * 16,
+                   "11" * 16, "12" * 16, "13" * 16, "14" * 16,
+                   "15" * 16, "16" * 16, "17" * 16):
             self.assertIsNone(store.erase_proof(op, "facts-live-zero"),
                               op)
+        # POSITIVE CONTROL (fourteenth fold): an UNCHANGED rewritten
+        # row (only the op id rewritten, every other field genuine)
+        # CLEARS - proving each negative above refuses on the INTENDED
+        # field, not on the rewrite mechanics
+        insert_forged("18" * 16, lambda o: None)
+        control = store.erase_proof("18" * 16, "facts-live-zero")
+        self.assertIsNotNone(control)
+        self.assertEqual(control["operation_id"], "18" * 16)
         # a malformed operation id / unknown coverage refuse on entry
         self.assertIsNone(store.erase_proof("zz", "facts-live-zero"))
         self.assertIsNone(store.erase_proof("0f" * 16, "everything"))

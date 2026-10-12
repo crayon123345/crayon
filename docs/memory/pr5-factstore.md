@@ -159,9 +159,13 @@ Covered by the suite (116 tests):
   == the owner's DURABLE current epoch, and the NESTED first page
   binding the SAME report_id/owner/lifetime/operation/commit with
   every inventory entry carrying the SAME owner - a positive-but-
-  contradictory report REFUSES; the negatives isolate ONE field per
-  probe with a consistent-row control, so each refusal is
-  attributable to the intended field), the decoded outcome
+  contradictory report REFUSES; the committed negatives isolate ONE
+  field per probe - every forged row uses a VALID 32-hex id (an
+  invalid id would refuse at _req_hex BEFORE the join, confounding
+  the receipt; fourteenth fold) and keeps the report op binding
+  consistent with the row id - and a COMMITTED unchanged rewritten-
+  row POSITIVE CONTROL clears, so each refusal is attributable to
+  the intended field), the decoded outcome
   agreeing on method + applied_at_revision, the owner's CURRENT lifetime, the
   FRESH-CURRENT policy (applied_at_revision == the CURRENT store
   revision - the claimed erase must be the LATEST committed op for
