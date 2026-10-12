@@ -260,7 +260,7 @@ def test_real_checker_positive_control_still_guard_blocked(monkeypatch):
     assert r.status == cr_live.STATUS_INSUFFICIENT  # guard, not checker
     assert r.failure_code == cr_live.FAILURE_CONTENT
     assert r.escalation_eligible is True
-    assert "https://example.com/fares" in r.evidence  # fetched+used receipt
+    assert "https://example.com/fares" in r.fetched_pages  # fetched+considered
     assert "https://example.com/fares" in r.search_leads
     assert "IndiGo" not in r.text  # checker-passed claim is NOT a fare quote
 
@@ -430,7 +430,8 @@ def test_agent_no_dispatch_for_unsupported_constraints(monkeypatch):
     reply, meta = A.respond(
         123, 456, "flights Delhi to Kolkata two adults and a child tomorrow")
     assert dispatched == []  # children: clarified, never dispatched
-    assert "adult" in reply
+    assert "children or infants" in reply
+    assert "how many adults" not in reply  # never propose dropping travelers
 
 
 def test_agent_returns_verified_lookup_directly(monkeypatch):
@@ -441,3 +442,123 @@ def test_agent_returns_verified_lookup_directly(monkeypatch):
     reply, meta = A.respond(123, 456, "latest news today")
     assert reply == "NEWS-OK"
     assert dispatched == []  # no escalation for a verified quick result
+
+
+# --- review-#3 narrow vectors ------------------------------------------
+
+def test_return_only_iso_is_never_stolen_as_departure():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata returning 2026-10-25", NOW_LOCAL)
+    assert n["date"] is None and "date" in n["missing"]
+    assert n["return_date"] == "2026-10-25"
+    assert n["unsupported"] == []
+
+
+def test_outbound_relative_plus_return_iso_are_independent():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow returning 2026-10-25", NOW_LOCAL)
+    assert n["date"] == "2026-10-13"  # tomorrow, NOT the return ISO
+    assert n["date_state"] == "resolved"
+    assert n["return_date"] == "2026-10-25"
+    assert n["missing"] == [] and n["unsupported"] == []
+
+
+def test_return_only_ask_clarifies_without_network(monkeypatch):
+    calls = []
+    def boom(*a, **k):
+        calls.append(1)
+        raise RuntimeError("down")
+    monkeypatch.setattr(cr_live.W, "search", boom)
+    r = cr_live.lookup("flight Delhi to Kolkata returning 2026-10-25", NOW_LOCAL)
+    assert calls == []
+    assert r.status == cr_live.STATUS_INSUFFICIENT
+    assert r.failure_code == cr_live.FAILURE_INCOMPLETE
+    assert "departure date" in r.text
+
+
+def test_date_alternatives_are_unsupported_not_first_pick():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata on 2026-10-20 or 2026-10-21", NOW_LOCAL)
+    assert n["date"] is None
+    assert any(u.startswith("date:alternatives") for u in n["unsupported"])
+
+
+def test_party_phrasing_is_unsupported_not_one_adult():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow for me and my wife", NOW_LOCAL)
+    assert "passengers:party-unparsed" in n["unsupported"]
+
+
+def test_conflicting_passenger_counts_are_unsupported():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow 2 adults and 3 adults", NOW_LOCAL)
+    assert any(u.startswith("passengers:conflict") for u in n["unsupported"])
+
+
+def test_time_preference_is_unsupported_not_dropped():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow before 10am", NOW_LOCAL)
+    assert any(u.startswith("time:preference") for u in n["unsupported"])
+
+
+def test_via_routing_is_unsupported_and_not_in_destination():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata via Mumbai tomorrow", NOW_LOCAL)
+    assert n["destination"] == "kolkata"
+    assert any(u.startswith("route:via") for u in n["unsupported"])
+
+
+def test_airline_preference_is_unsupported_not_dropped():
+    n = cr_live.flight_request(
+        "IndiGo flight Delhi to Kolkata tomorrow", NOW_LOCAL)
+    assert "airline:preference" in n["unsupported"]
+
+
+def test_supplied_constraints_make_lookup_ineligible(monkeypatch):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    for ask in ("flight Delhi to Kolkata tomorrow for me and my wife",
+                "flight Delhi to Kolkata tomorrow 2 adults and 3 adults",
+                "flight Delhi to Kolkata tomorrow before 10am",
+                "flight Delhi to Kolkata via Mumbai tomorrow"):
+        r = cr_live.lookup(ask, NOW_LOCAL)
+        assert r.status == cr_live.STATUS_INSUFFICIENT, ask
+        assert r.failure_code == cr_live.FAILURE_UNSUPPORTED, ask
+        assert r.escalation_eligible is False, ask
+
+
+def test_eligibility_requires_exact_typed_flight_shape():
+    # bare kind marker is NOT a dispatchable request
+    with pytest.raises(ValueError):
+        cr_live.LookupResult(cr_live.STATUS_INSUFFICIENT, "t", "now",
+                             cr_live.FAILURE_CONTENT, {"kind": "flight"},
+                             escalation_eligible=True)
+    # a non-flight kind can NEVER be eligible
+    with pytest.raises(ValueError):
+        cr_live.LookupResult(cr_live.STATUS_INSUFFICIENT, "t", "now",
+                             cr_live.FAILURE_CONTENT, {"kind": "weather"},
+                             escalation_eligible=True)
+    # a flight shape with an invalid date string is not dispatchable
+    with pytest.raises(ValueError):
+        cr_live.LookupResult(
+            cr_live.STATUS_INSUFFICIENT, "t", "now", cr_live.FAILURE_CONTENT,
+            {"kind": "flight", "origin": "delhi", "destination": "kolkata",
+             "date": "2026-99-99", "date_state": "resolved",
+             "return_date": None, "passengers": 1, "cabin": "economy",
+             "trip": "oneway", "nonstop": False,
+             "missing": [], "unsupported": []},
+            escalation_eligible=True)
+    # the complete typed shape IS accepted
+    n = cr_live.flight_request(ASK, NOW_LOCAL)
+    r = cr_live.LookupResult(cr_live.STATUS_INSUFFICIENT, "t", "now",
+                             cr_live.FAILURE_CONTENT, n,
+                             escalation_eligible=True)
+    assert r.escalation_eligible is True
+
+
+def test_complete_roundtrip_ask_stays_eligible_on_denial(monkeypatch):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    r = cr_live.lookup(
+        "flight Delhi to Kolkata tomorrow returning 2026-10-25", NOW_LOCAL)
+    assert r.status == cr_live.STATUS_UNAVAILABLE
+    assert r.escalation_eligible is True  # complete+supported denial
+    assert r.normalized["return_date"] == "2026-10-25"
