@@ -1,6 +1,6 @@
 """Deterministic public lookup for explicit search and changing-data requests.
 
-Step A (flight-escalation contract, review-#8 fold): lookup() returns a
+Step A (flight-escalation contract, review-#9 fold): lookup() returns a
 structured LookupResult. The flight request is normalized and RESOLVED
 BEFORE any network attempt: an incomplete or unsupported request is a
 clarification result with NO search/research call, NEVER a generic
@@ -309,6 +309,17 @@ def _negated(text, start):
     return bool(re.search(r'(?i)\b(?:not|no)\s+$', text[:start]))
 
 
+_ROUTE_NEG_RE = re.compile(r'(?i)\b(?:not|no)\s+(?:from\s+)?$')
+
+
+def _route_negated(text, start):
+    """True when the route/origin span at `start` is immediately preceded
+    by a negation (optionally through the from-connector): 'not Delhi to
+    ...' and 'not from Delhi to ...' are DENIED routes, never positive
+    escalation targets."""
+    return bool(_ROUTE_NEG_RE.search(text[:start]))
+
+
 def _unnegated(pattern, text):
     for m in pattern.finditer(text):
         if not _negated(text, m.start()):
@@ -437,7 +448,11 @@ def flight_request(text, now_local=None):
     origin = None
     destination = None
     km = _ROUTE_KNOWN_RE.search(text)
-    if km:
+    if km and _route_negated(text, km.start()):
+        # a DENIED route: consume the span but bind NOTHING - clarify
+        spans.append(km.span())
+        unsupported.append("route:negated")
+    elif km:
         # exact known-city binding: the consumed span ENDS at the city
         spans.append(km.span())
         origin = km.group(1).lower()
@@ -454,7 +469,10 @@ def flight_request(text, now_local=None):
             left = text[:conn.start()]
             right = text[conn.end():]
             om = re.search(r'(?i)(' + _KNOWN_CITY_ALT + r')\s*$', left)
-            if om:
+            if om and _route_negated(text, om.start()):
+                unsupported.append("route:negated")
+                spans.append(om.span())
+            elif om:
                 origin = om.group(1).lower()
                 spans.append(om.span())
             else:
@@ -485,7 +503,12 @@ def flight_request(text, now_local=None):
                                ("(" + date_note + ")" if date_note else ""))
     return_date, returning = _parse_return_date(text, now_local,
                                                 unsupported)
+    oneway_word = bool(re.search(r'(?i)\bone[- ]?way\b', text))
     roundtrip = bool(re.search(r'(?i)\bround[- ]?trip\b', text)) or returning
+    if oneway_word and roundtrip:
+        # contradictory trip words are reconciled by clarification,
+        # never by silently dropping one side
+        unsupported.append("trip:conflict(one-way+roundtrip)")
     if return_date and date and return_date < date:
         unsupported.append("date:return-order(before-departure)")
     pax_all = _PAX_RE.findall(text)
@@ -693,6 +716,11 @@ def _flight_reply(norm, when):
     elif any(u.startswith("constraint:") for u in unsupported):
         ask = (" I can't honor part of that request yet - I can only "
                "check route, dates, adults, cabin and one-way/return.")
+    elif "route:negated" in unsupported:
+        ask = (" You negated the route - tell me the route you do want: "
+               "the exact origin and destination cities.")
+    elif any(u.startswith("trip:conflict") for u in unsupported):
+        ask = " You said both one-way and round-trip - tell me which."
     elif "route:unresolved" in unsupported:
         ask = (" I couldn't verify those city names - tell me the exact "
                "origin and destination cities.")

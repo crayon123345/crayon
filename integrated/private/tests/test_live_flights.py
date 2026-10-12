@@ -775,3 +775,47 @@ def test_known_route_positives_stay_complete(ask, route):
     n = cr_live.flight_request(ask, NOW_LOCAL)
     assert (n["origin"], n["destination"]) == route
     assert n["missing"] == [] and n["unsupported"] == []
+
+
+# --- review-#9: route polarity + trip-word reconciliation ---------------
+
+@pytest.mark.parametrize("ask", [
+    "flight not Delhi to Kolkata tomorrow",
+    "flight not from Delhi to Kolkata tomorrow",
+])
+def test_negated_route_is_refused_not_bound(ask):
+    n = cr_live.flight_request(ask, NOW_LOCAL)
+    assert n["origin"] is None and n["destination"] is None
+    assert "route:negated" in n["unsupported"]
+    assert n["missing"] == ["origin", "destination"]
+
+
+def test_negated_route_is_ineligible_end_to_end(monkeypatch):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    r = cr_live.lookup("flight not Delhi to Kolkata tomorrow", NOW_LOCAL)
+    assert r.status == cr_live.STATUS_INSUFFICIENT
+    assert r.escalation_eligible is False
+    assert "route you do want" in r.text
+
+
+def test_contradictory_trip_words_clarify():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow one way round trip returning 2026-10-25",
+        NOW_LOCAL)
+    assert any(u.startswith("trip:conflict") for u in n["unsupported"])
+
+
+def test_trip_conflict_is_ineligible_end_to_end(monkeypatch):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    r = cr_live.lookup(
+        "flight Delhi to Kolkata tomorrow one way round trip returning 2026-10-25",
+        NOW_LOCAL)
+    assert r.status == cr_live.STATUS_INSUFFICIENT
+    assert r.escalation_eligible is False
+
+
+def test_oneway_word_positive_stays_complete():
+    n = cr_live.flight_request("one-way flight Delhi to Kolkata tomorrow",
+                               NOW_LOCAL)
+    assert n["trip"] == "oneway"
+    assert n["missing"] == [] and n["unsupported"] == []
