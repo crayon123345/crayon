@@ -96,6 +96,7 @@ class _FakeDB:
    s.store[key]=val;return None
   if sql.startswith('UPDATE kv SET value'):
    new=json.loads(p[0]);key=p[1];old=json.loads(p[2])
+   if 'AND (SELECT' in sql and s.store.get(p[3])!=json.loads(p[4]):return None
    if s.store.get(key)!=old:return None
    s.store[key]=new;return {'value':new}
   if sql.startswith('DELETE FROM kv WHERE key=%s AND value'):
@@ -468,3 +469,32 @@ def test_concurrent_other_connector_race_during_remove():
   c=db.store['mcp_connectors_1']
   assert 'github' not in c and 'notes' in c  # retry re-read preserved the concurrent entry
   assert state['raced'] is True
+
+def test_old_remove_cas_retry_superseded_by_new_generation():
+ # Peer's exact interleave: A's first connector UPDATE loses; B completes
+ # a full remove; C re-adds at gen4; A's RETRY must see its gen2 fence is
+ # gone and stop - never remove C's gen4 entry, never orphan the credential.
+ db=_FakeDB();_keyed_store(db)
+ db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
+ state={'raced':False}
+ orig=db.q
+ def hook(sql,p=(),f=None):
+  if sql.startswith('UPDATE kv SET value') and p[1]=='mcp_connectors_1' and not state['raced']:
+   state['raced']=True
+   U.remove(1,'github')      # B: fence gen 2->3, entry removed, old cred deleted
+   U.add_keyed(1,'github',True)  # C: claims gen 4, credential + publish succeed
+   return None               # A's CAS loses
+  return orig(sql,p,f)
+ db.q=hook
+ with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session',return_value={'tools':[{'name':'get_repo','inputSchema':{'type':'object','properties':{'repo':{'type':'string'}},'required':['repo']}}]}),_enter(*(db.patches()+_crypto())):
+  r=U.remove(1,'github')
+  assert r=={'removed':True,'superseded':True}  # reported no-op per linearization
+  assert 'github' in db.store['mcp_connectors_1']  # C's gen4 entry NOT removed by A's retry
+  cred=db.store['mcp_cred_1_github']['wrapped']
+  assert cred['gen']==4 and cred['token']==_TOK  # no orphaned credential
+  assert db.store['mcp_gen_1_github']=={'gen':4}
+  r=U.prepare(1,'github','get_repo',{'repo':'a/b'})  # gen4 positive: prepare works
+  assert 'revision 1, generation 4' in r['text']
+  with patch.object(U.db,'q',return_value={'value':_review(gen=4,rev=1)}),patch.object(U,'session',return_value={'content':[{'text':'ok'}],'ok':True}) as network:
+   out=U.confirm(1,'id','confirm')  # gen4 call positive
+   assert 'ok' in out['text']

@@ -322,13 +322,18 @@ def remove(uid,name):
         fence={'gen':g.get('gen',0)+1}
         row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(fence),gk,json.dumps(g)),'one')
         if not row:raise ValueError('Connector state changed - retry.')
+    # EVERY entry-removal attempt (including retries) is conditional on the
+    # connector row we read AND on OUR fence still holding. If the fence
+    # moved, a newer lifecycle operation owns this connector: this remove
+    # is superseded - it touches nothing further and reports no-op.
     cc='mcp_connectors_'+str(uid)
     for _ in range(3):
         old=connectors(uid)
         if name not in old:break
         new=dict(old);new.pop(name)
-        row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(new),cc,json.dumps(old)),'one')
+        row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb AND (SELECT value FROM kv WHERE key=%s)=%s::jsonb RETURNING value",(json.dumps(new),cc,json.dumps(old),gk,json.dumps(fence)),'one')
         if row:break
+        if (db.kv_get(gk) or {})!=fence:return {'removed':True,'superseded':True}
     else:
         raise ValueError('Connector state changed - retry.')
     fj=json.dumps(fence)
