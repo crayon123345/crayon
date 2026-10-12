@@ -55,12 +55,41 @@ def test_success_stores_secret_and_pops_setup_token(client, monkeypatch):
 
 
 def test_neon_rejection_leaves_no_partial_mutation(client, monkeypatch):
+    import sys, types
     c, calls = client
     monkeypatch.setenv("SETUP_TOKEN", "setuptok")  # restore after prior pop (fixture order)
-    bad_url = "postgresql://u:p@invalid-host-example.internal:5432/db"  # matches ALLOWED regex, unconnectable
+    # Offline: psycopg.connect is mocked to fail, no network involved.
+    def _boom(*a, **k):
+        raise OSError("mocked: connection refused")
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=_boom))
+    bad_url = "postgresql://u:p@db.example.com:5432/db"  # matches ALLOWED regex
     r = _post(c, n="NEON_DATABASE_URL", k=bad_url)
     assert r.status_code == 400
-    # no _init / DELETE / INSERT ran, env not mutated, setup token still active
+    # no _init / upsert ran, env not mutated, setup token still active
     assert calls == []
     assert "NEON_DATABASE_URL" not in os.environ
     assert os.environ.get("SETUP_TOKEN") == "setuptok"
+
+
+def test_store_is_single_atomic_upsert(client, monkeypatch):
+    """An upsert failure must not lose the OLD secret: no separate DELETE."""
+    c, calls = client
+
+    def flaky_db(sql, args=(), fetch=False):
+        calls.append((sql, args))
+        if "ON CONFLICT" in sql:
+            raise RuntimeError("mocked: write failed")
+
+    monkeypatch.setattr(gmail_auth, "db", flaky_db)
+    with pytest.raises(RuntimeError):
+        _post(c)
+    assert not any("DELETE FROM cw_secrets" in s for s, _ in calls)
+    writes = [s for s, _ in calls if "INSERT INTO cw_secrets" in s]
+    assert len(writes) == 1  # exactly one write statement, atomic by itself
+
+
+def test_unicode_setup_token_fails_closed_not_500(client):
+    c, calls = client
+    r = _post(c, t="sétuptok-ü")
+    assert r.status_code == 403
+    assert calls == []

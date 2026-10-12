@@ -60,7 +60,9 @@ async def save(req: Request):
         t, k, nm = str(b.get("t", "")), str(b.get("k", "")).strip(), str(b.get("n", "OPENROUTER_API_KEY"))
     except Exception:
         return JSONResponse({"error": "bad"}, status_code=400)
-    if not hmac.compare_digest(t, tok) or nm not in ALLOWED or not ALLOWED[nm].match(k):
+    # compare_digest on str raises TypeError for non-ASCII; compare as UTF-8
+    # bytes so a unicode setup-token guess fails closed (403), never 500.
+    if not hmac.compare_digest(t.encode("utf-8"), tok.encode("utf-8")) or nm not in ALLOWED or not ALLOWED[nm].match(k):
         return JSONResponse({"error": "no"}, status_code=403)
     if nm == "NEON_DATABASE_URL":
         # Validate BEFORE any mutation: a rejected repoint must not leave the
@@ -73,8 +75,11 @@ async def save(req: Request):
             return JSONResponse({"error": "Could not connect to that Postgres URL."}, status_code=400)
     _init()
     enc = gmail_auth._fernet().encrypt(k.encode()).decode()
-    gmail_auth.db("DELETE FROM cw_secrets WHERE name=%s", (nm,))
-    gmail_auth.db("INSERT INTO cw_secrets (name, val) VALUES (%s, %s)", (nm, enc))
+    # One atomic upsert (single commit in gmail_auth.db): the old DELETE+INSERT
+    # pair committed separately, so an INSERT failure after DELETE lost the OLD
+    # secret. ON CONFLICT works on both Postgres and SQLite (name is the PK).
+    gmail_auth.db("INSERT INTO cw_secrets (name, val) VALUES (%s, %s) "
+                  "ON CONFLICT (name) DO UPDATE SET val=EXCLUDED.val", (nm, enc))
     os.environ[nm] = k
     if nm == "NEON_DATABASE_URL":
         gmail_auth._DB = k
