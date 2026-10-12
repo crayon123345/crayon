@@ -51,7 +51,8 @@ def page():
 @router.post("/setup/key")
 async def save(req: Request):
     tok = os.environ.get("SETUP_TOKEN", "")
-    if not tok or _tries["n"] > 20 or req.headers.get("x-requested-with") != "crayon":
+    # Cap is 20 attempts: check before incrementing admitted 21 (n=0..20).
+    if not tok or _tries["n"] >= 20 or req.headers.get("x-requested-with") != "crayon":
         return JSONResponse({"error": "no"}, status_code=403)
     _tries["n"] += 1
     try:
@@ -61,21 +62,24 @@ async def save(req: Request):
         return JSONResponse({"error": "bad"}, status_code=400)
     if not hmac.compare_digest(t, tok) or nm not in ALLOWED or not ALLOWED[nm].match(k):
         return JSONResponse({"error": "no"}, status_code=403)
+    if nm == "NEON_DATABASE_URL":
+        # Validate BEFORE any mutation: a rejected repoint must not leave the
+        # new URL stored in cw_secrets / os.environ (partial-mutation fix).
+        try:
+            import psycopg
+            psycopg.connect(k, connect_timeout=8).close()
+        except Exception as e:
+            print("neon repoint rejected:", type(e).__name__)
+            return JSONResponse({"error": "Could not connect to that Postgres URL."}, status_code=400)
     _init()
     enc = gmail_auth._fernet().encrypt(k.encode()).decode()
     gmail_auth.db("DELETE FROM cw_secrets WHERE name=%s", (nm,))
     gmail_auth.db("INSERT INTO cw_secrets (name, val) VALUES (%s, %s)", (nm, enc))
     os.environ[nm] = k
     if nm == "NEON_DATABASE_URL":
-        try:
-            import psycopg
-            psycopg.connect(k, connect_timeout=8).close()
-            gmail_auth._DB = k
-            gmail_auth._ready = False
-            gmail_auth.migrate_if_needed()
-        except Exception as e:
-            print("neon repoint rejected:", type(e).__name__)
-            return JSONResponse({"error": "Could not connect to that Postgres URL."}, status_code=400)
+        gmail_auth._DB = k
+        gmail_auth._ready = False
+        gmail_auth.migrate_if_needed()
     if nm == "TELEGRAM_BOT_TOKEN":
         try:
             import telegram_bot
