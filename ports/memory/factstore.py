@@ -4770,9 +4770,21 @@ class FactStore:
             positive ints (a forged/negative id REFUSES);
           - ERASE CLASS: method == 'wipe' AND result_code == 'applied'
             (an earlier PUT or a refused/no-op wipe is NOT an erase);
-          - KNOWN DECODED OUTCOME: outcome_json decodes and its
-            method == 'wipe' AND its applied_at_revision == the row's
-            (a fabricated or mismatched outcome REFUSES);
+          - TYPED DECODE (twelfth fold): the stored variant is
+            decoded through the ACTUAL _decode_stored_outcome rule -
+            the outcome_kind flag must AGREE with the scrubbed column
+            and the typed OperationOutcome union invariants must hold
+            (wipe-applied requires a WipeReport, new_epoch, and the
+            closed result set). The decoded outcome must JOIN the row:
+            method WIPE, result 'applied', applied_at_revision == the
+            row's; the report must bind the SAME owner/lifetime/
+            operation and its unknown_coverage may carry ONLY the
+            DECLARED provider_side class (the local coverage is
+            CLOSED; provider-side derivation is the model's declared
+            unknown - any OTHER unknown class REFUSES). A missing/contradictory/incoherent stored
+            outcome, an 'unknown' kind flag, a kind/scrubbed
+            disagreement, or a report-shape violation REFUSES -
+            json.loads agreement alone is NOT proof;
           - CURRENT LIFETIME: the row's lifetime_id == the owner's
             CURRENT lifetime_state row;
           - FRESH-CURRENT (finding D): the row's applied_at_revision
@@ -4802,7 +4814,8 @@ class FactStore:
             conn.execute("BEGIN")
             rows = self._q.q(
                 "SELECT uid, lifetime_id, method, result_code,"
-                " applied_at_revision, outcome_json FROM"
+                " applied_at_revision, outcome_json, outcome_kind,"
+                " scrubbed FROM"
                 " operation_records WHERE operation_id=%s",
                 (operation_id,), "all")
             if rows is None or len(rows) != 1:
@@ -4821,13 +4834,25 @@ class FactStore:
                 conn.execute("ROLLBACK")
                 return None
             try:
-                decoded = json.loads(row["outcome_json"])
+                decoded = _decode_stored_outcome({
+                    "outcome_kind": row["outcome_kind"],
+                    "scrubbed": row["scrubbed"],
+                    "outcome_json": row["outcome_json"]})
             except Exception:
                 conn.execute("ROLLBACK")
-                return None
-            if not isinstance(decoded, dict) \
-                    or decoded.get("method") != "wipe" \
-                    or decoded.get("applied_at_revision") != rev:
+                return None  # an INCOHERENT durable outcome = NO step
+            if type(decoded) is not OperationOutcome \
+                    or decoded.method is not MethodCode.WIPE \
+                    or decoded.result_code != "applied" \
+                    or decoded.applied_at_revision != rev \
+                    or type(decoded.new_epoch) is not int \
+                    or decoded.new_epoch < 1 \
+                    or type(decoded.report) is not WipeReport \
+                    or decoded.report.operation_id != operation_id \
+                    or decoded.report.owner.uid != uid \
+                    or decoded.report.owner.lifetime_id != lid \
+                    or any(c is not UnknownCoverage.PROVIDER_SIDE
+                           for c in decoded.report.unknown_coverage):
                 conn.execute("ROLLBACK")
                 return None
             cur = self._q.q(

@@ -27,7 +27,7 @@ cd ports/memory
 python3 -m unittest tests.test_pr5_factstore
 ```
 
-Expected: 115 tests, OK (~60-66s; file-backed exclusive-fixture DBs). No pytest dependency; stdlib unittest.
+Expected: 116 tests, OK (~60-66s; file-backed exclusive-fixture DBs). No pytest dependency; stdlib unittest.
 
 ## Shape
 
@@ -59,7 +59,7 @@ Expected: 115 tests, OK (~60-66s; file-backed exclusive-fixture DBs). No pytest 
 
 ## Test-vector coverage (honest)
 
-Covered by the suite (115 tests):
+Covered by the suite (116 tests):
 
 - V01-V10 put/supersede classification incl. normalization collision,
   oversize and string rejections, N-to-1, duplicate old_fids, non-target
@@ -146,8 +146,15 @@ Covered by the suite (115 tests):
   SOURCE-OWNED FactStore.erase_proof route. erase_proof verifies the
   EXACT committed erase identity under ONE coherent receiver read
   snapshot: exactly one operation row with strict positive ids, WIPE
-  method + 'applied', the KNOWN decoded outcome agreeing on method +
-  applied_at_revision, the owner's CURRENT lifetime, the
+  method + 'applied', a TYPED DECODE through the ACTUAL
+  _decode_stored_outcome rule (twelfth fold: outcome_json +
+  outcome_kind + scrubbed decoded by the SAME rule _write path
+  decodes - a durable missing/contradictory result, a union-
+  impossible 'refused', an 'unknown'/scrubbed kind-flag mismatch, a
+  dropped/mismatched wipe report (owner/lifetime/operation), and any
+  unknown class beyond the DECLARED provider_side one all REFUSE;
+  json.loads agreement alone is NOT proof), the decoded outcome
+  agreeing on method + applied_at_revision, the owner's CURRENT lifetime, the
   FRESH-CURRENT policy (applied_at_revision == the CURRENT store
   revision - the claimed erase must be the LATEST committed op for
   the owner subject; historical revision-owned coverage is UNPROVABLE

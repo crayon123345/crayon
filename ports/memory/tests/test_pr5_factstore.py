@@ -2381,7 +2381,7 @@ class V34bHarnessVectors(unittest.TestCase):
                 return self._raw is not None
 
         def rig_erased():
-            # known PUT commit -> delivered commit -> KNOWN WIPE erase
+            # twelfth fold: known PUT commit -> delivered commit -> KNOWN WIPE erase
             # at fresh revision R' with the live row gone
             store, req, b, rid, provider, harness, proj, oconn = \
                 self._rig()
@@ -2620,37 +2620,102 @@ class V34bHarnessVectors(unittest.TestCase):
         with self.assertRaises(f.HarnessRefusedError):
             harness.register_erase_readback(f.OwnedEraseReadback(store))
 
-        # (B) FORGED DURABLE ROWS via the SOURCE-OWNED route: a
-        # fabricated wipe row at rev 999 (decoded outcome agreeing)
-        # REFUSES (not the current revision); a fabricated row with
-        # NEGATIVE owner/lifetime ids REFUSES (exact-subject policy)
+        # (B) DURABLE DECODE NEGATIVES (twelfth fold): erase_proof
+        # decodes through the ACTUAL _decode_stored_outcome rule - a
+        # MISSING result, a union-impossible result ('refused' on a
+        # wipe), an 'unknown' kind flag, a kind/scrubbed flag
+        # disagreement, a DROPPED report, and a report carrying ANY
+        # unknown class beyond the DECLARED provider_side one all
+        # refuse even on a genuine-shaped tampered row; json.loads
+        # agreement alone is NOT proof. A fabricated row with NEGATIVE
+        # owner/lifetime ids refuses at the exact-subject policy.
         store, req, b, rid, provider, harness, proj, oconn = self._rig()
-        store._q.q(
-            "INSERT INTO operation_records(uid, lifetime_id,"
-            " operation_id, binding_hash, marker, method, result_code,"
-            " outcome_json, outcome_kind, proof_json,"
-            " applied_at_revision, epoch, store_revision, fence,"
-            " scrubbed, scrub_revision) VALUES(1,1,%s,'x',NULL,"
-            "'wipe','applied',"
-            "'{\"method\":\"wipe\",\"applied_at_revision\":999}'," 
-            "'full',NULL,999,1,999,1,0,1)", ("ab" * 16,), "exec")
-        self.assertIsNone(store.erase_proof("ab" * 16,
-                                            "facts-live-zero"))
+        json = __import__("json")
+        r1, _ = run(store, put_req("9e" * 16, key="w2key"))
+        self.assertEqual(r1.result.outcome.result_code, "applied")
+        rw, _ = run(store, wipe_req("0f" * 16))
+        self.assertEqual(rw.result.outcome.result_code, "applied")
+        rev_w = store._store_revision(1)
+        good_json = store._q.q(
+            "SELECT outcome_json FROM operation_records WHERE"
+            " operation_id=%s", ("0f" * 16,), "one")["outcome_json"]
+        good = json.loads(good_json)
+
+        def insert_forged(op, mut, kind="full", scrubbed=0):
+            obj = json.loads(good_json)
+            mut(obj)
+            store._q.q(
+                "INSERT INTO operation_records(uid, lifetime_id,"
+                " operation_id, binding_hash, marker, method,"
+                " result_code, outcome_json, outcome_kind, proof_json,"
+                " applied_at_revision, epoch, store_revision, fence,"
+                " scrubbed, scrub_revision) VALUES(1,1,%s,'x',NULL,"
+                " 'wipe','applied',%s,%s,NULL,%s,1,%s,1,%s,1)",
+                (op, json.dumps(obj), kind, rev_w, rev_w, scrubbed),
+                "exec")
+
+        insert_forged("ab" * 16, lambda o: o.pop("result_code"))
+        insert_forged("cd" * 16,
+                      lambda o: o.__setitem__("result_code", "refused"))
+        insert_forged("e7" * 16, lambda o: None, kind="unknown")
+        insert_forged("a9" * 16, lambda o: None, scrubbed=1)
+        insert_forged("b1" * 16, lambda o: o.pop("report"))
+        insert_forged(
+            "c3" * 16,
+            lambda o: o["report"]["unknown_coverage"].append(
+                "unaudited_external_copy"))
         store._q.q(
             "INSERT INTO operation_records(uid, lifetime_id,"
             " operation_id, binding_hash, marker, method, result_code,"
             " outcome_json, outcome_kind, proof_json,"
             " applied_at_revision, epoch, store_revision, fence,"
             " scrubbed, scrub_revision) VALUES(-99,-99,%s,'x',NULL,"
-            "'wipe','applied',"
-            "'{\"method\":\"wipe\",\"applied_at_revision\":1}'," 
-            "'full',NULL,1,1,1,1,0,1)",
-            ("cd" * 16,), "exec")
-        self.assertIsNone(store.erase_proof("cd" * 16,
-                                            "facts-live-zero"))
+            " 'wipe','applied',%s,'full',NULL,%s,1,%s,1,0,1)",
+            ("f5" * 16, good_json, rev_w, rev_w), "exec")
+        for op in ("ab" * 16, "cd" * 16, "e7" * 16, "a9" * 16,
+                   "b1" * 16, "c3" * 16, "f5" * 16):
+            self.assertIsNone(store.erase_proof(op, "facts-live-zero"),
+                              op)
         # a malformed operation id / unknown coverage refuse on entry
         self.assertIsNone(store.erase_proof("zz", "facts-live-zero"))
-        self.assertIsNone(store.erase_proof("ab" * 16, "everything"))
+        self.assertIsNone(store.erase_proof("0f" * 16, "everything"))
+
+        # END-TO-END (the peer's probe): with the OWNED adapter
+        # registered, tamper the GENUINE row (result_code dropped) ->
+        # scrub REFUSES with NOTHING recorded; restore the genuine
+        # outcome -> scrub CLEARS and logs the owned tuple
+        comp = harness.compose({"projection": proj, "recovery_id": rid})
+        harness.send(comp.token)
+        d = provider.deliver({"projection": proj, "token": comp.token})
+        self.assertEqual(harness.ack(d["ack"]).kind, "delivered")
+        harness.register_erase_readback(f.OwnedEraseReadback(store))
+        tampered = dict(good)
+        tampered.pop("result_code")
+        store._q.q(
+            "UPDATE operation_records SET outcome_json=%s WHERE"
+            " operation_id=%s", (json.dumps(tampered), "0f" * 16),
+            "exec")
+        with self.assertRaises(f.HarnessRefusedError):
+            harness.scrub(comp.token, {
+                "raw_ref_handle": _Ok(), "comparison_buffer": _Ok()},
+                erase={"operation_id": "0f" * 16,
+                       "coverage_id": "facts-live-zero"})
+        self.assertEqual(oconn.execute(
+            "SELECT count(*) FROM scrub_log").fetchone()[0], 0)
+        store._q.q(
+            "UPDATE operation_records SET outcome_json=%s WHERE"
+            " operation_id=%s", (good_json, "0f" * 16), "exec")
+        out = harness.scrub(comp.token, {
+            "raw_ref_handle": _Ok(), "comparison_buffer": _Ok()},
+            erase={"operation_id": "0f" * 16,
+                   "coverage_id": "facts-live-zero"})
+        self.assertEqual(out["kind"], "cleared")
+        row = oconn.execute(
+            "SELECT step_id, revision, verified_at_revision FROM"
+            " scrub_log WHERE token=?", (comp.token,)).fetchone()
+        self.assertEqual(tuple(row), (
+            "erase:1:1:%s:facts-live-zero:%d" % ("0f" * 16, rev_w),
+            rev_w, rev_w))
 
         # (D) FRESH-CURRENT - the peer's exact probe: wipe 0f at R2 /
         # new PUT at R3 / new wipe 1f at R4. The OLD 0f claim REFUSES
