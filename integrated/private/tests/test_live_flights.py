@@ -130,10 +130,11 @@ def test_only_negated_cabin_is_unsupported_not_defaulted():
     assert "cabin:only-negated" in n["unsupported"]
 
 
-def test_negated_nonstop_stays_false():
+def test_negated_nonstop_is_a_refused_exclusion():
     n = cr_live.flight_request(
         "flight Delhi to Kolkata tomorrow not nonstop", NOW_LOCAL)
     assert n["nonstop"] is False
+    assert "nonstop:negated-exclusion" in n["unsupported"]  # hard exclusion refused
 
 
 def test_explicit_return_date_parsed():
@@ -671,3 +672,65 @@ def test_residual_refusal_is_ineligible_end_to_end(monkeypatch):
     assert r.failure_code == cr_live.FAILURE_UNSUPPORTED
     assert r.escalation_eligible is False
     assert "I can't honor part of that request" in r.text
+
+
+# --- review-#6: span boundary + cardinality -----------------------------
+
+@pytest.mark.parametrize("mid", [
+    "wheelchair assistance",
+    "with checked bags",
+    "cheaper fares",
+])
+def test_constraint_between_destination_and_date_is_residual(mid):
+    """A known city binds EXACTLY: a trailing requirement after the
+    destination is NEVER absorbed into the route span."""
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata %s tomorrow" % mid, NOW_LOCAL)
+    assert n["destination"] == "kolkata"
+    assert any(u.startswith("constraint:unparsed") for u in n["unsupported"]), mid
+
+
+def test_multiple_route_mentions_are_residual():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata and Mumbai to Delhi tomorrow", NOW_LOCAL)
+    assert (n["origin"], n["destination"]) == ("delhi", "kolkata")
+    assert any(u.startswith("constraint:unparsed") for u in n["unsupported"])
+
+
+def test_alternative_return_dates_are_unsupported_not_first():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow returning 2026-10-25 or returning 2026-10-26",
+        NOW_LOCAL)
+    assert n["return_date"] is None
+    assert any(u.startswith("date:return-alternatives") for u in n["unsupported"])
+
+
+def test_mixed_return_clauses_are_alternatives():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow returning tomorrow or returning 2026-10-26",
+        NOW_LOCAL)
+    assert any(u.startswith("date:return-alternatives") for u in n["unsupported"])
+
+
+def test_relative_departure_alternatives_are_unsupported():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata today or tomorrow", NOW_LOCAL)
+    assert n["date"] is None
+    assert any("alternatives-relative" in u for u in n["unsupported"])
+
+
+def test_negated_return_means_oneway_not_missing():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata on 2026-10-20, no return", NOW_LOCAL)
+    assert n["trip"] == "oneway"
+    assert "return_date" not in n["missing"] and n["missing"] == []
+
+
+def test_cardinality_refusals_are_ineligible_end_to_end(monkeypatch):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    for ask in ("flight Delhi to Kolkata tomorrow returning 2026-10-25 or returning 2026-10-26",
+                "flight Delhi to Kolkata today or tomorrow",
+                "flight Delhi to Kolkata wheelchair assistance tomorrow"):
+        r = cr_live.lookup(ask, NOW_LOCAL)
+        assert r.status == cr_live.STATUS_INSUFFICIENT, ask
+        assert r.escalation_eligible is False, ask

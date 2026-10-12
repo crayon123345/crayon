@@ -1,6 +1,6 @@
 """Deterministic public lookup for explicit search and changing-data requests.
 
-Step A (flight-escalation contract, review-#5 fold): lookup() returns a
+Step A (flight-escalation contract, review-#6 fold): lookup() returns a
 structured LookupResult. The flight request is normalized and RESOLVED
 BEFORE any network attempt: an incomplete or unsupported request is a
 clarification result with NO search/research call, NEVER a generic
@@ -270,6 +270,16 @@ _IATA = {
     "ahmedabad": "AMD", "jaipur": "JAI", "lucknow": "LKO",
 }
 
+# Known cities bind EXACTLY (longest alias first): a matched route span
+# ends at the city boundary, so a trailing requirement after a known city
+# is NEVER absorbed into the destination (the residual guard sees it).
+_KNOWN_CITY_ALT = "|".join(
+    re.escape(c) for c in sorted(_IATA, key=len, reverse=True))
+_ROUTE_KNOWN_RE = re.compile(
+    r'(?i)(?<![a-z])(' + _KNOWN_CITY_ALT + r')\s+(?:to|into)\s+(' +
+    _KNOWN_CITY_ALT + r')(?![a-z])')
+_NEG_RETURN_RE = re.compile(r'(?i)\b(?:not|no)\s+return(?:ing)?\b')
+
 _STOP_ORIGIN = re.compile(
     r'(?i)^(?:cheapest|cheap|find|book|search|show|get|flight|flights|fare|'
     r'fares|airfare|airfares|latest|news|tickets?|please|me|a|an|the|'
@@ -332,50 +342,74 @@ def _parse_date(text, now_local):
             return None, "invalid", m.group(0)
         if d not in dates:
             dates.append(d)
-    rel = _unnegated(_REL_RE, text)
+    rels = [m for m in _REL_RE.finditer(text)
+            if not _negated(text, m.start())]
     if len(dates) > 1:
         return None, "unsupported", "alternatives(" + "|".join(
             d.isoformat() for d in dates) + ")"
     if dates:
-        if rel:
+        if rels:
             return dates[0].isoformat(), "conflict", "explicit-vs-relative"
         return dates[0].isoformat(), "resolved", ""
+    if len(rels) > 1:
+        # EVERY semantic span is counted: two relative departure words -
+        # even the same one twice - are alternatives, never first-wins
+        return None, "unsupported", "alternatives-relative(" + "|".join(
+            sorted({m.group(1).lower() for m in rels})) + ")"
     if _NEXT_REL_RE.search(text):
         return None, "unsupported", "next-relative"
-    if rel:
+    if rels:
         if now_local is None:
             return None, "needs_clock", "relative-without-clock"
         base = now_local.date()
         return ((base + timedelta(days=1)).isoformat()
-                if rel.group(1).lower() == "tomorrow"
+                if rels[0].group(1).lower() == "tomorrow"
                 else base.isoformat()), "resolved", ""
     return None, "absent", ""
 
 
 def _parse_return_date(text, now_local, unsupported):
-    """Return (return_date_or_None, returning). An explicit return date is
-    calendar-validated; 'returning next Friday' is unsupported; 'returning
-    tomorrow' resolves from the caller clock; a bare round-trip/return ask
-    with no date leaves return_date MISSING (clarified, never dropped)."""
-    m = _RETURN_ISO_RE.search(text)
-    if m and not _negated(text, m.start()):
-        try:
-            return _date(*map(int, m.group(1).split('-'))).isoformat(), True
-        except ValueError:
-            unsupported.append("date:return-invalid(" + m.group(1) + ")")
-            return None, True
-    if _RETURN_NEXT_RE.search(text):
-        unsupported.append("date:return-unsupported(next-relative)")
+    """Return (return_date_or_None, returning). EVERY return clause is
+    counted: two or more non-negated return clauses (any mix of ISO,
+    next-relative, today/tomorrow) are alternatives, NEVER first-wins.
+    A single explicit return date is calendar-validated; 'returning next
+    Friday' is unsupported; 'returning tomorrow' resolves from the caller
+    clock; a bare UNNEGATED round-trip/return ask with no date leaves
+    return_date MISSING. A NEGATED return ('no return') means one-way -
+    it does NOT create a missing return date."""
+    clauses = []
+    for rx, kind in ((_RETURN_ISO_RE, "iso"), (_RETURN_NEXT_RE, "next"),
+                     (_RETURN_REL_RE, "rel")):
+        for m in rx.finditer(text):
+            if not _negated(text, m.start()):
+                clauses.append((m.start(), kind, m))
+    clauses.sort(key=lambda c: c[0])
+    if len(clauses) > 1:
+        unsupported.append("date:return-alternatives(" +
+                           str(len(clauses)) + " clauses)")
         return None, True
-    rm = _RETURN_REL_RE.search(text)
-    if rm and not _negated(text, rm.start()):
+    if clauses:
+        _, kind, m = clauses[0]
+        if kind == "iso":
+            try:
+                return _date(*map(int, m.group(1).split('-'))).isoformat(), True
+            except ValueError:
+                unsupported.append("date:return-invalid(" + m.group(1) + ")")
+                return None, True
+        if kind == "next":
+            unsupported.append("date:return-unsupported(next-relative)")
+            return None, True
         if now_local is None:
             return None, True  # missing (needs clock)
         base = now_local.date()
         return ((base + timedelta(days=1)).isoformat()
-                if rm.group(1).lower() == "tomorrow"
+                if m.group(1).lower() == "tomorrow"
                 else base.isoformat()), True
-    return None, bool(re.search(r'(?i)\breturn(?:ing)?\b', text))
+    # no dated return clause: a NEGATED return word means one-way
+    for bm in _BARE_RETURN_RE.finditer(text):
+        if not _negated(text, bm.start()):
+            return None, True
+    return None, False
 
 
 def flight_request(text, now_local=None):
@@ -392,11 +426,19 @@ def flight_request(text, now_local=None):
     if not _FLIGHT_WORD.search(text):
         return None
     spans = []
-    m = _ROUTE_RE.search(text) or _BARE_ROUTE_RE.search(text)
-    if m:
-        spans.append(m.span())
-    origin = _city(m.group(1)) if m else None
-    destination = _city(m.group(2)) if m else None
+    km = _ROUTE_KNOWN_RE.search(text)
+    if km:
+        # exact known-city binding: the consumed span ENDS at the city
+        spans.append(km.span())
+        origin = km.group(1).lower()
+        destination = km.group(2).lower()
+        m = None
+    else:
+        m = _ROUTE_RE.search(text) or _BARE_ROUTE_RE.search(text)
+        if m:
+            spans.append(m.span())
+        origin = _city(m.group(1)) if m else None
+        destination = _city(m.group(2)) if m else None
     departure_text, ret_spans = _mask_return_clauses(text)
     spans += ret_spans
     for rx in (_ISO_DATE_RE, _REL_RE, _NEXT_REL_RE):
@@ -457,7 +499,12 @@ def flight_request(text, now_local=None):
     nonstop = bool(ns_m)
     if ns_m:
         spans.append(ns_m.span())
+    if _NEG_NONSTOP_RE.search(text):
+        # 'not nonstop' is a hard exclusion we cannot honor in a quick
+        # check - refuse conservatively, never silently treat as complete
+        unsupported.append("nonstop:negated-exclusion")
     spans += [nm.span() for nm in _NEG_NONSTOP_RE.finditer(text)]
+    spans += [nm.span() for nm in _NEG_RETURN_RE.finditer(text)]
     tm = _TIME_PREF_RE.search(text)
     if tm:
         unsupported.append("time:preference(" + tm.group(0).strip() + ")")
@@ -585,8 +632,12 @@ def _flight_reply(norm, when):
         ask = " You gave more than one departure date - tell me which one to use."
     elif any(u.startswith("date:unsupported") for u in unsupported):
         ask = " I can't resolve that relative date yet - give me an exact date (YYYY-MM-DD) or say today/tomorrow."
+    elif any(u.startswith("date:return-alternatives") for u in unsupported):
+        ask = " You gave more than one return date - tell me which one to use."
     elif any(u.startswith("date:return-unsupported") for u in unsupported):
         ask = " I can't resolve that relative return date yet - give me an exact return date (YYYY-MM-DD)."
+    elif "nonstop:negated-exclusion" in unsupported:
+        ask = " I can't exclude connecting flights yet - I can only check nonstop or any routing."
     elif "multi-city" in unsupported:
         ask = " I can only check one-way or return trips between two cities."
     elif any(u.startswith("route:via") for u in unsupported):
