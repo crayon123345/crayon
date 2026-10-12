@@ -76,6 +76,12 @@ class _FakeDB:
   if 'INSERT INTO audit' in sql:
    if s.fail_closing_audit and 'begin' not in str(p):raise RuntimeError('audit down')
    s.audits.append(str(p));return None
+  if sql.startswith('WITH ok AS'):
+   if s.store.get(p[0])!=json.loads(p[1]):return None
+   if s.store.get(p[2])!=json.loads(p[3]):return None
+   cc=p[4];newv=json.loads(p[5]);oldv=json.loads(p[7])
+   if cc in s.store and s.store[cc]!=oldv:return None
+   s.store[cc]=newv;return {'value':newv}
   if sql.startswith('INSERT INTO kv'):
    key=p[0];val=json.loads(p[1])
    if 'DO UPDATE' in sql:
@@ -206,25 +212,12 @@ def test_concurrent_add_generation_claim_is_unique():
  with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session',return_value={'tools':[]}),_enter(*(db.patches()+_crypto())):
   U.add_keyed(1,'github',True)
   assert db.store['mcp_gen_1_github']=={'gen':1}
-  U.remove(1,'github')
-  U.add_keyed(1,'github',True)
-  assert db.store['mcp_gen_1_github']=={'gen':2}  # never reset
-  with patch.object(U.db,'q',return_value={'value':_review(gen=1)}),patch.object(U,'session') as network:
-   with pytest.raises(ValueError):U.confirm(1,'id','confirm')  # gen-1 review dead
+  U.remove(1,'github')  # fence bump: gen 1 -> 2
+  U.add_keyed(1,'github',True)  # claims gen 3
+  assert db.store['mcp_gen_1_github']=={'gen':3}  # never reset, never reused
+  with patch.object(U.db,'q',return_value={'value':_review(gen=2)}),patch.object(U,'session') as network:
+   with pytest.raises(ValueError):U.confirm(1,'id','confirm')  # gen-2 review dead
    network.assert_not_called()
-
-def test_concurrent_rotate_cas_loser_fails():
- db=_FakeDB();_keyed_store(db)
- enc_a={'wrapped':dict(_BLOB,rev=2,token='ghp_rotated_a')}
- def enc_a_fn(uid,p):return enc_a
- with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated_a','CRAYON_MCP_KEYED_UIDS':'1'},clear=True),_enter(*(db.patches())),patch.object(U.G,'encrypt',side_effect=enc_a_fn),patch.object(U.G,'decrypt',side_effect=lambda uid,b:(b['wrapped'] if isinstance(b,dict) and 'wrapped' in b else b)):
-  db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}  # encrypted blob at rev1
-  U.rotate_keyed(1,'github',True)  # rotation A wins: blob now rev2
-  # rotation B read the SAME rev1 blob and tries the same conditional update
-  ck='mcp_cred_1_github';old_blob={'wrapped':dict(_BLOB)}
-  row=U.db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps({'wrapped':dict(_BLOB,rev=2,token='ghp_rotated_b')}),ck,json.dumps(old_blob)),'one')
-  assert row is None  # CAS rejects the loser
-  assert db.store[ck]==enc_a  # winner's value intact
 
 def test_rotation_invalidates_stale_review():
  db=_FakeDB();_keyed_store(db)
@@ -284,4 +277,115 @@ def test_remove_deletes_credential_meta_and_reviews_keeps_generation():
  with patch.object(U.db,'kv_get',side_effect=db.get),patch.object(U.db,'kv_set',side_effect=db.set),patch.object(U.db,'q',side_effect=db.q):
   assert U.remove(1,'server')=={'removed':True}
   assert db.store.get('reviews_revoked') is True
-  assert db.store['mcp_gen_1_server']=={'gen':3}
+  assert db.store['mcp_gen_1_server']=={'gen':4}  # remove bumps the fence; generation kept monotonic
+
+def _decrypt_wrapped(uid,b):return b['wrapped'] if isinstance(b,dict) and 'wrapped' in b else b
+
+def _unkeyed_review(server='notes',tool='get_note',args=None,url='https://mcp.example/notes'):
+ import time as _time
+ return {'server':server,'tool':tool,'arguments':args or {'id':'n1'},'url':url,'until':_time.time()+60,'keyed':False}
+
+def test_concurrent_rotate_pending_claim_loser_fails():
+ db=_FakeDB();_keyed_store(db)
+ db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated_a','CRAYON_MCP_KEYED_UIDS':'1'},clear=True),_enter(*(db.patches())),patch.object(U.G,'encrypt',side_effect=lambda uid,p:{'wrapped':p}),patch.object(U.G,'decrypt',side_effect=_decrypt_wrapped):
+  db.store['mcp_credpending_1_github']={'wrapped':dict(_BLOB,rev=2)}  # in-flight rotation holds the claim
+  with pytest.raises(ValueError):U.rotate_keyed(1,'github',True)
+  assert db.store['mcp_cred_1_github']=={'wrapped':dict(_BLOB)}  # live blob untouched
+
+def test_concurrent_rotate_stale_read_loses_commit_cas():
+ db=_FakeDB();_keyed_store(db)
+ db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
+ orig_get=db.get;state={'done':False}
+ def hook_get(k,d=None):
+  v=orig_get(k,d)
+  if k=='mcp_cred_1_github' and not state['done']:
+   state['done']=True
+   with patch.object(U.db,'kv_get',side_effect=orig_get):
+    U.rotate_keyed(1,'github',True)  # rotation A runs fully while B holds a stale read
+  return v
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated_WIN','CRAYON_MCP_KEYED_UIDS':'1'},clear=True),patch.object(U.db,'kv_get',side_effect=hook_get),patch.object(U.db,'kv_set',side_effect=db.set),patch.object(U.db,'q',side_effect=db.q),patch.object(U.G,'encrypt',side_effect=lambda uid,p:{'wrapped':p}),patch.object(U.G,'decrypt',side_effect=_decrypt_wrapped):
+  with pytest.raises(ValueError):U.rotate_keyed(1,'github',True)  # B's commit CAS loses
+  assert db.store['mcp_cred_1_github']=={'wrapped':dict(_BLOB,rev=2,token='ghp_rotated_WIN')}
+  assert 'mcp_credpending_1_github' not in db.store  # loser's pending row cleaned up
+
+def test_rotate_audit_failure_leaves_committed_credential_untouched():
+ db=_FakeDB();_keyed_store(db);db.fail_closing_audit=True
+ db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated9x','CRAYON_MCP_KEYED_UIDS':'1'},clear=True),_enter(*(db.patches()+_crypto())):
+  with pytest.raises(ValueError):U.rotate_keyed(1,'github',True)
+  assert db.store['mcp_cred_1_github']=={'wrapped':dict(_BLOB)}  # rev1 never swapped
+  assert db.store['mcp_credmeta_1_github']['rev']==1
+  assert 'mcp_credpending_1_github' not in db.store
+  db.fail_closing_audit=False
+  # the committed rev1 credential still serves a rev1 review - no gap
+  with patch.object(U.db,'q',return_value={'value':_review(gen=1,rev=1)}),patch.object(U,'session',return_value={'content':[{'text':'ok'}],'ok':True}) as network:
+   out=U.confirm(1,'id','confirm')
+   network.assert_called_once_with(_GH_URL,'tools/call',{'name':'get_repo','arguments':{'repo':'a/b'}},token='ghp_x_validtoken1')
+   assert 'ok' in out['text']
+
+def test_rotation_pending_window_prepare_uses_committed_revision():
+ db=_FakeDB();_keyed_store(db)
+ db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
+ seen={}
+ orig=db.q
+ def hook(sql,p=(),f=None):
+  r=orig(sql,p,f)
+  if sql.startswith('INSERT INTO kv') and p and p[0]=='mcp_credpending_1_github':
+   # mid-rotation: rev2 exists only as PENDING, not yet audited/committed
+   rev=U.prepare(1,'github','get_repo',{'repo':'a/b'})
+   assert 'revision 1, generation 1' in rev['text']
+   seen['prepared']=True
+  return r
+ db.q=hook
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotatedNEW1','CRAYON_MCP_KEYED_UIDS':'1'},clear=True),_enter(*(db.patches()+_crypto())):
+  U.rotate_keyed(1,'github',True)
+  assert seen.get('prepared') is True
+  assert db.store['mcp_credmeta_1_github']['rev']==2
+  with patch.object(U.db,'q',return_value={'value':_review(gen=1,rev=1)}),patch.object(U,'session') as network:
+   with pytest.raises(ValueError):U.confirm(1,'id','confirm')  # rev1 review now stale
+   network.assert_not_called()
+
+def test_add_remove_fence_no_false_success_no_resurrection():
+ db=_FakeDB()
+ orig=db.q
+ def hook(sql,p=(),f=None):
+  if 'INSERT INTO audit' in sql and 'begin' not in str(p):
+   r=orig(sql,p,f)
+   U.remove(1,'github')  # remove lands DURING the closing audit, before publish
+   return r
+  return orig(sql,p,f)
+ db.q=hook
+ with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session',return_value={'tools':[]}),_enter(*(db.patches()+_crypto())):
+  with pytest.raises(ValueError):U.add_keyed(1,'github',True)  # no false success
+  assert 'github' not in db.store.get('mcp_connectors_1',{})  # nothing published
+  assert 'mcp_cred_1_github' not in db.store and 'mcp_credmeta_1_github' not in db.store
+  assert db.store['mcp_gen_1_github']=={'gen':2}  # remove bumped the fence; never reused
+
+def test_remove_preserves_same_user_other_connectors():
+ db=_FakeDB();_keyed_store(db)
+ other=dict(_BLOB,name='tavily',url='https://mcp.tavily.com/mcp',gen=4,rev=2)
+ db.store['mcp_connectors_1']['tavily']={'url':'https://mcp.tavily.com/mcp','keyed':True,'principal':'server-service-account','tools':[]}
+ db.store['mcp_cred_1_tavily']={'wrapped':other}
+ db.store['mcp_credmeta_1_tavily']={'url':'https://mcp.tavily.com/mcp','gen':4,'rev':2,'scope':'server','principal':'server-service-account'}
+ db.store['mcp_gen_1_tavily']={'gen':4}
+ with _enter(*(db.patches())):
+  assert U.remove(1,'github')=={'removed':True}
+  assert 'github' not in db.store['mcp_connectors_1'] and 'tavily' in db.store['mcp_connectors_1']
+  assert 'mcp_cred_1_github' not in db.store and 'mcp_credmeta_1_github' not in db.store
+  assert db.store['mcp_cred_1_tavily']=={'wrapped':other}
+  assert db.store['mcp_credmeta_1_tavily']['rev']==2
+  assert db.store['mcp_gen_1_tavily']=={'gen':4}
+  assert db.store['mcp_gen_1_github']=={'gen':2}  # fence bumped, monotonic
+
+def test_unkeyed_confirm_nested_dict_list_result_passthrough():
+ db=_FakeDB()
+ db.store['mcp_connectors_1']={'notes':{'url':'https://mcp.example/notes','tools':[{'name':'get_note','inputSchema':{'type':'object','properties':{'id':{'type':'string'}},'required':['id']}}]}}
+ result={'content':[{'text':'note body'}],'nested':{'list':[1,{'k':'v'},['x','y']],'dict':{'a':{'b':2}}},'ok':True}
+ with _enter(*(db.patches()+_crypto())):
+  r=U.prepare(1,'notes','get_note',{'id':'n1'})
+  assert 'Credential: none' in r['text']
+  with patch.object(U.db,'q',return_value={'value':_unkeyed_review()}),patch.object(U,'session',return_value=result) as network:
+   out=U.confirm(1,'id','confirm')
+   network.assert_called_once_with('https://mcp.example/notes','tools/call',{'name':'get_note','arguments':{'id':'n1'}},token=None)
+   assert 'note body' in out['text'] and 'nested' in out['text'] and '"b": 2' in out['text']

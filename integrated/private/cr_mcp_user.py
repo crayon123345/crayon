@@ -47,7 +47,11 @@ def _scrub(text, token):
     return text
 def _scrub_obj(obj, token):
     '''Scrub STRING VALUES BEFORE any serialization, so JSON escaping of
-    quote/backslash characters cannot smuggle the token past the scrub.'''
+    quote/backslash characters cannot smuggle the token past the scrub.
+    token=None (unkeyed call) is a PASSTHROUGH: there is no credential to
+    remove and the result must be returned intact.'''
+    if token is None:
+        return obj
     if isinstance(obj, str):
         return _scrub(obj, token)
     if isinstance(obj, list):
@@ -143,6 +147,7 @@ def add(uid,name,url,accept,token=None):
 def _cred_key(uid,name):return 'mcp_cred_'+str(uid)+'_'+name
 def _cred_meta_key(uid,name):return 'mcp_credmeta_'+str(uid)+'_'+name
 def _gen_key(uid,name):return 'mcp_gen_'+str(uid)+'_'+name
+def _cred_pending_key(uid,name):return 'mcp_credpending_'+str(uid)+'_'+name
 def _read_env_credential(env_var):
  if not re.fullmatch(r'[A-Z0-9_]{1,60}',env_var or ''):raise ValueError('Invalid credential variable name.')
  import os
@@ -216,40 +221,53 @@ def add_keyed(uid,name,accept):
         # PUBLISH LAST, by CAS: the connector becomes visible only now.
         cc='mcp_connectors_'+str(uid);old=connectors(uid)
         new=dict(old);new[name]={'url':url,'tools':safe,'keyed':True,'intent':entry['intent'],'principal':entry['principal'],'consent_at':int(time.time()),'notice':NOTICE}
-        # Single-statement conditional upsert: inserts only if the row is
-        # absent; on conflict, updates only if the live row still equals
-        # what we read. A concurrent publisher loses and retries.
-        row=db.q("INSERT INTO kv(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=%s::jsonb WHERE kv.value=%s::jsonb RETURNING value",(cc,json.dumps(new),json.dumps(new),json.dumps(old)),'one')
+        # Single-statement LIFECYCLE-FENCED publish: the upsert lands only
+        # if (a) our generation claim row and (b) our credential row are
+        # still EXACTLY what this call wrote, and (c) the connector row
+        # still equals what we read. A concurrent remove() bumps the
+        # generation and deletes the credential, so either fence fails the
+        # whole statement atomically - no published connector without its
+        # credential, no false success, no resurrection.
+        gj=json.dumps({'gen':gen});cj=json.dumps(enc)
+        row=db.q("WITH ok AS (SELECT 1 WHERE (SELECT value FROM kv WHERE key=%s)=%s::jsonb AND (SELECT value FROM kv WHERE key=%s)=%s::jsonb) INSERT INTO kv(key,value) SELECT %s,%s::jsonb FROM ok ON CONFLICT(key) DO UPDATE SET value=%s::jsonb WHERE kv.value=%s::jsonb AND (SELECT value FROM kv WHERE key=%s)=%s::jsonb AND (SELECT value FROM kv WHERE key=%s)=%s::jsonb RETURNING value",(_gen_key(uid,name),gj,ck,cj,cc,json.dumps(new),json.dumps(new),json.dumps(old),_gen_key(uid,name),gj,ck,cj),'one')
         if not row:raise ValueError('Connector state changed - retry.')
     except Exception:
         _rollback_keyed(uid,name,cred_val=enc,meta_val=meta)
         raise ValueError('Credential storage or audit unavailable - connector not saved.') from None
     return {'name':name,'url':url,'tools':[t.get('name') for t in safe],'keyed':True}
 def rotate_keyed(uid,name,accept):
-    # Explicit rotation with TRUE compare-and-swap: one conditional UPDATE
-    # on the encrypted blob row. Two concurrent rotations from the same
-    # state cannot both succeed; the loser raises instead of overwriting.
-    # Reviews pinned to the old revision are refused.
+    # Explicit rotation with COMMIT VISIBILITY. The new credential is
+    # written to a PENDING row first (insert-only claim: one rotation at
+    # a time), the CHECKED audit lands, and only then is the live blob
+    # swapped by a conditional UPDATE. prepare/confirm read ONLY the live
+    # blob, so an unaudited revision is never usable. If the audit fails,
+    # the pending row is dropped and the live credential never changed:
+    # nothing to roll back, no effects despite "not saved".
     if accept is not True:raise ValueError(NOTICE)
     entry=_REGISTRY.get(name);c=connectors(uid).get(name)
     if not entry or not c or not c.get('keyed'):raise ValueError('No such keyed connector.')
     _principal_allowed(uid,name)
     token=_read_env_credential(entry['env'])
     _crypto_preflight(uid);_storage_preflight(uid)
-    ck=_cred_key(uid,name)
+    ck=_cred_key(uid,name);pk=_cred_pending_key(uid,name)
     old_blob=db.kv_get(ck)
     try:old=G.decrypt(uid,old_blob)
     except Exception:raise ValueError('Credential unavailable - reconnect the connector.') from None
     gen=old.get('gen',1);rev=old.get('rev',0)+1
     new_enc=G.encrypt(uid,{'token':token,'env':entry['env'],'url':entry['url'],'name':name,'gen':gen,'rev':rev,'scope':'server'})
-    row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(new_enc),ck,json.dumps(old_blob)),'one')
-    if not row:raise ValueError('Credential changed during rotation - retry.')
+    row=db.q("INSERT INTO kv(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING RETURNING value",(pk,json.dumps(new_enc)),'one')
+    if not row:raise ValueError('Rotation already in progress - retry.')
     try:
-        db.kv_set(_cred_meta_key(uid,name),{'url':entry['url'],'gen':gen,'rev':rev,'scope':'server','principal':entry['principal']})
         _checked_audit(uid,'mcp_connector_rotated',json.dumps({'name':name,'url':entry['url'],'gen':gen,'rev':rev}))
     except Exception:
-        db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(old_blob),ck,json.dumps(new_enc)),'one')
+        db.q('DELETE FROM kv WHERE key=%s AND value=%s::jsonb',(pk,json.dumps(new_enc)),'none')
         raise ValueError('Audit store unavailable - rotation not saved.') from None
+    row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(new_enc),ck,json.dumps(old_blob)),'one')
+    if not row:
+        db.q('DELETE FROM kv WHERE key=%s AND value=%s::jsonb',(pk,json.dumps(new_enc)),'none')
+        raise ValueError('Credential changed during rotation - retry.')
+    db.kv_set(_cred_meta_key(uid,name),{'url':entry['url'],'gen':gen,'rev':rev,'scope':'server','principal':entry['principal']})
+    db.q('DELETE FROM kv WHERE key=%s AND value=%s::jsonb',(pk,json.dumps(new_enc)),'none')
     return {'name':name,'rev':rev,'gen':gen}
 def _keyed_credential(uid,name,url):
  '''Fail-closed credential load. The encrypted blob is the AUTHENTICATED
@@ -263,12 +281,28 @@ def _keyed_credential(uid,name,url):
  except Exception:raise ValueError('Credential unavailable - reconnect the connector.') from None
  return token,cred
 def remove(uid,name):
- c=connectors(uid);c.pop(name,None);db.kv_set('mcp_connectors_'+str(uid),c)
- db.q('DELETE FROM kv WHERE key IN (%s,%s)',(_cred_key(uid,name),_cred_meta_key(uid,name)),'none')
- # Pending reviews must not survive a remove/re-add: revoke them all.
- # The durable generation counter is KEPT so a re-add never reuses one.
- db.q("DELETE FROM kv WHERE key LIKE %s",('mcp_review_'+str(uid)+'_%',),'none')
- return {'removed':True}
+    # Lifecycle fence: bump the durable generation FIRST, so any in-flight
+    # add_keyed publish (fenced on its claimed generation and credential
+    # row) loses instead of resurrecting a connector this remove deleted.
+    # The entry removal itself is a CONDITIONAL update of exactly the row
+    # we read, so a concurrent publisher's row is never silently replaced.
+    # The generation counter is KEPT (monotonic), never reset.
+    gk=_gen_key(uid,name);g=db.kv_get(gk)
+    if g:
+        db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb",(json.dumps({'gen':g.get('gen',0)+1}),gk,json.dumps(g)),'none')
+    cc='mcp_connectors_'+str(uid)
+    for _ in range(3):
+        old=connectors(uid)
+        if name not in old:break
+        new=dict(old);new.pop(name)
+        row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(new),cc,json.dumps(old)),'one')
+        if row:break
+    else:
+        raise ValueError('Connector state changed - retry.')
+    db.q('DELETE FROM kv WHERE key IN (%s,%s,%s)',(_cred_key(uid,name),_cred_meta_key(uid,name),_cred_pending_key(uid,name)),'none')
+    # Pending reviews must not survive a remove/re-add: revoke them all.
+    db.q("DELETE FROM kv WHERE key LIKE %s",('mcp_review_'+str(uid)+'_%',),'none')
+    return {'removed':True}
 def prepare(uid,server,tool,arguments):
  c=connectors(uid).get(server)
  if not c or not any(t['name']==tool for t in c['tools']):raise ValueError('Connect this server/tool first.')
