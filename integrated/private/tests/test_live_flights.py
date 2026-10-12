@@ -621,3 +621,53 @@ def test_supplied_time_party_constraints_make_lookup_ineligible(monkeypatch):
         r = cr_live.lookup(ask, NOW_LOCAL)
         assert r.status == cr_live.STATUS_INSUFFICIENT, ask
         assert r.escalation_eligible is False, ask
+
+
+# --- review-#5: consumed-span residual guard ----------------------------
+
+@pytest.mark.parametrize("tail", [
+    "under INR 5000",
+    "only Air Canada",
+    "landing before noon",
+    "maximum one stop",
+    "no overnight connections",
+    "for a couple",
+    "with checked bags",
+    "arriving by 18",
+    "wheelchair assistance",
+])
+def test_unlisted_constraints_are_residual_refusals(tail):
+    """The whitelist consumes the accepted grammar; ANY other requirement
+    is an unconsumed leftover - refused, never silently discarded."""
+    n = cr_live.flight_request("flight Delhi to Kolkata tomorrow " + tail,
+                               NOW_LOCAL)
+    assert any(u.startswith("constraint:unparsed") for u in n["unsupported"]), tail
+
+
+@pytest.mark.parametrize("ask", [
+    "cheapest flight tomorrow Delhi to Kolkata",
+    "flights Delhi to Kolkata tomorrow 2 adults business nonstop",
+    "flight from Delhi to Kolkata tomorrow",
+    "suggest flights Delhi to Kolkata tomorrow",
+    "flight Delhi to Kolkata tomorrow not business, economy only",
+])
+def test_oneway_positives_stay_complete(ask):
+    n = cr_live.flight_request(ask, NOW_LOCAL)
+    assert n["missing"] == [] and n["unsupported"] == [], ask
+
+
+def test_roundtrip_positive_stays_complete():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata on 2026-10-20 returning 2026-10-25", NOW_LOCAL)
+    assert n["missing"] == [] and n["unsupported"] == []
+    assert n["trip"] == "roundtrip" and n["return_date"] == "2026-10-25"
+
+
+def test_residual_refusal_is_ineligible_end_to_end(monkeypatch):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    r = cr_live.lookup(
+        "flight Delhi to Kolkata tomorrow under INR 5000", NOW_LOCAL)
+    assert r.status == cr_live.STATUS_INSUFFICIENT
+    assert r.failure_code == cr_live.FAILURE_UNSUPPORTED
+    assert r.escalation_eligible is False
+    assert "I can't honor part of that request" in r.text

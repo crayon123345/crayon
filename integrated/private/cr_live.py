@@ -1,6 +1,6 @@
 """Deterministic public lookup for explicit search and changing-data requests.
 
-Step A (flight-escalation contract, review-#3 fold): lookup() returns a
+Step A (flight-escalation contract, review-#5 fold): lookup() returns a
 structured LookupResult. The flight request is normalized and RESOLVED
 BEFORE any network attempt: an incomplete or unsupported request is a
 clarification result with NO search/research call, NEVER a generic
@@ -232,6 +232,32 @@ _LEFTOVER_RE = re.compile(
     r'\b(?:layover|stopover|refundable|flexible\s+dates?|baggage|luggage|'
     r'window\s+seat|aisle\s+seat|meal\s+preference)\b')
 _TERMINAL_RE = re.compile(r'(?i)\bterminal\s+\d+\b')
+_NEG_CABIN_RE = re.compile(
+    r'(?i)\b(?:not|no)\s+(?:premium\s+economy|business|first|economy)\b')
+_NEG_NONSTOP_RE = re.compile(r'(?i)\b(?:not|no)\s+(?:non[- ]?stop|direct)\b')
+_TRIP_WORD_RE = re.compile(r'(?i)\b(?:round[- ]?trip|one[- ]?way)\b')
+_BARE_RETURN_RE = re.compile(r'(?i)\breturn(?:ing)?\b')
+_FOCUS_PREFIX_RE = re.compile(
+    r'(?is)^Research focus \[(?:web|deep|academic|social|video)\]:\s*')
+
+# Accepted step-A request shape: route, ONE departure date (ISO/today/
+# tomorrow), optional return clause, adult count, cabin, trip type,
+# nonstop. Consumed spans are blanked; leftover words must ALL be
+# request FILLER - any other fragment is an unconsumed constraint and is
+# refused (constraint:unparsed), NEVER swallowed. This is a consumed-
+# span residual guard, not a keyword blacklist.
+_REQUEST_FILLER = frozenset({
+    "a", "an", "the", "i", "me", "my", "we", "us", "our", "you", "please",
+    "pls", "can", "could", "would", "help", "want", "need", "like",
+    "looking", "look", "find", "get", "got", "show", "search", "book",
+    "check", "tell", "give", "list", "compare", "suggest", "recommend",
+    "any", "some", "best", "cheapest", "cheap", "lowest", "low", "good",
+    "flight", "flights", "airfare", "airfares", "fare", "fares", "price",
+    "prices", "cost", "ticket", "tickets", "trip", "travel", "options",
+    "deals", "deal", "for", "on", "of", "to", "from", "in", "at", "by",
+    "and", "or", "with", "is", "are", "what", "whats", "how", "much",
+    "latest", "news", "only", "just", "also", "go", "going", "fly",
+    "flying", "class", "not", "no", "now", "hey", "hi", "ok", "okay"})
 
 # resolved IATA codes are a NORMALIZATION aid only, never evidence
 _IATA = {
@@ -275,13 +301,17 @@ def _unnegated(pattern, text):
 
 def _mask_return_clauses(text):
     """Blank out return-date clauses so the DEPARTURE parser can never
-    steal a return date. Leg clauses bind first."""
+    steal a return date. Leg clauses bind first. Returns (masked_text,
+    spans) - spans refer to ORIGINAL text coordinates (masking preserves
+    length)."""
     chars = list(text)
+    spans = []
     for rx in (_RETURN_ISO_RE, _RETURN_NEXT_RE, _RETURN_REL_RE):
         for m in rx.finditer(text):
+            spans.append(m.span())
             for i in range(m.start(), m.end()):
                 chars[i] = ' '
-    return ''.join(chars)
+    return ''.join(chars), spans
 
 
 def _parse_date(text, now_local):
@@ -353,22 +383,25 @@ def flight_request(text, now_local=None):
 
     now_local: the caller-resolved USER-LOCAL datetime; needed ONLY for
     relative dates. Leg clauses bind FIRST (return masked before the
-    departure parse). EVERY supplied constraint is either honored in the
-    normalized dict or marked missing/unsupported - NEVER silently
-    defaulted: spelled-out passenger counts parse; children/infants,
-    party phrasing, out-of-range or count-less counts, negated-only
-    cabins, departure-time preferences, via routings, airline and
-    terminal preferences are UNSUPPORTED; round-trip asks carry a parsed
-    or MISSING return date; multiple explicit departure dates are
-    UNSUPPORTED alternatives. Multi-city and next-relative dates are
-    UNSUPPORTED.
+    departure parse). Accepted-shape spans (route, dates, return clause,
+    adult count, cabin, trip words, nonstop, negations) plus every
+    recognized UNSUPPORTED constraint are CONSUMED; any leftover word
+    that is not request filler is an unconsumed constraint and is marked
+    constraint:unparsed - a requirement can never be silently discarded.
     """
     if not _FLIGHT_WORD.search(text):
         return None
+    spans = []
     m = _ROUTE_RE.search(text) or _BARE_ROUTE_RE.search(text)
+    if m:
+        spans.append(m.span())
     origin = _city(m.group(1)) if m else None
     destination = _city(m.group(2)) if m else None
-    departure_text = _mask_return_clauses(text)
+    departure_text, ret_spans = _mask_return_clauses(text)
+    spans += ret_spans
+    for rx in (_ISO_DATE_RE, _REL_RE, _NEXT_REL_RE):
+        for dm in rx.finditer(departure_text):
+            spans.append(dm.span())  # negated spans consumed too
     date, date_state, date_note = _parse_date(departure_text, now_local)
     unsupported = []
     if date_state in ("invalid", "unsupported", "conflict"):
@@ -385,6 +418,8 @@ def flight_request(text, now_local=None):
     pax_all = _PAX_RE.findall(text)
     passengers = 1
     if pax_all:
+        for pm in _PAX_RE.finditer(text):
+            spans.append(pm.span())
         counts = []
         for raw_m in pax_all:
             raw = raw_m.lower()
@@ -404,33 +439,65 @@ def flight_request(text, now_local=None):
         unsupported.append("passengers:unparsed")
     if _KID_RE.search(text):
         unsupported.append("passengers:children-infants")
+        spans += [km.span() for km in _KID_RE.finditer(text)]
     if _PARTY_RE.search(text):
         unsupported.append("passengers:party-unparsed")
+        spans += [pm.span() for pm in _PARTY_RE.finditer(text)]
     cabin_m = _unnegated(_CABIN_RE, text)
     if cabin_m:
         cabin = cabin_m.group(1).lower()
+        spans.append(cabin_m.span())
     elif _CABIN_RE.search(text):
         cabin = None
         unsupported.append("cabin:only-negated")
     else:
         cabin = "economy"
-    nonstop = bool(_unnegated(_NONSTOP_RE, text))
+    spans += [cm.span() for cm in _NEG_CABIN_RE.finditer(text)]
+    ns_m = _unnegated(_NONSTOP_RE, text)
+    nonstop = bool(ns_m)
+    if ns_m:
+        spans.append(ns_m.span())
+    spans += [nm.span() for nm in _NEG_NONSTOP_RE.finditer(text)]
     tm = _TIME_PREF_RE.search(text)
     if tm:
         unsupported.append("time:preference(" + tm.group(0).strip() + ")")
+        spans += [t.span() for t in _TIME_PREF_RE.finditer(text)]
+    vm = _VIA_RE.search(text)
+    if vm:
+        unsupported.append("route:via(" + vm.group(1).strip().lower() + ")")
+        spans += [v.span() for v in _VIA_RE.finditer(text)]
+    if _AIRLINE_RE.search(text):
+        unsupported.append("airline:preference")
+        spans += [a.span() for a in _AIRLINE_RE.finditer(text)]
+    if _TERMINAL_RE.search(text):
+        unsupported.append("airport:terminal")
+        spans += [t.span() for t in _TERMINAL_RE.finditer(text)]
     lm = _LEFTOVER_RE.search(text)
     if lm:
         unsupported.append("constraint:unsupported(" +
                            lm.group(0).strip().lower()[:30] + ")")
-    vm = _VIA_RE.search(text)
-    if vm:
-        unsupported.append("route:via(" + vm.group(1).strip().lower() + ")")
-    if _AIRLINE_RE.search(text):
-        unsupported.append("airline:preference")
-    if _TERMINAL_RE.search(text):
-        unsupported.append("airport:terminal")
+        spans += [x.span() for x in _LEFTOVER_RE.finditer(text)]
     if re.search(r'(?i)\bmulti[- ]?city\b', text):
         unsupported.append("multi-city")
+        spans += [x.span() for x in
+                  re.finditer(r'(?i)\bmulti[- ]?city\b', text)]
+    spans += [t.span() for t in _TRIP_WORD_RE.finditer(text)]
+    spans += [t.span() for t in _BARE_RETURN_RE.finditer(text)]
+    # consumed-span residual guard: blank every consumed span; leftover
+    # words that are not request filler are UNCONSUMED CONSTRAINTS
+    chars = list(text)
+    pm = _FOCUS_PREFIX_RE.match(text)
+    if pm:
+        spans.append(pm.span())
+    for a, b in spans:
+        for i in range(a, b):
+            chars[i] = ' '
+    leftover = [w.lower() for w in re.findall(r'[a-zA-Z0-9]+',
+                                              ''.join(chars))]
+    residual = [w for w in leftover if w not in _REQUEST_FILLER]
+    if residual:
+        unsupported.append("constraint:unparsed(" +
+                           " ".join(residual[:6]) + ")")
     missing = [k for k, v in (("origin", origin), ("destination", destination))
                if not v]
     if date_state in ("absent", "needs_clock"):
@@ -541,9 +608,9 @@ def _flight_reply(norm, when):
         ask = " I can't filter by airline yet - I would check all airlines on the route."
     elif "airport:terminal" in unsupported:
         ask = " I can't filter by airport terminal yet."
-    elif any(u.startswith("constraint:unsupported") for u in unsupported):
-        ask = (" I can't honor that constraint yet - I can only check "
-               "route, dates, adults, cabin and one-way/return.")
+    elif any(u.startswith("constraint:") for u in unsupported):
+        ask = (" I can't honor part of that request yet - I can only "
+               "check route, dates, adults, cabin and one-way/return.")
     elif "date" in missing:
         ask = " Tell me the departure date and I will check that exact day."
     elif "origin" in missing or "destination" in missing:
