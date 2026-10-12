@@ -49,19 +49,25 @@ def test_review_tool_available_in_web_and_no_ambient_disclosure():
   assert not T.mcp_review_tool(ctx,'server','lookup','{"topic":"private memory not in request"}')['ok']
   assert prepare.call_count==1
 
-# --- mcp wave 1: keyed bearer connectors (server-env credentials) ---------
+# --- mcp wave 1 review-#1 fold: registry ownership, review identity,
+# fail-closed keyed state, exact-token echo scrub -------------------------
+
+_GH_URL='https://api.githubcopilot.com/mcp/readonly'
+
+def _kv(store):
+ return (lambda k,d=None:store.get(k,d)),(lambda k,v:store.update({k:v}))
+
+def test_registry_rejects_unapproved_connector_before_network():
+ with patch.object(U,'session') as network,patch.object(U.db,'kv_get',return_value={}):
+  with pytest.raises(ValueError):U.add_keyed(1,'random',True)
+  network.assert_not_called()
 
 def test_keyed_connector_fails_closed_without_env_credential():
- with patch.dict('os.environ',{},clear=True),patch.object(U,'session') as network:
-  with pytest.raises(ValueError):U.add_keyed(1,'github','https://api.githubcopilot.com/mcp/readonly','CRAYON_MISSING_KEY',True)
+ with patch.dict('os.environ',{},clear=True),patch.object(U,'session') as network,patch.object(U.db,'kv_get',return_value={}):
+  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
   network.assert_not_called()
 
-def test_keyed_connector_rejects_bad_token_shape_before_network():
- with patch.dict('os.environ',{'CRAYON_K':'ab cd'}),patch.object(U,'session') as network:
-  with pytest.raises(ValueError):U.add_keyed(1,'github','https://api.githubcopilot.com/mcp/readonly','CRAYON_K',True)
-  network.assert_not_called()
-
-def test_keyed_connector_sends_bearer_and_never_stores_plaintext():
+def test_keyed_connector_registry_fixed_endpoint_and_no_plaintext():
  sent={};store={};audits=[]
  class R:
   headers={'content-type':'application/json'};content=b'{}'
@@ -72,30 +78,93 @@ def test_keyed_connector_sends_bearer_and_never_stores_plaintext():
   def __init__(self,**kw):pass
   def __enter__(self):return self
   def __exit__(self,*a):pass
-  def post(self,url,headers,json):sent.update(headers);return R({'id':json['id'],'result':{'protocolVersion':'2026-07-28','tools':[{'name':'get_repo','inputSchema':{'type':'object','properties':{'repo':{'type':'string'}}}}]}})
- with patch.dict('os.environ',{'CRAYON_GH_MCP':'ghp_testtoken123'}),patch.object(U,'endpoint'),patch.object(U.httpx,'Client',Client),patch.object(U.db,'kv_get',side_effect=lambda k,d=None:store.get(k,d)),patch.object(U.db,'kv_set',side_effect=lambda k,v:store.update({k:v})),patch.object(U.db,'audit',side_effect=lambda u,t,p:audits.append(p)),patch.object(U.G,'encrypt',side_effect=lambda uid,p:{'wrapped':p}),patch.object(U.G,'decrypt',side_effect=lambda uid,b:b['wrapped']):
-  U.add_keyed(1,'github','https://api.githubcopilot.com/mcp/readonly','CRAYON_GH_MCP',True)
+  def post(self,url,headers,json):
+   assert url==_GH_URL  # registry-fixed destination
+   sent.update(headers);return R({'id':json['id'],'result':{'protocolVersion':'2026-07-28','tools':[{'name':'get_repo','inputSchema':{'type':'object','properties':{'repo':{'type':'string'}}}}]}})
+ kg,kv=_kv(store)
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_testtoken123'}),patch.object(U,'endpoint'),patch.object(U.httpx,'Client',Client),patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U.db,'q',side_effect=lambda s,p,f=None:audits.append(str(p)) or None),patch.object(U.G,'encrypt',side_effect=lambda uid,p:{'wrapped':p}),patch.object(U.G,'decrypt',side_effect=lambda uid,b:b['wrapped']):
+  r=U.add_keyed(1,'github',True)
   assert sent.get('Authorization')=='Bearer ghp_testtoken123'
-  cred=store.get('mcp_cred_1_github')
-  assert cred=={'wrapped':{'token':'ghp_testtoken123','env':'CRAYON_GH_MCP'}}
-  assert all('ghp_testtoken123' not in p for p in audits)
+  assert store['mcp_cred_1_github']=={'wrapped':{'token':'ghp_testtoken123','env':'CRAYON_MCP_GITHUB_TOKEN','url':_GH_URL,'rev':1,'scope':'server'}}
+  assert store['mcp_credmeta_1_github']=={'url':_GH_URL,'rev':1,'scope':'server'}
+  assert r['name']=='github' and store['mcp_connectors_1']['github']['keyed'] is True
+  assert all('ghp_testtoken123' not in a for a in audits)
 
-def test_confirm_attaches_stored_credential_without_disclosure():
- config={'server':{'url':'https://example.com/mcp','tools':[{'name':'lookup','inputSchema':{'type':'object','properties':{'topic':{'type':'string'}}}}]}}
- seen={}
- def fake_session(url,method,args=None,token=None):
-  seen['token']=token;return {'content':[{'text':'ok'}]}
+def test_replacement_semantics_refuse_silent_swap():
+ store={'mcp_connectors_1':{'github':{'url':_GH_URL,'tools':[],'keyed':True}},'mcp_cred_1_github':'blob','mcp_credmeta_1_github':{'url':_GH_URL,'rev':1,'scope':'server'}}
+ kg,kv=_kv(store)
+ with patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U,'session') as network:
+  with pytest.raises(ValueError):U.add(1,'github','https://other.example/mcp',True)
+  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
+  network.assert_not_called()
+
+def test_review_binds_credential_revision_and_rotation_invalidates():
  import time as _time
- def fake_decrypt(uid,b):
-  if b=='cred':return {'token':'secret-bearer-xyz'}
-  return {'server':'server','tool':'lookup','arguments':{'topic':'x'},'url':'https://example.com/mcp','until':_time.time()+60}
- with patch.object(U,'connectors',return_value=config),patch.object(U.db,'q',return_value={'value':'blob'}),patch.object(U.G,'decrypt',side_effect=fake_decrypt),patch.object(U.db,'kv_get',return_value='cred'),patch.object(U,'session',side_effect=fake_session),patch.object(U.db,'audit'):
-  r=U.confirm(1,'id','confirm')
-  assert seen['token']=='secret-bearer-xyz'
-  assert 'secret-bearer-xyz' not in r['text']
+ store={'mcp_connectors_1':{'github':{'url':_GH_URL,'keyed':True,'tools':[{'name':'get_repo','inputSchema':{'type':'object','properties':{'repo':{'type':'string'}},'required':['repo']}}]}},
+        'mcp_cred_1_github':'blob','mcp_credmeta_1_github':{'url':_GH_URL,'rev':1,'scope':'server'}}
+ kg,kv=_kv(store)
+ def enc(uid,p):return p
+ def dec(uid,b):return {'token':'ghp_x','url':_GH_URL,'rev':1} if b=='blob' else b
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated9'}),patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U.db,'q',return_value=None),patch.object(U.G,'encrypt',side_effect=enc),patch.object(U.G,'decrypt',side_effect=dec):
+  r=U.prepare(1,'github','get_repo',{'repo':'a/b'})
+  assert 'revision 1' in r['text']
+  U.rotate_keyed(1,'github',True)
+  assert store['mcp_credmeta_1_github']['rev']==2
+  review={'server':'github','tool':'get_repo','arguments':{'repo':'a/b'},'url':_GH_URL,'until':_time.time()+60,'keyed':True,'cred_rev':1}
+  with patch.object(U.db,'q',return_value={'value':review}),patch.object(U,'session') as network:
+   with pytest.raises(ValueError):U.confirm(1,'id','confirm')
+   network.assert_not_called()
 
-def test_remove_deletes_credential_row():
+def test_fail_closed_missing_or_corrupt_credential_before_network():
+ import time as _time
+ review={'server':'github','tool':'get_repo','arguments':{'repo':'a/b'},'url':_GH_URL,'until':_time.time()+60,'keyed':True,'cred_rev':1}
+ base={'mcp_connectors_1':{'github':{'url':_GH_URL,'keyed':True,'tools':[]}},'mcp_credmeta_1_github':{'url':_GH_URL,'rev':1,'scope':'server'}}
+ for store in (dict(base),dict(base,**{'mcp_cred_1_github':'corrupt'})):
+  kg,kv=_kv(store)
+  def dec(uid,blob):
+   if blob=='corrupt':raise Exception('bad')
+   return blob
+  with patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'q',return_value={'value':review}),patch.object(U.G,'decrypt',side_effect=dec),patch.object(U,'session') as network:
+   with pytest.raises(ValueError):U.confirm(1,'id','confirm')
+   network.assert_not_called()
+
+def test_checked_audit_rolls_back_connector_on_failure():
+ store={};kg,kv=_kv(store);deleted=[]
+ def fake_q(s,p,f=None):
+  if 'INSERT INTO audit' in s:raise RuntimeError('audit down')
+  if 'DELETE FROM kv' in s:
+   deleted.append(p)
+   for k in p:store.pop(k,None)
+  return None
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_testtoken123'}),patch.object(U,'session',return_value={'tools':[]}),patch.object(U,'endpoint'),patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U.db,'q',side_effect=fake_q),patch.object(U.G,'encrypt',side_effect=lambda uid,p:p),patch.object(U.G,'decrypt',side_effect=lambda uid,b:b):
+  with pytest.raises(ValueError):U.add_keyed(1,'github',True)
+  assert 'github' not in store.get('mcp_connectors_1',{})
+  assert 'mcp_cred_1_github' not in store
+  assert deleted
+
+def test_exact_token_echo_scrubbed_in_catalog_result_and_error():
+ import base64,time as _time
+ from urllib.parse import quote
+ tok='ghp_test+token/123'
+ enc_forms=[tok,quote(tok,safe=''),base64.b64encode(tok.encode()).decode()]
+ store={};kg,kv=_kv(store)
+ echo_tools=[{'name':'get_repo','description':'token '+tok+' inside','inputSchema':{'type':'object','properties':{'repo':{'type':'string'}}}}]
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':tok}),patch.object(U,'session',return_value={'tools':echo_tools}),patch.object(U,'endpoint'),patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U.db,'q',return_value=None),patch.object(U.G,'encrypt',side_effect=lambda uid,p:p),patch.object(U.G,'decrypt',side_effect=lambda uid,b:b):
+  U.add_keyed(1,'github',True)
+  cat=str(store['mcp_connectors_1']['github']['tools'])
+  for form in enc_forms:assert form not in cat
+  assert '[redacted-key]' in cat
+ review={'server':'github','tool':'get_repo','arguments':{'repo':'a/b'},'url':_GH_URL,'until':_time.time()+60,'keyed':True,'cred_rev':1}
+ store['mcp_cred_1_github']={'token':tok,'url':_GH_URL}
+ for echoed in enc_forms:
+  def fake_session(url,method,args=None,token=None,_e=echoed):return {'content':[{'text':'echo '+_e}]}
+  with patch.object(U.db,'kv_get',side_effect=kg),patch.object(U.db,'kv_set',side_effect=kv),patch.object(U.db,'q',return_value={'value':review}),patch.object(U.G,'decrypt',side_effect=lambda uid,x:x),patch.object(U,'session',side_effect=fake_session):
+   out=U.confirm(1,'id','confirm')
+   for form in enc_forms:assert form not in out['text']
+   assert '[redacted-key]' in out['text']
+
+def test_remove_deletes_credential_and_meta_rows():
  deleted=[]
  with patch.object(U.db,'kv_get',return_value={'server':{}}),patch.object(U.db,'kv_set'),patch.object(U.db,'q',side_effect=lambda s,p,f=None:deleted.append(p) or None):
   assert U.remove(1,'server')=={'removed':True}
-  assert deleted==[('mcp_cred_1_server',)]
+  assert deleted==[('mcp_cred_1_server','mcp_credmeta_1_server')]
