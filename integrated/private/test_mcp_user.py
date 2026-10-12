@@ -103,9 +103,15 @@ class _FakeDB:
    if s.store.get(key)==old:s.store.pop(key,None)
    return None
   if sql.startswith('DELETE FROM kv WHERE key IN'):
-   for k in p:s.store.pop(k,None)
+   if 'AND (SELECT' in sql:
+    if s.store.get(p[3])!=json.loads(p[4]):return None
+    keys=p[:3]
+   else:keys=p
+   for k in keys:s.store.pop(k,None)
    return None
   if sql.startswith('DELETE FROM kv WHERE key LIKE'):
+   if 'AND (SELECT' in sql:
+    if s.store.get(p[1])!=json.loads(p[2]):return None
    s.store['reviews_revoked']=True;return None
   if sql.startswith('DELETE FROM kv WHERE key=%s'):
    s.store.pop(p[0],None);return None
@@ -289,7 +295,8 @@ def test_concurrent_rotate_pending_claim_loser_fails():
  db=_FakeDB();_keyed_store(db)
  db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
  with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated_a','CRAYON_MCP_KEYED_UIDS':'1'},clear=True),_enter(*(db.patches())),patch.object(U.G,'encrypt',side_effect=lambda uid,p:{'wrapped':p}),patch.object(U.G,'decrypt',side_effect=_decrypt_wrapped):
-  db.store['mcp_credpending_1_github']={'wrapped':dict(_BLOB,rev=2)}  # in-flight rotation holds the claim
+  import time as _t
+  db.store['mcp_credpending_1_github']={'enc':{'wrapped':dict(_BLOB,rev=2)},'at':int(_t.time()),'by':'x'}  # FRESH in-flight claim
   with pytest.raises(ValueError):U.rotate_keyed(1,'github',True)
   assert db.store['mcp_cred_1_github']=={'wrapped':dict(_BLOB)}  # live blob untouched
 
@@ -389,3 +396,75 @@ def test_unkeyed_confirm_nested_dict_list_result_passthrough():
    out=U.confirm(1,'id','confirm')
    network.assert_called_once_with('https://mcp.example/notes','tools/call',{'name':'get_note','arguments':{'id':'n1'}},token=None)
    assert 'note body' in out['text'] and 'nested' in out['text'] and '"b": 2' in out['text']
+
+def test_post_commit_meta_failure_reconciled_no_false_failure_no_stuck():
+ db=_FakeDB();_keyed_store(db)
+ db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
+ state={'failed':False}
+ def flaky_set(k,v):
+  if k=='mcp_credmeta_1_github' and not state['failed']:
+   state['failed']=True;raise RuntimeError('db down')
+  db.set(k,v)
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated9x','CRAYON_MCP_KEYED_UIDS':'1'},clear=True),patch.object(U.db,'kv_get',side_effect=db.get),patch.object(U.db,'kv_set',side_effect=flaky_set),patch.object(U.db,'q',side_effect=db.q),patch.object(U.G,'encrypt',side_effect=lambda uid,p:{'wrapped':p}),patch.object(U.G,'decrypt',side_effect=_decrypt_wrapped):
+  r=U.rotate_keyed(1,'github',True)  # committed rev2; meta write failed AFTER commit
+  assert r['rev']==2 and r['meta_synced'] is False  # NOT a false failure
+  assert db.store['mcp_cred_1_github']=={'wrapped':dict(_BLOB,rev=2,token='ghp_rotated9x')}  # live rev2 kept, never rolled back
+  assert 'mcp_credpending_1_github' not in db.store  # pending released in finally
+  with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotatedAGAIN1','CRAYON_MCP_KEYED_UIDS':'1'},clear=True):
+   r=U.rotate_keyed(1,'github',True)  # next rotation NOT stuck
+   assert r['rev']==3 and r['meta_synced'] is True
+   assert db.store['mcp_credmeta_1_github']['rev']==3
+
+def test_stale_pending_claim_reclaimed_after_db_down():
+ import time as _t
+ db=_FakeDB();_keyed_store(db)
+ db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
+ db.store['mcp_credpending_1_github']={'enc':{'wrapped':dict(_BLOB,rev=2)},'at':int(_t.time())-3600,'by':'crashed'}
+ with patch.dict('os.environ',{'CRAYON_MCP_GITHUB_TOKEN':'ghp_rotated9x','CRAYON_MCP_KEYED_UIDS':'1'},clear=True),_enter(*(db.patches())),patch.object(U.G,'encrypt',side_effect=lambda uid,p:{'wrapped':p}),patch.object(U.G,'decrypt',side_effect=_decrypt_wrapped):
+  r=U.rotate_keyed(1,'github',True)  # stale claim reclaimed conditionally
+  assert r['rev']==2 and r['meta_synced'] is True
+  assert 'mcp_credpending_1_github' not in db.store
+
+def test_remove_fence_never_deletes_a_newer_generation():
+ # Peer's repro: A removes and pauses before the credential delete; C
+ # re-adds at a NEW generation and succeeds; A resumes - A's deletes are
+ # fence-bound to the removed generation and MUST NOT delete C's rows.
+ db=_FakeDB();_keyed_store(db)
+ db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
+ state={'added':False}
+ orig=db.q
+ def hook(sql,p=(),f=None):
+  if sql.startswith('DELETE FROM kv WHERE key IN') and not state['added']:
+   state['added']=True
+   U.remove(1,'github')  # B finishes an old remove: gen 2->3, old cred deleted
+   U.add_keyed(1,'github',True)  # C re-adds at gen 4 BEFORE A's delete runs
+  return orig(sql,p,f)
+ db.q=hook
+ with patch.dict('os.environ',_ENV,clear=True),patch.object(U,'session',return_value={'tools':[{'name':'get_repo','inputSchema':{'type':'object','properties':{'repo':{'type':'string'}},'required':['repo']}}]}),_enter(*(db.patches()+_crypto())):
+  assert U.remove(1,'github')=={'removed':True}
+  assert 'github' in db.store['mcp_connectors_1']  # C's connector intact
+  cred=db.store['mcp_cred_1_github']['wrapped']  # C's credential intact (gens: A fence 1->2, B fence 2->3, C claims 4)
+  assert cred['gen']==4 and cred['rev']==1 and cred['token']==_TOK
+  assert db.store['mcp_gen_1_github']=={'gen':4}
+  r=U.prepare(1,'github','get_repo',{'repo':'a/b'})  # actually callable
+  assert 'revision 1, generation 4' in r['text']
+
+def test_concurrent_other_connector_race_during_remove():
+ db=_FakeDB();_keyed_store(db)
+ db.store['mcp_cred_1_github']={'wrapped':dict(_BLOB)}
+ state={'raced':False}
+ orig=db.q
+ def hook(sql,p=(),f=None):
+  if sql.startswith('UPDATE kv SET value') and p[1]=='mcp_connectors_1' and not state['raced']:
+   state['raced']=True
+   # a concurrent publisher lands another connector mid-remove: CAS loses
+   cur=db.store['mcp_connectors_1']
+   db.store['mcp_connectors_1']=dict(cur,notes={'url':'https://mcp.example/notes','tools':[]})
+   return None
+  return orig(sql,p,f)
+ db.q=hook
+ with _enter(*(db.patches())):
+  assert U.remove(1,'github')=={'removed':True}
+  c=db.store['mcp_connectors_1']
+  assert 'github' not in c and 'notes' in c  # retry re-read preserved the concurrent entry
+  assert state['raced'] is True

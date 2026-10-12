@@ -235,14 +235,28 @@ def add_keyed(uid,name,accept):
         _rollback_keyed(uid,name,cred_val=enc,meta_val=meta)
         raise ValueError('Credential storage or audit unavailable - connector not saved.') from None
     return {'name':name,'url':url,'tools':[t.get('name') for t in safe],'keyed':True}
+def _claim_pending(pk,value):
+    # Insert-only pending claim. A FRESH pending row means another rotation
+    # is live and we refuse. A STALE row (older than 300s - writer crashed
+    # or the DB dropped mid-cleanup) is reclaimed by a conditional update,
+    # so a failed cleanup can never wedge rotation permanently.
+    row=db.q("INSERT INTO kv(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING RETURNING value",(pk,json.dumps(value)),'one')
+    if row:return
+    cur=db.kv_get(pk)
+    if isinstance(cur,dict) and int(time.time())-int(cur.get('at',0))>300:
+        row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(value),pk,json.dumps(cur)),'one')
+        if row:return
+    raise ValueError('Rotation already in progress - retry.')
 def rotate_keyed(uid,name,accept):
-    # Explicit rotation with COMMIT VISIBILITY. The new credential is
-    # written to a PENDING row first (insert-only claim: one rotation at
-    # a time), the CHECKED audit lands, and only then is the live blob
-    # swapped by a conditional UPDATE. prepare/confirm read ONLY the live
-    # blob, so an unaudited revision is never usable. If the audit fails,
-    # the pending row is dropped and the live credential never changed:
-    # nothing to roll back, no effects despite "not saved".
+    # Explicit rotation with COMMIT VISIBILITY and FINAL-STATE
+    # RECONCILIATION. The new credential is staged in a PENDING row
+    # (insert-only claim, timestamped so a stale claim is reclaimable),
+    # the CHECKED audit lands, and only then is the live blob swapped by a
+    # conditional UPDATE. prepare/confirm read ONLY the live blob, so an
+    # unaudited revision is never usable. After the swap commits, the
+    # derived meta index is reconciled best-effort: a meta write failure
+    # does NOT convert a committed rotation into a false failure. OUR
+    # pending claim is always released (conditionally) in a finally.
     if accept is not True:raise ValueError(NOTICE)
     entry=_REGISTRY.get(name);c=connectors(uid).get(name)
     if not entry or not c or not c.get('keyed'):raise ValueError('No such keyed connector.')
@@ -255,20 +269,31 @@ def rotate_keyed(uid,name,accept):
     except Exception:raise ValueError('Credential unavailable - reconnect the connector.') from None
     gen=old.get('gen',1);rev=old.get('rev',0)+1
     new_enc=G.encrypt(uid,{'token':token,'env':entry['env'],'url':entry['url'],'name':name,'gen':gen,'rev':rev,'scope':'server'})
-    row=db.q("INSERT INTO kv(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING RETURNING value",(pk,json.dumps(new_enc)),'one')
-    if not row:raise ValueError('Rotation already in progress - retry.')
+    pending={'enc':new_enc,'at':int(time.time()),'by':secrets.token_hex(6)}
+    _claim_pending(pk,pending)
     try:
         _checked_audit(uid,'mcp_connector_rotated',json.dumps({'name':name,'url':entry['url'],'gen':gen,'rev':rev}))
     except Exception:
-        db.q('DELETE FROM kv WHERE key=%s AND value=%s::jsonb',(pk,json.dumps(new_enc)),'none')
+        try:db.q('DELETE FROM kv WHERE key=%s AND value=%s::jsonb',(pk,json.dumps(pending)),'none')
+        except Exception:pass
         raise ValueError('Audit store unavailable - rotation not saved.') from None
-    row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(new_enc),ck,json.dumps(old_blob)),'one')
-    if not row:
-        db.q('DELETE FROM kv WHERE key=%s AND value=%s::jsonb',(pk,json.dumps(new_enc)),'none')
-        raise ValueError('Credential changed during rotation - retry.')
-    db.kv_set(_cred_meta_key(uid,name),{'url':entry['url'],'gen':gen,'rev':rev,'scope':'server','principal':entry['principal']})
-    db.q('DELETE FROM kv WHERE key=%s AND value=%s::jsonb',(pk,json.dumps(new_enc)),'none')
-    return {'name':name,'rev':rev,'gen':gen}
+    committed=False;meta_synced=False
+    try:
+        row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(new_enc),ck,json.dumps(old_blob)),'one')
+        if not row:raise ValueError('Credential changed during rotation - retry.')
+        committed=True
+        # Meta is a DERIVED, non-authoritative index. The live identity
+        # change is already committed and may already be in use - never
+        # rolled back to hide an error; a meta failure is only reported.
+        try:
+            db.kv_set(_cred_meta_key(uid,name),{'url':entry['url'],'gen':gen,'rev':rev,'scope':'server','principal':entry['principal']})
+            meta_synced=True
+        except Exception:
+            meta_synced=False
+    finally:
+        try:db.q('DELETE FROM kv WHERE key=%s AND value=%s::jsonb',(pk,json.dumps(pending)),'none')
+        except Exception:pass
+    return {'name':name,'rev':rev,'gen':gen,'meta_synced':meta_synced}
 def _keyed_credential(uid,name,url):
  '''Fail-closed credential load. The encrypted blob is the AUTHENTICATED
  record: name, endpoint and scope must all match, and a missing or
@@ -281,15 +306,22 @@ def _keyed_credential(uid,name,url):
  except Exception:raise ValueError('Credential unavailable - reconnect the connector.') from None
  return token,cred
 def remove(uid,name):
-    # Lifecycle fence: bump the durable generation FIRST, so any in-flight
-    # add_keyed publish (fenced on its claimed generation and credential
-    # row) loses instead of resurrecting a connector this remove deleted.
-    # The entry removal itself is a CONDITIONAL update of exactly the row
-    # we read, so a concurrent publisher's row is never silently replaced.
-    # The generation counter is KEPT (monotonic), never reset.
-    gk=_gen_key(uid,name);g=db.kv_get(gk)
-    if g:
-        db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb",(json.dumps({'gen':g.get('gen',0)+1}),gk,json.dumps(g)),'none')
+    # Removal fence. FIRST claim the removal generation: create the row
+    # insert-only if absent, else bump it with a conditional update. Every
+    # delete below is bound to THIS fence value, so a re-add that claims a
+    # newer generation turns the old remove's deletes into no-ops - an old
+    # remove can never delete a new credential, and a mid-flight add
+    # always loses its publish fence instead of resurrecting. The entry
+    # removal is a conditional update of exactly the row we read.
+    gk=_gen_key(uid,name)
+    row=db.q("INSERT INTO kv(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING RETURNING value",(gk,json.dumps({'gen':1})),'one')
+    if row:
+        fence={'gen':1}
+    else:
+        g=db.kv_get(gk) or {}
+        fence={'gen':g.get('gen',0)+1}
+        row=db.q("UPDATE kv SET value=%s::jsonb WHERE key=%s AND value=%s::jsonb RETURNING value",(json.dumps(fence),gk,json.dumps(g)),'one')
+        if not row:raise ValueError('Connector state changed - retry.')
     cc='mcp_connectors_'+str(uid)
     for _ in range(3):
         old=connectors(uid)
@@ -299,9 +331,12 @@ def remove(uid,name):
         if row:break
     else:
         raise ValueError('Connector state changed - retry.')
-    db.q('DELETE FROM kv WHERE key IN (%s,%s,%s)',(_cred_key(uid,name),_cred_meta_key(uid,name),_cred_pending_key(uid,name)),'none')
-    # Pending reviews must not survive a remove/re-add: revoke them all.
-    db.q("DELETE FROM kv WHERE key LIKE %s",('mcp_review_'+str(uid)+'_%',),'none')
+    fj=json.dumps(fence)
+    # Generation-bound deletes: only land while the fence still holds.
+    db.q('DELETE FROM kv WHERE key IN (%s,%s,%s) AND (SELECT value FROM kv WHERE key=%s)=%s::jsonb',(_cred_key(uid,name),_cred_meta_key(uid,name),_cred_pending_key(uid,name),gk,fj),'none')
+    # Reviews of the REMOVED generation are revoked; reviews pinned to a
+    # NEWER generation (a later add) survive.
+    db.q('DELETE FROM kv WHERE key LIKE %s AND (SELECT value FROM kv WHERE key=%s)=%s::jsonb',('mcp_review_'+str(uid)+'_%',gk,fj),'none')
     return {'removed':True}
 def prepare(uid,server,tool,arguments):
  c=connectors(uid).get(server)
