@@ -182,12 +182,19 @@ _ROUTE_END = (
     r'indigo\b|vistara\b|spicejet\b|akasa\b|emirates\b|qatar\b|'
     r'lufthansa\b|airasia\b|\d)'
     r'|\s*$|\s*[,\.;:!?])')
+# Generic (unknown-city) endpoints are BOUNDED: 1-2 words, each a
+# city-shaped token, and the destination must be immediately followed by
+# a hard terminator (_ROUTE_END). An endpoint that cannot be delimited
+# this way is UNRESOLVED (the route fails and is clarified) - the grammar
+# never guesses where an unknown city name ends.
+_CITY_GENERIC = (r'[a-zA-Z][a-zA-Z.-]{1,19}'
+                 r'(?:\s+[a-zA-Z][a-zA-Z.-]{1,19})??')
 _ROUTE_RE = re.compile(
-    r'(?i)\bfrom\s+([a-zA-Z][a-zA-Z .]{1,38}?)\s+(?:to|into)\s+'
-    r'([a-zA-Z][a-zA-Z .]{1,38}?)' + _ROUTE_END)
+    r'(?i)\bfrom\s+(' + _CITY_GENERIC + r')\s+(?:to|into)\s+(' +
+    _CITY_GENERIC + r')' + _ROUTE_END)
 _BARE_ROUTE_RE = re.compile(
-    r'(?i)\b([a-zA-Z][a-zA-Z .]{1,38}?)\s+(?:to|into)\s+'
-    r'([a-zA-Z][a-zA-Z .]{1,38}?)' + _ROUTE_END)
+    r'(?i)\b(' + _CITY_GENERIC + r')\s+(?:to|into)\s+(' +
+    _CITY_GENERIC + r')' + _ROUTE_END)
 _ISO_DATE_RE = re.compile(r'\b(20\d\d)-(\d{1,2})-(\d{1,2})\b')
 _REL_RE = re.compile(r'(?i)\b(tomorrow|today|tonight)\b')
 _NEXT_REL_RE = re.compile(
