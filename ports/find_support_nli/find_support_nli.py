@@ -145,6 +145,79 @@ def _marks(tokens):
     return set(tokens) & (_NEG | _NEG_STEMS | _HEDGE)
 
 
+_NUM_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40,
+    "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
+    "ninety": 90, "dozen": 12,
+}
+# Canonical-unit factors: value * factor == canonical amount. Time only -
+# weight/distance conversion is not claimed.
+_TIME_UNITS = {
+    "second": 1, "seconds": 1,
+    "minute": 60, "minutes": 60,
+    "hour": 3600, "hours": 3600,
+    "day": 86400, "days": 86400,
+    "week": 604800, "weeks": 604800,
+}
+
+
+def _parse_number(tok):
+    """Digits or a single number word -> float, else None."""
+    try:
+        return float(tok)
+    except ValueError:
+        pass
+    return _NUM_WORDS.get(tok)
+
+
+def _quantities(tokens):
+    """(canonical_seconds_or_None, raw_value, unit_or_None) for every
+    number token; unit attaches only to an immediately following unit
+    word. Exact equality after conversion - never approximate."""
+    out = []
+    for i, t in enumerate(tokens):
+        v = _parse_number(t)
+        if v is None:
+            continue
+        unit = tokens[i + 1] if i + 1 < len(tokens) else None
+        factor = _TIME_UNITS.get(unit) if unit else None
+        out.append((v * factor if factor else None, v, unit if factor else None))
+    return out
+
+
+def _numeric_match(claim_tokens, sent_token_set, sent_tokens):
+    """Numeric safeguard with word/digit + exact time-unit conversion.
+    Every claim quantity must appear in the premise: time quantities
+    match on exact canonical seconds (120 minutes == 2 hours);
+    plain numbers match on normalized value (two == 2); symbol-bearing
+    numeric tokens ($200, 9:40, 2bhk) fall back to the gate's exact-token
+    check. Same fail-closed direction as the gate: it can only refuse,
+    never verify by itself."""
+    sent_quantities = _quantities(sent_tokens)
+    sent_values = {v for _, v, _ in sent_quantities}
+    sent_timed = {c for c, _, u in sent_quantities if u}
+    for i, t in enumerate(claim_tokens):
+        if t not in _NUM_WORDS and not any(c.isdigit() for c in t):
+            continue
+        v = _parse_number(t)
+        if v is None:
+            if t not in sent_token_set:
+                return False
+            continue
+        unit = claim_tokens[i + 1] if i + 1 < len(claim_tokens) else None
+        factor = _TIME_UNITS.get(unit) if unit else None
+        if factor:
+            if v * factor not in sent_timed:
+                return False
+        elif v not in sent_values and t not in sent_token_set:
+            return False
+    return True
+
+
 def _nli_scores(provider, premise_text, hypothesis_text):
     """Module-level twin of the nested scorer in make_support_fn: same
     backend call, same ModelsError wrapping, same strict validation."""
@@ -189,9 +262,13 @@ def _scan(config, breaker, provider, threshold, hypothesis, claim_numbers,
         if _marks(sent_tokens) != claim_marks:
             continue
         sent_token_set = set(sent_tokens)
-        if any(n not in sent_token_set for n in claim_numbers):
-            continue
-        if restriction_guard and _restriction_gap(sent_tokens, hypothesis.split()):
+        if restriction_guard:
+            if not _numeric_match(hypothesis.split(), sent_token_set,
+                                  sent_tokens):
+                continue
+            if _restriction_gap(sent_tokens, hypothesis.split()):
+                continue
+        elif any(n not in sent_token_set for n in claim_numbers):
             continue
         scored += 1
         premise = " ".join(sent_tokens)
