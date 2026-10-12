@@ -562,3 +562,62 @@ def test_complete_roundtrip_ask_stays_eligible_on_denial(monkeypatch):
     assert r.status == cr_live.STATUS_UNAVAILABLE
     assert r.escalation_eligible is True  # complete+supported denial
     assert r.normalized["return_date"] == "2026-10-25"
+
+
+# --- review-#4 narrow vectors ------------------------------------------
+
+def test_shape_refuses_untyped_routes():
+    base = {"kind": "flight", "origin": "delhi", "destination": "kolkata",
+            "date": "2026-10-13", "date_state": "resolved",
+            "return_date": None, "passengers": 1, "cabin": "economy",
+            "trip": "oneway", "nonstop": False,
+            "missing": [], "unsupported": []}
+    bad_variants = [
+        dict(base, origin=42),                       # truthy != typed
+        dict(base, destination=["kolkata"]),         # list != str
+        dict(base, return_date="2026-10-25"),        # oneway => return None
+        dict(base, trip="roundtrip", return_date="2026-10-01"),  # before dep
+        dict(base, missing=None),                    # None is not empty
+        dict(base, unsupported=None),
+        dict(base, origin="d"),                      # below min length
+        dict(base, origin="delhi1"),                 # not city-shaped
+    ]
+    for bad in bad_variants:
+        with pytest.raises(ValueError):
+            cr_live.LookupResult(cr_live.STATUS_INSUFFICIENT, "t", "now",
+                                 cr_live.FAILURE_CONTENT, bad,
+                                 escalation_eligible=True)
+    good = dict(base, trip="roundtrip", return_date="2026-10-20")
+    r = cr_live.LookupResult(cr_live.STATUS_INSUFFICIENT, "t", "now",
+                             cr_live.FAILURE_CONTENT, good,
+                             escalation_eligible=True)
+    assert r.escalation_eligible is True
+
+
+def test_clock_time_constraint_is_unsupported():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow departing at 10:30", NOW_LOCAL)
+    assert any(u.startswith("time:preference") for u in n["unsupported"])
+
+
+def test_repeated_same_passenger_count_is_a_conflict():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow 2 adults and 2 adults", NOW_LOCAL)
+    assert any(u.startswith("passengers:conflict") for u in n["unsupported"])
+
+
+def test_leftover_constraint_fragments_are_refused():
+    for ask in ("flight Delhi to Kolkata tomorrow with a layover",
+                "flight Delhi to Kolkata tomorrow refundable",
+                "flight Delhi to Kolkata tomorrow arriving at 6pm"):
+        n = cr_live.flight_request(ask, NOW_LOCAL)
+        assert n["unsupported"], ask
+
+
+def test_supplied_time_party_constraints_make_lookup_ineligible(monkeypatch):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    for ask in ("flight Delhi to Kolkata tomorrow departing at 10:30",
+                "flight Delhi to Kolkata tomorrow 2 adults and 2 adults"):
+        r = cr_live.lookup(ask, NOW_LOCAL)
+        assert r.status == cr_live.STATUS_INSUFFICIENT, ask
+        assert r.escalation_eligible is False, ask

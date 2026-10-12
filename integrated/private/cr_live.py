@@ -59,29 +59,50 @@ def _deep_freeze(value):
     return value
 
 
+_CITY_SHAPE_RE = re.compile(r'^[a-z][a-z .-]{1,39}$')
+
+
 def _flight_shape_complete(norm):
-    """The exact typed/validated flight-request shape: kind flight, no
-    missing/unsupported fields, non-empty route, a resolved calendar-valid
-    departure date, a valid return date iff roundtrip, passengers 1-9, a
-    known cabin, typed trip/nonstop. Anything less is not dispatchable."""
+    """The exact typed/validated flight-request shape: kind flight;
+    missing/unsupported present as empty str SEQUENCES (None is a
+    refusal, not an empty list); origin/destination bounded non-empty
+    city-shaped STRINGS (truthiness is not typing); a resolved
+    calendar-valid departure date; trip in the closed set with the
+    return join ENFORCED (oneway => return None; roundtrip => a valid
+    return ON OR AFTER the departure); passengers an int 1-9; cabin in
+    the closed set; nonstop a bool. Anything less is not dispatchable."""
     try:
         if not norm or norm.get("kind") != "flight":
             return False
-        if norm.get("missing") or norm.get("unsupported"):
+        missing = norm.get("missing")
+        unsupported = norm.get("unsupported")
+        if not isinstance(missing, (list, tuple)) \
+                or not isinstance(unsupported, (list, tuple)):
             return False
-        if not norm.get("origin") or not norm.get("destination"):
+        if not all(isinstance(x, str) for x in
+                   tuple(missing) + tuple(unsupported)):
             return False
+        if missing or unsupported:
+            return False
+        for key in ("origin", "destination"):
+            v = norm.get(key)
+            if not isinstance(v, str) or not _CITY_SHAPE_RE.match(v):
+                return False
         if norm.get("date_state") != "resolved":
             return False
-        _date.fromisoformat(norm.get("date") or "")
+        dep = _date.fromisoformat(norm.get("date") or "")
         trip = norm.get("trip")
         if trip not in ("oneway", "roundtrip"):
             return False
         ret = norm.get("return_date")
-        if trip == "roundtrip" and not ret:
-            return False
-        if ret is not None:
-            _date.fromisoformat(ret)
+        if trip == "oneway":
+            if ret is not None:
+                return False
+        else:
+            if not isinstance(ret, str):
+                return False
+            if _date.fromisoformat(ret) < dep:
+                return False
         pax = norm.get("passengers")
         if not isinstance(pax, int) or isinstance(pax, bool) \
                 or not (1 <= pax <= 9):
@@ -198,9 +219,18 @@ _AIRLINE_RE = re.compile(
     r'qatar\s+airways|singapore\s+airlines|lufthansa|british\s+airways|'
     r'airasia)\b')
 _TIME_PREF_RE = re.compile(
-    r'(?i)\b(?:before|after|around|by)\s+\d{1,2}(?::\d{2})?\s*'
+    r'(?i)\b(?:before|after|around|by|at)\s+\d{1,2}(?::\d{2})?\s*'
     r'(?:a\.?m\.?|p\.?m\.?)\b|'
+    r'\b\d{1,2}:\d{2}\b|'
     r'\b(?:morning|afternoon|evening|red[- ]?eye)\b')
+# Step-A whitelist of accepted request shapes: route, one departure date
+# (ISO/today/tomorrow), optional return clause, adult count, cabin, trip
+# type, nonstop. Any OTHER constraint-looking fragment is conservatively
+# UNSUPPORTED (clarified), never silently dropped.
+_LEFTOVER_RE = re.compile(
+    r'(?i)\b(?:depart(?:ing|s|ure)?|arriv(?:e|ing|al))\s+at\b|'
+    r'\b(?:layover|stopover|refundable|flexible\s+dates?|baggage|luggage|'
+    r'window\s+seat|aisle\s+seat|meal\s+preference)\b')
 _TERMINAL_RE = re.compile(r'(?i)\bterminal\s+\d+\b')
 
 # resolved IATA codes are a NORMALIZATION aid only, never evidence
@@ -363,7 +393,9 @@ def flight_request(text, now_local=None):
                 unsupported.append("passengers:invalid(" + raw_m + ")")
             elif n not in counts:
                 counts.append(n)
-        if len(counts) > 1:
+        if len(pax_all) > 1:
+            # two passenger mentions - even the SAME count twice - are an
+            # ambiguous party, never a deduplicated total
             unsupported.append("passengers:conflict(" + "|".join(
                 str(c) for c in counts) + ")")
         elif counts:
@@ -386,6 +418,10 @@ def flight_request(text, now_local=None):
     tm = _TIME_PREF_RE.search(text)
     if tm:
         unsupported.append("time:preference(" + tm.group(0).strip() + ")")
+    lm = _LEFTOVER_RE.search(text)
+    if lm:
+        unsupported.append("constraint:unsupported(" +
+                           lm.group(0).strip().lower()[:30] + ")")
     vm = _VIA_RE.search(text)
     if vm:
         unsupported.append("route:via(" + vm.group(1).strip().lower() + ")")
@@ -505,6 +541,9 @@ def _flight_reply(norm, when):
         ask = " I can't filter by airline yet - I would check all airlines on the route."
     elif "airport:terminal" in unsupported:
         ask = " I can't filter by airport terminal yet."
+    elif any(u.startswith("constraint:unsupported") for u in unsupported):
+        ask = (" I can't honor that constraint yet - I can only check "
+               "route, dates, adults, cabin and one-way/return.")
     elif "date" in missing:
         ask = " Tell me the departure date and I will check that exact day."
     elif "origin" in missing or "destination" in missing:
