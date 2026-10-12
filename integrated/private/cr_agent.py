@@ -170,7 +170,22 @@ def respond(uid, chat_id, text, name="", goal_mode=False, readonly=False, channe
                 mem.add_message(uid,'assistant',reply);return reply,meta
     import cr_live
     if cr_live.requested(text):
-        reply=cr_live.answer(text);meta['tools'].append('live_public_lookup')
+        # Step A: the quick lookup is ATTEMPT 1 with a structured result -
+        # a verified result returns; an insufficient/unavailable result
+        # with escalation eligibility dispatches to the specialized
+        # capability (search_flights; durable browser job lands in steps
+        # B/C - until enabled it returns verified=False and the honest
+        # unverified reply stands). No blind retry of denied access.
+        result=cr_live.lookup(text,now_local=T.now_local(uid))
+        meta['tools'].append('live_public_lookup')
+        meta.setdefault('trace',[]).append({'tool':'live_public_lookup','status':result.status,'failure_code':result.failure_code,'escalation_eligible':result.escalation_eligible})
+        if result.escalation_eligible:
+            esc=T.run('search_flights',dict(result.normalized),ctx)
+            meta.setdefault('trace',[]).append({'tool':'search_flights','ok':bool(esc.get('ok')),'verified':bool(esc.get('verified'))})
+            if esc.get('verified'):
+                reply=esc['text'];meta['tools'].append('search_flights')
+                mem.add_message(uid,'assistant',reply);return reply,meta
+        reply=result.text
         mem.add_message(uid,'assistant',reply);return reply,meta
     citation_pages=[]
     search_results=[]
