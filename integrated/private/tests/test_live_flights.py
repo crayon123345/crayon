@@ -904,3 +904,55 @@ def test_unresolvable_relative_denial_refuses_without_clock():
     n = cr_live.flight_request(
         "flight Delhi to Kolkata on 2026-10-20, not tomorrow", None)
     assert "date:denial-unresolved" in n["unsupported"]
+
+
+# --- review-#12: an unqualified denied date excludes EITHER leg ----------
+
+def test_denied_date_matching_selected_return_is_refused():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow returning 2026-10-25 "
+        "not 2026-10-25", NOW_LOCAL)
+    assert n["date"] == "2026-10-13"
+    assert n["return_date"] == "2026-10-25"
+    assert "date:return-conflict(denied-value)" in n["unsupported"]
+
+
+def test_denied_date_matching_neither_leg_stays_complete():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow returning 2026-10-25 "
+        "not 2026-10-26", NOW_LOCAL)
+    assert n["return_date"] == "2026-10-25"
+    assert n["missing"] == [] and n["unsupported"] == []
+
+
+def test_return_scoped_denial_does_not_bind_the_departure_leg():
+    # 'not returning <date>' is EXPLICIT return-leg scope: it must not
+    # enter the unqualified denied-date set or block the departure leg.
+    # (It still over-refuses a positive return - intentional safe
+    # conservatism per the review-#12 scope caveats.)
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata on 2026-10-25 returning 2026-10-28 "
+        "not returning 2026-10-25", NOW_LOCAL)
+    assert n["date"] == "2026-10-25"
+    assert n["return_date"] == "2026-10-28"
+    assert not any(u.startswith("date:conflict") for u in n["unsupported"])
+    assert not any(u.startswith("date:return-conflict")
+                   for u in n["unsupported"])
+    assert "trip:conflict(no-return+return)" in n["unsupported"]
+
+
+def test_return_denied_value_is_ineligible_end_to_end(monkeypatch):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    r = cr_live.lookup(
+        "flight Delhi to Kolkata tomorrow returning 2026-10-25 "
+        "not 2026-10-25", NOW_LOCAL)
+    assert r.status == cr_live.STATUS_INSUFFICIENT
+    assert r.escalation_eligible is False
+
+
+def test_unresolvable_relative_denial_refuses_both_legs_without_clock():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata on 2026-10-20 returning 2026-10-25, "
+        "not tomorrow", None)
+    assert "date:denial-unresolved" in n["unsupported"]
+    assert "date:return-denial-unresolved" in n["unsupported"]

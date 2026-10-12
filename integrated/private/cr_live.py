@@ -619,6 +619,14 @@ def flight_request(text, now_local=None):
         # a relative denial we cannot resolve against the same clock -
         # conservatively refuse rather than risk a denied selection
         unsupported.append("date:denial-unresolved")
+    # an UNQUALIFIED denied date excludes EITHER leg: the selected return
+    # must never equal a denied date. Explicit leg scope ('not returning
+    # <date>') routes through the negated-return path, never into
+    # denied_dates, so every entry here is unqualified and binds BOTH legs
+    if return_date and return_date in denied_dates:
+        unsupported.append("date:return-conflict(denied-value)")
+    elif return_date and unresolved_date_denial:
+        unsupported.append("date:return-denial-unresolved")
     if _NEG_RETURN_RE.search(text) and (return_date or roundtrip_word):
         # 'no return' is incompatible with a positive return selection
         unsupported.append("trip:conflict(no-return+return)")
@@ -761,6 +769,10 @@ def _flight_reply(norm, when):
         ask = " I can't resolve that relative date yet - give me an exact date (YYYY-MM-DD) or say today/tomorrow."
     elif "date:denial-unresolved" in unsupported:
         ask = " I couldn't resolve which day your negated date rules out - give me the exact departure date."
+    elif any(u.startswith("date:return-conflict") for u in unsupported):
+        ask = " The date you excluded is the return date itself - give me a return date you do want."
+    elif "date:return-denial-unresolved" in unsupported:
+        ask = " I couldn't resolve which day your negated date rules out - give me the exact return date."
     elif any(u.startswith("date:return-alternatives") for u in unsupported):
         ask = " You gave more than one return date - tell me which one to use."
     elif any(u.startswith("date:return-unsupported") for u in unsupported):
