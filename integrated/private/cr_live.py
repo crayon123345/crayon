@@ -1,6 +1,6 @@
 """Deterministic public lookup for explicit search and changing-data requests.
 
-Step A (flight-escalation contract, review-#9 fold): lookup() returns a
+Step A (flight-escalation contract, review-#10 fold): lookup() returns a
 structured LookupResult. The flight request is normalized and RESOLVED
 BEFORE any network attempt: an incomplete or unsupported request is a
 clarification result with NO search/research call, NEVER a generic
@@ -264,7 +264,12 @@ _REQUEST_FILLER = frozenset({
     "deals", "deal", "for", "on", "of", "to", "from", "in", "at", "by",
     "and", "or", "with", "is", "are", "what", "whats", "how", "much",
     "latest", "news", "only", "just", "also", "go", "going", "fly",
-    "flying", "class", "not", "no", "now", "hey", "hi", "ok", "okay"})
+    "flying", "class", "now", "hey", "hi", "ok", "okay"})
+# "not"/"no" are deliberately NOT filler: only the explicitly modeled
+# negations above (route / cabin / nonstop / return / trip / pax / date)
+# consume their spans. ANY other negation token lands in the residual
+# stream and refuses the request - a denial can never silently apply to
+# an accepted semantic span.
 
 # resolved IATA codes are a NORMALIZATION aid only, never evidence
 _IATA = {
@@ -310,6 +315,14 @@ def _negated(text, start):
 
 
 _ROUTE_NEG_RE = re.compile(r'(?i)\b(?:not|no)\s+(?:from\s+)?$')
+_NEG_ONEWAY_RE = re.compile(r'(?i)\b(?:not|no)\s+one[- ]?way\b')
+_NEG_ROUNDTRIP_RE = re.compile(r'(?i)\b(?:not|no)\s+round[- ]?trip\b')
+_NEG_PAX_RE = re.compile(
+    r'(?i)\b(?:not|no)\s+(\d{1,2}|one|two|three|four|five|six|seven|'
+    r'eight|nine)\s+(?:adults?|passengers?|people|travell?ers?|tickets?|'
+    r'seats?)\b')
+_NEG_REL_RE = re.compile(r'(?i)\b(?:not|no)\s+(?:tomorrow|today|tonight)\b')
+_NEG_ISO_RE = re.compile(r'(?i)\b(?:not|no)\s+20\d\d-\d{1,2}-\d{1,2}\b')
 
 
 def _route_negated(text, start):
@@ -449,7 +462,11 @@ def flight_request(text, now_local=None):
     destination = None
     km = _ROUTE_KNOWN_RE.search(text)
     if km and _route_negated(text, km.start()):
-        # a DENIED route: consume the span but bind NOTHING - clarify
+        # a DENIED route: consume the span (and its "not "/"no " prefix)
+        # but bind NOTHING - clarify
+        pm = _ROUTE_NEG_RE.search(text[:km.start()])
+        if pm:
+            spans.append((pm.start(), km.start()))
         spans.append(km.span())
         unsupported.append("route:negated")
     elif km:
@@ -494,6 +511,9 @@ def flight_request(text, now_local=None):
     for rx in (_ISO_DATE_RE, _REL_RE, _NEXT_REL_RE):
         for dm in rx.finditer(departure_text):
             spans.append(dm.span())  # negated spans consumed too
+    for rx in (_NEG_REL_RE, _NEG_ISO_RE):
+        for dm in rx.finditer(departure_text):
+            spans.append(dm.span())  # and their "not "/"no " prefixes
     date, date_state, date_note = _parse_date(departure_text, now_local)
     if date_state in ("invalid", "unsupported", "conflict"):
         if date_note.startswith("alternatives("):
@@ -503,19 +523,35 @@ def flight_request(text, now_local=None):
                                ("(" + date_note + ")" if date_note else ""))
     return_date, returning = _parse_return_date(text, now_local,
                                                 unsupported)
-    oneway_word = bool(re.search(r'(?i)\bone[- ]?way\b', text))
-    roundtrip = bool(re.search(r'(?i)\bround[- ]?trip\b', text)) or returning
+    if _NEG_ONEWAY_RE.search(text):
+        unsupported.append("trip:negated(one-way)")
+        spans += [m.span() for m in _NEG_ONEWAY_RE.finditer(text)]
+    if _NEG_ROUNDTRIP_RE.search(text):
+        unsupported.append("trip:negated(round-trip)")
+        spans += [m.span() for m in _NEG_ROUNDTRIP_RE.finditer(text)]
+    oneway_word = bool(_unnegated(re.compile(r'(?i)\bone[- ]?way\b'), text))
+    roundtrip_word = bool(_unnegated(re.compile(r'(?i)\bround[- ]?trip\b'),
+                                     text))
+    roundtrip = roundtrip_word or returning
     if oneway_word and roundtrip:
         # contradictory trip words are reconciled by clarification,
         # never by silently dropping one side
         unsupported.append("trip:conflict(one-way+roundtrip)")
     if return_date and date and return_date < date:
         unsupported.append("date:return-order(before-departure)")
-    pax_all = _PAX_RE.findall(text)
+    pax_all = []
+    pax_seen = False
     passengers = 1
+    for pm in _PAX_RE.finditer(text):
+        spans.append(pm.span())
+        pax_seen = True
+        if _negated(text, pm.start()):
+            # a DENIED count is clarified, never bound as the party size
+            unsupported.append("passengers:negated(" + pm.group(1) + ")")
+            continue
+        pax_all.append(pm.group(1))
+    spans += [m.span() for m in _NEG_PAX_RE.finditer(text)]
     if pax_all:
-        for pm in _PAX_RE.finditer(text):
-            spans.append(pm.span())
         counts = []
         for raw_m in pax_all:
             raw = raw_m.lower()
@@ -531,7 +567,7 @@ def flight_request(text, now_local=None):
                 str(c) for c in counts) + ")")
         elif counts:
             passengers = counts[0]
-    elif _PAX_WORD_RE.search(text):
+    elif not pax_seen and _PAX_WORD_RE.search(text):
         unsupported.append("passengers:unparsed")
     if _KID_RE.search(text):
         unsupported.append("passengers:children-infants")
@@ -721,6 +757,10 @@ def _flight_reply(norm, when):
                "the exact origin and destination cities.")
     elif any(u.startswith("trip:conflict") for u in unsupported):
         ask = " You said both one-way and round-trip - tell me which."
+    elif any(u.startswith("trip:negated") for u in unsupported):
+        ask = " You negated the trip type - tell me if it's one-way or round-trip."
+    elif any(u.startswith("passengers:negated") for u in unsupported):
+        ask = " You negated the passenger count - tell me how many adults are travelling."
     elif "route:unresolved" in unsupported:
         ask = (" I couldn't verify those city names - tell me the exact "
                "origin and destination cities.")

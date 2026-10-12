@@ -819,3 +819,55 @@ def test_oneway_word_positive_stays_complete():
                                NOW_LOCAL)
     assert n["trip"] == "oneway"
     assert n["missing"] == [] and n["unsupported"] == []
+
+
+# --- review-#10: negation never binds accepted semantics -----------------
+
+def test_negated_oneway_is_clarified():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow not one way", NOW_LOCAL)
+    assert "trip:negated(one-way)" in n["unsupported"]
+
+
+def test_negated_roundtrip_with_return_is_clarified():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata not round trip returning 2026-10-25",
+        NOW_LOCAL)
+    assert "trip:negated(round-trip)" in n["unsupported"]
+
+
+def test_negated_passenger_count_never_binds():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow not 2 adults", NOW_LOCAL)
+    assert n["passengers"] == 1  # no binding from a denied count
+    assert any(u.startswith("passengers:negated") for u in n["unsupported"])
+    assert "passengers:unparsed" not in n["unsupported"]  # single clear cause
+
+
+def test_unmodeled_negation_is_residual_refusal():
+    n = cr_live.flight_request(
+        "flight Delhi to Kolkata tomorrow, not Friday", NOW_LOCAL)
+    assert any(u.startswith("constraint:unparsed") for u in n["unsupported"])
+
+
+@pytest.mark.parametrize("ask", [
+    "flight Delhi to Kolkata tomorrow not one way",
+    "flight Delhi to Kolkata not round trip returning 2026-10-25",
+    "flight Delhi to Kolkata tomorrow not 2 adults",
+])
+def test_denied_trip_and_pax_are_ineligible_end_to_end(monkeypatch, ask):
+    monkeypatch.setattr(cr_live.W, "search", _boom)
+    r = cr_live.lookup(ask, NOW_LOCAL)
+    assert r.status == cr_live.STATUS_INSUFFICIENT
+    assert r.escalation_eligible is False
+
+
+@pytest.mark.parametrize("ask", [
+    "flight Delhi to Kolkata on 2026-10-20, not tomorrow",   # modeled date polarity
+    "flight Delhi to Kolkata tomorrow not business, economy only",  # modeled cabin
+    "flight Delhi to Kolkata on 2026-10-20, no return",      # modeled trip polarity
+    "flight Delhi to Kolkata tomorrow 2 adults",             # positive count
+])
+def test_modeled_polarity_positives_stay_complete(ask):
+    n = cr_live.flight_request(ask, NOW_LOCAL)
+    assert n["missing"] == [] and n["unsupported"] == [], ask
