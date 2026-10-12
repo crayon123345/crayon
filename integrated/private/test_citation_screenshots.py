@@ -50,7 +50,9 @@ def test_flight_search_leads_not_quotes(monkeypatch):
  monkeypatch.setattr(L.W,'search',lambda *a:[{'title':'Airline search','url':'https://example.com/flights'}])
  monkeypatch.setattr(L.W,'fetch',lambda *a: (_ for _ in ()).throw(RuntimeError('blocked')))
  r=L.answer('Cheapest flight Delhi Kolkata')
- assert 'cheapest flight' in r and 'What window' in r
+ # PR #41: leads are not quotes - no lowest fare may be asserted without
+ # dated, available itineraries; the reply must say so and note the check.
+ assert 'could not verify a current fare' in r and 'No lowest fare is verified yet' in r and 'Checked:' in r
 
 def test_regression_snippets_keep_search_links(monkeypatch):
  import cr_live as L
@@ -96,4 +98,6 @@ def test_flight_fetched_prices_are_not_bailed_out(monkeypatch):
  monkeypatch.setattr(L.W.llm,'generate',lambda *a,**k:{'text':'Advertised fare'})
  monkeypatch.setattr(Cit,'checked_answer',lambda *a:'The site advertises Delhi-Kolkata fares from Rs6200, not a dated available quote.\nSource: https://example.com/flights')
  r=L.answer('Cheapest flight Delhi Kolkata')
- assert 'Rs6200' in r and 'Checked:' in r and 'What window' not in r
+ # PR #41: an advertised, undated starting fare is NOT a verified quote and
+ # must not be passed through as one.
+ assert 'Rs6200' not in r and 'No lowest fare is verified yet' in r and 'Checked:' in r and 'What window' not in r
