@@ -284,6 +284,9 @@ def _do_search(q: str):
             try:
                 rows = [{"title": str(r.get("title", ""))[:140], "url": str(r.get("url", ""))[:300], "snippet": str(r.get("body", ""))[:300], "date": str(r.get("date", ""))[:10]}
                         for r in DDGS(timeout=8).news(q, max_results=6, safesearch="moderate", backend=backend)]
+                # Filter first: rows the dedupe step would drop (non-http URLs)
+                # must count as empty so the chain still tries the next backend.
+                rows = [r for r in rows if r["url"].startswith(("http://", "https://"))]
                 if rows:
                     return rows
                 empty = True
@@ -297,6 +300,8 @@ def _do_search(q: str):
             try:
                 rows = [{"title": str(r.get("title", ""))[:140], "url": str(r.get("href", ""))[:300], "snippet": str(r.get("body", ""))[:300], "date": ""}
                         for r in DDGS(timeout=8).text(q, max_results=6, region="wt-wt", safesearch="moderate", backend=backend)]
+                # Same filter-first rule as get_news.
+                rows = [r for r in rows if r["url"].startswith(("http://", "https://"))]
                 if rows:
                     return rows
                 empty = True

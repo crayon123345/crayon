@@ -46,6 +46,10 @@ class FakeDDGS:
             raise DDGSException("No results found.")
         if mode == "empty":
             return []
+        if mode == "badurl":
+            row = {"title": "trap", "body": "snippet", "date": "2026-10-13"}
+            row["href" if href else "url"] = "javascript:alert(1)"
+            return [row]
         row = {"title": f"{method}-{backend} title", "body": "snippet", "date": "2026-10-13"}
         row["href" if href else "url"] = f"https://example.com/{method}-{backend}"
         return [row]
@@ -109,7 +113,7 @@ def test_total_outage_not_ok(fake_ddgs):
     assert ok is False
 
 
-def test_rows_normalized_and_deduped(fake_ddgs):
+def test_rows_normalized_and_deduped(fake_ddgs, monkeypatch):
     dup = {"title": "t" * 200, "body": "s" * 400, "date": "2026-10-13"}
     class SameURL(FakeDDGS):
         def _act(self, method, backend, href):
@@ -117,11 +121,32 @@ def test_rows_normalized_and_deduped(fake_ddgs):
             row["href" if href else "url"] = "https://example.com/same"
             return [row]
     fake_ddgs.behavior = {("text", "auto"): "rows", ("news", "auto"): "rows"}
-    FakeDDGS._act = SameURL._act
-    try:
-        res, ok = app._do_search("q")
-    finally:
-        del FakeDDGS._act
+    # monkeypatch restores the original _act after the test; a bare
+    # overwrite+del deletes the class attribute and breaks later tests
+    # (cross-review repro: dedupe-first ordering made partial_outage fail).
+    monkeypatch.setattr(FakeDDGS, "_act", SameURL._act)
+    res, ok = app._do_search("q")
     assert ok is True
     assert len(res) == 1  # same URL across families deduped
     assert len(res[0]["title"]) == 140 and len(res[0]["snippet"]) == 300
+
+
+def test_class_override_is_restored(fake_ddgs):
+    # Runs after test_rows_normalized_and_deduped in file order: if that test
+    # ever leaks its FakeDDGS._act override again, this rows-mode search fails.
+    fake_ddgs.behavior = {("text", "auto"): "rows", ("news", "auto"): "rows"}
+    res, ok = app._do_search("q")
+    assert ok is True
+    assert any(r["url"] == "https://example.com/text-auto" for r in res)
+
+
+def test_unusable_rows_trigger_fallback(fake_ddgs):
+    # A backend whose rows are all unusable (non-http URLs, dropped by the
+    # dedupe filter) must count as empty so the chain tries the next backend.
+    fake_ddgs.behavior = {("text", "auto"): "badurl", ("text", "yahoo"): "rows",
+                          ("news", "auto"): "rows"}
+    res, ok = app._do_search("q")
+    assert ok is True
+    assert any(r["url"] == "https://example.com/text-yahoo" for r in res)
+    text_backends = [b for m, b in fake_ddgs.calls if m == "text"]
+    assert text_backends == ["auto", "yahoo"]
