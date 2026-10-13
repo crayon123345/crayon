@@ -299,3 +299,89 @@ def test_direct_mode_steps_labeled_by_actual_provider(monkeypatch):
     provider = llm.provider()
     steps = [(provider, None, "default")]
     assert steps[0][0] == "openrouter"  # not the old hardcoded 'gemini'
+
+
+# ---- round 6: real app.model config-drift receipts ----
+
+@pytest.fixture
+def real_app(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "test-secret-key-for-pytest-only")
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+    import app as A
+    A._models.clear()
+    yield A
+    A._models.clear()
+
+
+def test_app_model_cache_is_provider_aware(real_app, monkeypatch):
+    """Config drift must not hand back a client built under the other backend."""
+    built = []
+
+    def fake_build(streaming=True, name=None):
+        c = object()
+        built.append((llm.provider(), name, c))
+        return c
+
+    monkeypatch.setattr(llm, "build_model", fake_build)
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"g", "openrouter/free"})
+
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    or_client = real_app.model("g")
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    gem_client = real_app.model("g")
+    assert or_client is not gem_client            # no stale OR client under Gemini config
+    assert built[0][0] == "openrouter" and built[1][0] == "gemini"
+
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    assert real_app.model("g") is or_client       # cache hit, same backend -> same client
+    assert len(built) == 2                         # nothing rebuilt
+
+
+def test_app_model_cached_or_client_reverified(real_app, monkeypatch):
+    """A cached OR client must not outlive its price verification."""
+    monkeypatch.setattr(llm, "build_model", lambda streaming=True, name=None: object())
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"g"})
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    real_app.model("g")  # cached under verified-free 'g'
+
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"openrouter/free"})  # 'g' went paid
+    with pytest.raises(RuntimeError, match="not zero-price"):
+        real_app.model("g")
+
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: None)  # catalog down
+    with pytest.raises(RuntimeError, match="unverifiable"):
+        real_app.model("g")
+
+
+def test_twilio_drift_scenario_real_app_model(real_app, monkeypatch):
+    """The reviewer's repro, with the REAL app.model: OR config caches an OR client
+    for 'g'; config flips to Gemini; a Gemini-labeled Twilio step must get a freshly
+    built Gemini client, never the cached OR one."""
+    import types, asyncio
+    built = []
+
+    class FakeClient:
+        def __init__(self, prov): self.prov = prov
+        async def ainvoke(self, msgs):
+            if self.prov == "openrouter":
+                raise RuntimeError("OR client failed")
+            return types.SimpleNamespace(content="gemini answer")
+
+    def fake_build(streaming=True, name=None):
+        c = FakeClient(llm.provider()); built.append(c); return c
+
+    monkeypatch.setattr(llm, "build_model", fake_build)
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"g", "openrouter/free"})
+    monkeypatch.setattr(llm, "to_messages", lambda h, t, m, a=False: [types.SimpleNamespace(content="sys")])
+
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    or_client = real_app.model("g")          # cached under OR config
+
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(llm, "plan", lambda text: [("gemini", "g", "g")])
+    llm._FREE_CACHE.update(ts=llm._time.time(), ids={"g"})
+
+    import twilio_wa
+    out = asyncio.run(twilio_wa.think([], "hi"))
+    assert out == "gemini answer"
+    assert built[-1] is not or_client and built[-1].prov == "gemini"  # fresh Gemini client, not the stale OR one

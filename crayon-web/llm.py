@@ -162,8 +162,8 @@ OR_CATALOG_URL = "https://openrouter.ai/api/v1/models"
 # zero-spend cap, other fee fields are catalog-prefilter-only, and live
 # paid-refusal is UNRUN. Cache TTL is 5 min.
 OR_CATALOG_TTL_S = 300
-# Execution-time price protection: passed as extra_body on every OpenRouter call,
-# so a stale catalog can never let a paid provider serve the request.
+# Execution-time price protection: passed as extra_body on every OpenRouter call.
+# Scope: the five documented acceptance filters only; not a total-spend cap.
 OR_MAX_PRICE_ZERO = {"prompt": "0", "completion": "0", "image": "0", "audio": "0", "request": "0"}
 # Pinned free defaults, verified zero-price in the live OpenRouter catalog on 2026-10-13.
 PINNED_FREE_CODE_MODELS = ["nvidia/nemotron-3-ultra-550b-a55b:free", "cohere/north-mini-code:free", "openrouter/free"]

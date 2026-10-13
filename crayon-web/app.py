@@ -68,10 +68,24 @@ _models: dict = {}
 
 
 def model(name=None):
-    key = name or "_default"
-    if key not in _models:
-        _models[key] = llm.build_model(name=name) if name else llm.build_model()
-    return _models[key]
+    # Cache is bound to the ACTUAL backend identity (provider + resolved model),
+    # not just the requested name: a config flip (gemini <-> openrouter) must
+    # never hand back a client built under the other backend.
+    prov = llm.provider()
+    resolved = name or (os.environ.get("OPENROUTER_MODEL", "openrouter/free") if prov == "openrouter"
+                        else llm.model_names()[0])
+    key = f"{prov}|{resolved}"
+    entry = _models.get(key)
+    if entry is None:
+        client = llm.build_model(name=name) if name else llm.build_model()
+        _models[key] = (client, prov, resolved)
+        return client
+    client, bprov, bmodel = entry
+    if bprov == "openrouter":
+        # A cached client's price verification must not outlive the catalog
+        # metadata: re-verify (warm-cache cheap) or fail closed to the next step.
+        llm._require_free(bmodel)
+    return client
 
 
 def client_ip(req: Request) -> str:
