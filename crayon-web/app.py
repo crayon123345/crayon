@@ -191,7 +191,7 @@ async def chat(req: Request):
         active["n"] += 1
         try:
             used_model = None
-            steps = llm.plan(text) if llm.provider() == "gemini" else [("gemini", None, "default")]
+            steps = llm.plan(text) if llm.provider() == "gemini" else [(llm.provider(), None, "default")]
             last = None
             for kind, nm, lab in steps:
                 try:
@@ -211,8 +211,10 @@ async def chat(req: Request):
                 except Exception as e2:
                     last = e2
                     print("model fail:", kind, nm, type(e2).__name__)
-                    if kind == "or":
-                        llm.invalidate_free_cache()  # a failed OR call may mean catalog drift; re-verify next plan
+                    if kind == "or" or llm.provider() == "openrouter":
+                        # failed OR-routed call (plan label OR direct provider mode, incl. cached
+                        # clients from app.model): may mean catalog drift; re-verify next plan
+                        llm.invalidate_free_cache()
                     if out:
                         break
             if last is not None and not out:

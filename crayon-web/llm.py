@@ -157,8 +157,10 @@ def or_key() -> str:
 OR_CATALOG_URL = "https://openrouter.ai/api/v1/models"
 # Freshness policy: catalog metadata is a pre-filter, NOT a spend guarantee - a
 # warm cache can be stale in both directions (model went paid, or outage hides a
-# change). The hard stop is the execution-time max_price=0 provider constraint
-# below, which makes OpenRouter itself refuse any paid route. Cache TTL is 5 min.
+# change). Execution-time max_price=0 (below) adds the five DOCUMENTED acceptance
+# filters (prompt/completion/image/audio/request) as a second layer; it is not a
+# zero-spend cap, other fee fields are catalog-prefilter-only, and live
+# paid-refusal is UNRUN. Cache TTL is 5 min.
 OR_CATALOG_TTL_S = 300
 # Execution-time price protection: passed as extra_body on every OpenRouter call,
 # so a stale catalog can never let a paid provider serve the request.
@@ -255,9 +257,9 @@ def _require_free(name: str):
 
 def code_models():
     # Free-only, fail closed. Env-supplied models run only when the live OpenRouter
-    # catalog verifies them as zero-price; when the catalog is unreachable the env
-    # entries are dropped as unverifiable and the pinned defaults (verified at pin
-    # time) remain. CRAYON_DEEPSEEK_MODEL activates the moment a genuinely free
+    # catalog verifies them as zero-price; when the catalog is unreachable, NOTHING
+    # is returned (env entries AND pinned defaults are unverifiable then) and
+    # plan() falls back to the Gemini chain. CRAYON_DEEPSEEK_MODEL activates the moment a genuinely free
     # DeepSeek is listed - as of 2026-10-13 the catalog has none, so a paid id
     # here is refused, not run. Do NOT strip :free suffixes to force a match.
     ds = os.environ.get("CRAYON_DEEPSEEK_MODEL", "").strip()
@@ -281,8 +283,9 @@ def code_models():
 
 
 def _or_extra_body():
-    # Hard execution-time stop: OpenRouter refuses to route to any provider whose
-    # price exceeds max_price=0, even if our catalog cache is stale.
+    # Execution-time layer: asks OpenRouter to accept only providers within
+    # max_price=0 for the five documented filter fields. Covers those fields
+    # only - not a zero-spend cap; live paid-refusal UNRUN.
     return {"provider": {"max_price": dict(OR_MAX_PRICE_ZERO)}}
 
 

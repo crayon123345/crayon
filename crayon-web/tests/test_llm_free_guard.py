@@ -264,3 +264,38 @@ def test_twilio_or_failure_invalidates_cache(monkeypatch):
     out = asyncio.run(twilio_wa.think([], "hi"))
     assert out == "gemini answer"
     assert llm._FREE_CACHE["ids"] is None  # invalidated by the failing OR step
+
+
+# ---- round 5: direct provider-mode invalidation (actual identity, not plan label) ----
+
+def test_direct_or_mode_failure_invalidates_despite_gemini_label(monkeypatch):
+    """LLM_PROVIDER=openrouter: plan steps can be labeled 'gemini' while the client
+    is actually OpenRouter. A failure must still drop the catalog cache."""
+    import types
+    import asyncio
+
+    fake_app = types.ModuleType("app")
+
+    class CachedORClient:
+        async def ainvoke(self, msgs): raise RuntimeError("cached OR client failed")
+
+    fake_app.model = lambda nm=None: CachedORClient()  # cached client outlives verification
+    monkeypatch.setitem(sys.modules, "app", fake_app)
+
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setattr(llm, "plan", lambda text: [("gemini", None, "default")])  # honest-bug label
+    monkeypatch.setattr(llm, "to_messages", lambda h, t, m, a=False: [types.SimpleNamespace(content="sys")])
+    llm._FREE_CACHE.update(ts=llm._time.time(), ids={"x:free"})  # warm cache
+
+    import twilio_wa
+    with pytest.raises(RuntimeError, match="cached OR client failed"):
+        asyncio.run(twilio_wa.think([], "hi"))
+    assert llm._FREE_CACHE["ids"] is None  # invalidated via actual provider identity
+
+
+def test_direct_mode_steps_labeled_by_actual_provider(monkeypatch):
+    """The web/Discord direct-mode branch must label steps with the real provider."""
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    provider = llm.provider()
+    steps = [(provider, None, "default")]
+    assert steps[0][0] == "openrouter"  # not the old hardcoded 'gemini'

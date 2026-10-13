@@ -70,7 +70,7 @@ def register():
         async with msg.channel.typing():
             out = []
             try:
-                steps = llm.plan(text) if llm.provider() == "gemini" else [("gemini", None, "default")]
+                steps = llm.plan(text) if llm.provider() == "gemini" else [(llm.provider(), None, "default")]
                 last = None
                 for kind, nm, lab in steps:
                     try:
@@ -84,8 +84,8 @@ def register():
                     except Exception as e2:
                         last = e2
                         print("discord model fail:", type(e2).__name__)
-                        if kind == "or":
-                            llm.invalidate_free_cache()  # re-verify catalog on next plan
+                        if kind == "or" or llm.provider() == "openrouter":
+                            llm.invalidate_free_cache()  # direct-OR mode too; re-verify next plan
                         if out:
                             break
                 if last is not None and not out:
