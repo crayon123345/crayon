@@ -148,9 +148,10 @@ def or_key() -> str:
 
 
 def code_models():
-    # DeepSeek is paid on OpenRouter; only used if CRAYON_DEEPSEEK_MODEL is set explicitly.
+    # DeepSeek V3/R1 have free hosted variants on OpenRouter (:free, 50 req/day shared free quota).
+    # CRAYON_DEEPSEEK_MODEL can still override with any explicit model id.
     ds = os.environ.get("CRAYON_DEEPSEEK_MODEL", "").strip()
-    raw = os.environ.get("CRAYON_CODE_MODELS", "nvidia/nemotron-3-ultra-550b-a55b:free,cohere/north-mini-code:free,openrouter/free")
+    raw = os.environ.get("CRAYON_CODE_MODELS", "deepseek/deepseek-chat-v3-0324:free,nvidia/nemotron-3-ultra-550b-a55b:free,cohere/north-mini-code:free,openrouter/free")
     names = ([ds] if ds else []) + [x.strip() for x in raw.split(",") if x.strip()]
     return names
 
