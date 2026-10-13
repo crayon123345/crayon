@@ -64,12 +64,14 @@ def model_names():
 def build_model(streaming: bool = True, name: str | None = None):
     p = provider()
     if p == "openrouter":
-        from langchain_openai import ChatOpenAI
         key = os.environ.get("OPENROUTER_API_KEY")
         if not key:
             raise RuntimeError("OPENROUTER_API_KEY missing")
+        name = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+        _require_free(name)
+        from langchain_openai import ChatOpenAI
         return ChatOpenAI(
-            model=os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash"),
+            model=name,
             api_key=key,
             base_url="https://openrouter.ai/api/v1",
             streaming=streaming,
@@ -136,8 +138,11 @@ def chunk_text(chunk) -> str:
     return "".join(out)
 
 
-# ---- model router (free models only by default) ----
+# ---- model router (free models only, verified against the live catalog) ----
 import re as _re
+import json as _json
+import time as _time
+import urllib.request as _urlreq
 
 CODE_HINT = _re.compile(r"\b(code|python|javascript|script|function|bug|debug|error|regex|sql|algorithm|api|class|compile|stack ?trace|"
                         r"calculate|math|equation|prove|proof|derive|optimi[sz]e|solve|integral|probability|big-?o|refactor)\b|\[Computer output\]", _re.I)
@@ -147,13 +152,74 @@ def or_key() -> str:
     return os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
+OR_CATALOG_URL = "https://openrouter.ai/api/v1/models"
+OR_CATALOG_TTL_S = 6 * 3600
+# Pinned free defaults, verified zero-price in the live OpenRouter catalog on 2026-10-13.
+PINNED_FREE_CODE_MODELS = ["nvidia/nemotron-3-ultra-550b-a55b:free", "cohere/north-mini-code:free", "openrouter/free"]
+
+_FREE_CACHE = {"ts": 0.0, "ids": None}
+
+
+def free_model_ids(force: bool = False):
+    """Zero-price (prompt and completion both 0) model ids from the live OpenRouter
+    catalog, cached for OR_CATALOG_TTL_S. Returns None when the catalog cannot be
+    fetched or parsed - that means 'unverifiable', and callers must fail closed."""
+    now = _time.time()
+    if not force and _FREE_CACHE["ids"] is not None and now - _FREE_CACHE["ts"] < OR_CATALOG_TTL_S:
+        return _FREE_CACHE["ids"]
+    try:
+        req = _urlreq.Request(OR_CATALOG_URL, headers={"User-Agent": "crayon-free-check"})
+        with _urlreq.urlopen(req, timeout=10) as r:
+            data = _json.load(r)
+        ids = set()
+        for m in data.get("data", []):
+            pr = m.get("pricing") or {}
+            try:
+                if float(pr.get("prompt") or 1) == 0.0 and float(pr.get("completion") or 1) == 0.0 and m.get("id"):
+                    ids.add(m["id"])
+            except (TypeError, ValueError):
+                continue
+        _FREE_CACHE.update(ts=now, ids=ids)
+        return ids
+    except Exception:
+        return None
+
+
+def _require_free(name: str):
+    """Fail closed: only models verified zero-price in the live catalog may run."""
+    ids = free_model_ids()
+    if ids is None:
+        raise RuntimeError(
+            f"OpenRouter catalog unreachable; refusing unverifiable model {name!r} (free-only rule).")
+    if name not in ids:
+        raise RuntimeError(
+            f"OpenRouter model {name!r} is not zero-price in the live catalog (free-only rule); refusing to run it.")
+
+
 def code_models():
-    # DeepSeek V3/R1 have free hosted variants on OpenRouter (:free, 50 req/day shared free quota).
-    # CRAYON_DEEPSEEK_MODEL can still override with any explicit model id.
+    # Free-only, fail closed. Env-supplied models run only when the live OpenRouter
+    # catalog verifies them as zero-price; when the catalog is unreachable the env
+    # entries are dropped as unverifiable and the pinned defaults (verified at pin
+    # time) remain. CRAYON_DEEPSEEK_MODEL activates the moment a genuinely free
+    # DeepSeek is listed - as of 2026-10-13 the catalog has none, so a paid id
+    # here is refused, not run. Do NOT strip :free suffixes to force a match.
     ds = os.environ.get("CRAYON_DEEPSEEK_MODEL", "").strip()
-    raw = os.environ.get("CRAYON_CODE_MODELS", "deepseek/deepseek-chat-v3-0324:free,nvidia/nemotron-3-ultra-550b-a55b:free,cohere/north-mini-code:free,openrouter/free")
-    names = ([ds] if ds else []) + [x.strip() for x in raw.split(",") if x.strip()]
-    return names
+    raw = os.environ.get("CRAYON_CODE_MODELS", "")
+    env_names = ([ds] if ds else []) + [x.strip() for x in raw.split(",") if x.strip()]
+    ids = free_model_ids()
+    names = []
+    if ids is not None:
+        names.extend(n for n in env_names if n in ids)
+        names.extend(n for n in PINNED_FREE_CODE_MODELS if n in ids)
+    else:
+        names.extend(PINNED_FREE_CODE_MODELS)
+    seen = set()
+    out = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
 
 
 def build_or(name: str):
