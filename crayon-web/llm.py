@@ -71,6 +71,7 @@ def build_model(streaming: bool = True, name: str | None = None):
         _require_free(name)
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
+            extra_body=_or_extra_body(),
             model=name,
             api_key=key,
             base_url="https://openrouter.ai/api/v1",
@@ -143,6 +144,7 @@ import re as _re
 import json as _json
 import time as _time
 import urllib.request as _urlreq
+from decimal import Decimal as _Decimal
 
 CODE_HINT = _re.compile(r"\b(code|python|javascript|script|function|bug|debug|error|regex|sql|algorithm|api|class|compile|stack ?trace|"
                         r"calculate|math|equation|prove|proof|derive|optimi[sz]e|solve|integral|probability|big-?o|refactor)\b|\[Computer output\]", _re.I)
@@ -153,15 +155,65 @@ def or_key() -> str:
 
 
 OR_CATALOG_URL = "https://openrouter.ai/api/v1/models"
-OR_CATALOG_TTL_S = 6 * 3600
+# Freshness policy: catalog metadata is a pre-filter, NOT a spend guarantee - a
+# warm cache can be stale in both directions (model went paid, or outage hides a
+# change). The hard stop is the execution-time max_price=0 provider constraint
+# below, which makes OpenRouter itself refuse any paid route. Cache TTL is 5 min.
+OR_CATALOG_TTL_S = 300
+# Execution-time price protection: passed as extra_body on every OpenRouter call,
+# so a stale catalog can never let a paid provider serve the request.
+OR_MAX_PRICE_ZERO = {"prompt": "0", "completion": "0", "image": "0", "audio": "0", "request": "0"}
 # Pinned free defaults, verified zero-price in the live OpenRouter catalog on 2026-10-13.
 PINNED_FREE_CODE_MODELS = ["nvidia/nemotron-3-ultra-550b-a55b:free", "cohere/north-mini-code:free", "openrouter/free"]
 
 _FREE_CACHE = {"ts": 0.0, "ids": None}
 
 
+def invalidate_free_cache():
+    """Drop the cached catalog (e.g. after any OpenRouter call error)."""
+    _FREE_CACHE.update(ts=0.0, ids=None)
+
+
+def _dec_zero(v) -> bool:
+    """True only if v parses to a finite Decimal exactly equal to zero.
+    Numeric 0 and "0"/"0.0" pass; "1e-999" (float would underflow) fails;
+    NaN/Infinity/unparseable fail."""
+    if isinstance(v, bool):
+        return False
+    try:
+        d = _Decimal(str(v).strip())
+    except Exception:
+        return False
+    return d.is_finite() and d == 0
+
+
+# Keys inside tiered 'overrides' entries that are thresholds, not prices. Any
+# other key - including price fields we do not recognize yet - must be exactly
+# zero, so a new paid component fails closed instead of slipping through.
+_NON_PRICE_TIER_KEYS = {"min_prompt_tokens", "max_prompt_tokens", "min_completion_tokens", "max_completion_tokens"}
+
+
+def _pricing_is_zero(pr) -> bool:
+    """True only when pricing is a non-empty dict and EVERY charge component is
+    exactly zero - token prices, request/image/audio fees, cache rates, and any
+    tiered 'overrides'. Absent, empty, unknown, or unparseable pricing is NOT
+    free: token price zero is not total zero."""
+    if not isinstance(pr, dict) or not pr:
+        return False
+    for k, v in pr.items():
+        if k == "overrides":
+            if not isinstance(v, list) or not v or not all(_pricing_is_zero(t) for t in v):
+                return False
+            continue
+        if k in _NON_PRICE_TIER_KEYS:
+            continue
+        if not _dec_zero(v):
+            return False
+    return True
+
+
 def free_model_ids(force: bool = False):
-    """Zero-price (prompt and completion both 0) model ids from the live OpenRouter
+    """Ids whose FULL pricing verifies as exactly zero in the live OpenRouter
     catalog, cached for OR_CATALOG_TTL_S. Returns None when the catalog cannot be
     fetched or parsed - that means 'unverifiable', and callers must fail closed."""
     now = _time.time()
@@ -173,12 +225,8 @@ def free_model_ids(force: bool = False):
             data = _json.load(r)
         ids = set()
         for m in data.get("data", []):
-            pr = m.get("pricing") or {}
-            try:
-                if float(pr.get("prompt") or 1) == 0.0 and float(pr.get("completion") or 1) == 0.0 and m.get("id"):
-                    ids.add(m["id"])
-            except (TypeError, ValueError):
-                continue
+            if m.get("id") and _pricing_is_zero(m.get("pricing")):
+                ids.add(m["id"])
         _FREE_CACHE.update(ts=now, ids=ids)
         return ids
     except Exception:
@@ -211,8 +259,9 @@ def code_models():
     if ids is not None:
         names.extend(n for n in env_names if n in ids)
         names.extend(n for n in PINNED_FREE_CODE_MODELS if n in ids)
-    else:
-        names.extend(PINNED_FREE_CODE_MODELS)
+    # ids is None: catalog unverifiable -> return NOTHING. Pinned metadata is not
+    # a spend guarantee; plan() then falls back to the Gemini chain only, and any
+    # direct build_or call is refused by _require_free before construction.
     seen = set()
     out = []
     for n in names:
@@ -222,10 +271,18 @@ def code_models():
     return out
 
 
+def _or_extra_body():
+    # Hard execution-time stop: OpenRouter refuses to route to any provider whose
+    # price exceeds max_price=0, even if our catalog cache is stale.
+    return {"provider": {"max_price": dict(OR_MAX_PRICE_ZERO)}}
+
+
 def build_or(name: str):
+    _require_free(name)  # fail closed BEFORE importing/constructing anything
     from langchain_openai import ChatOpenAI
     return ChatOpenAI(model=name, api_key=or_key(), base_url="https://openrouter.ai/api/v1",
-                      streaming=True, temperature=0.4, timeout=60, max_retries=0)
+                      streaming=True, temperature=0.4, timeout=60, max_retries=0,
+                      extra_body=_or_extra_body())
 
 
 def plan(text: str):
