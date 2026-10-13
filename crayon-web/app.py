@@ -68,10 +68,25 @@ _models: dict = {}
 
 
 def model(name=None):
-    key = name or "_default"
-    if key not in _models:
-        _models[key] = llm.build_model(name=name) if name else llm.build_model()
-    return _models[key]
+    # Cache is bound to the ACTUAL constructor identity - provider, the model
+    # llm.resolve_model says will really be built (the OpenRouter branch ignores
+    # `name`), and an opaque credential fingerprint - so config flips, env model
+    # changes, and key rotation each force a rebuild instead of silently reusing
+    # a client from another backend/model/account generation. (A rotated-in
+    # client is built fresh; verification cannot retrofit an old client's policy.)
+    prov, resolved = llm.resolve_model(name)
+    key = f"{prov}|{resolved}|{llm.cred_fingerprint(prov)}"
+    entry = _models.get(key)
+    if entry is None:
+        client = llm.build_model(name=name) if name else llm.build_model()
+        _models[key] = (client, prov, resolved)
+        return client
+    client, bprov, bmodel = entry
+    if bprov == "openrouter":
+        # A cached client's price verification must not outlive the catalog
+        # metadata: re-verify (warm-cache cheap) or fail closed to the next step.
+        llm._require_free(bmodel)
+    return client
 
 
 def client_ip(req: Request) -> str:
@@ -191,7 +206,7 @@ async def chat(req: Request):
         active["n"] += 1
         try:
             used_model = None
-            steps = llm.plan(text) if llm.provider() == "gemini" else [("gemini", None, "default")]
+            steps = llm.plan(text) if llm.provider() == "gemini" else [(llm.provider(), None, "default")]
             last = None
             for kind, nm, lab in steps:
                 try:
@@ -211,6 +226,10 @@ async def chat(req: Request):
                 except Exception as e2:
                     last = e2
                     print("model fail:", kind, nm, type(e2).__name__)
+                    if kind == "or" or llm.provider() == "openrouter":
+                        # failed OR-routed call (plan label OR direct provider mode, incl. cached
+                        # clients from app.model): may mean catalog drift; re-verify next plan
+                        llm.invalidate_free_cache()
                     if out:
                         break
             if last is not None and not out:

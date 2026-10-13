@@ -52,6 +52,29 @@ def provider() -> str:
     return os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
 
 
+def resolve_model(name: str | None = None):
+    """The ACTUAL (provider, model) a build_model call will construct right now.
+    Single source of truth: the constructor, app.model's cache key, and the
+    price guard must all use THIS identity. Note the OpenRouter branch
+    intentionally ignores `name` (single-model bypass) - resolve_model encodes
+    that owning behavior instead of letting callers assume otherwise."""
+    p = provider()
+    if p == "openrouter":
+        return p, os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+    return p, (name or model_names()[0])
+
+
+def cred_fingerprint(p: str) -> str:
+    """Opaque generation marker for the active credential of provider p.
+    Lets caches rebuild on key rotation without ever logging the raw secret."""
+    import hashlib
+    if p == "openrouter":
+        cred = os.environ.get("OPENROUTER_API_KEY", "")
+    else:
+        cred = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+    return hashlib.sha256(cred.encode()).hexdigest()[:12] if cred else "none"
+
+
 def model_names():
     raw = os.environ.get("GEMINI_MODELS") or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
     names = [x.strip() for x in raw.split(",") if x.strip()]
@@ -64,12 +87,15 @@ def model_names():
 def build_model(streaming: bool = True, name: str | None = None):
     p = provider()
     if p == "openrouter":
-        from langchain_openai import ChatOpenAI
         key = os.environ.get("OPENROUTER_API_KEY")
         if not key:
             raise RuntimeError("OPENROUTER_API_KEY missing")
+        _, name = resolve_model(name)  # actual identity (this branch ignores the requested name)
+        _require_free(name)
+        from langchain_openai import ChatOpenAI
         return ChatOpenAI(
-            model=os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash"),
+            extra_body=_or_extra_body(),
+            model=name,
             api_key=key,
             base_url="https://openrouter.ai/api/v1",
             streaming=streaming,
@@ -81,8 +107,9 @@ def build_model(streaming: bool = True, name: str | None = None):
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY missing")
+    _, resolved = resolve_model(name)
     return ChatGoogleGenerativeAI(
-        model=name or model_names()[0],
+        model=resolved,
         google_api_key=key,
         temperature=0.6,
         timeout=60,
@@ -136,8 +163,12 @@ def chunk_text(chunk) -> str:
     return "".join(out)
 
 
-# ---- model router (free models only by default) ----
+# ---- model router (free models only, verified against the live catalog) ----
 import re as _re
+import json as _json
+import time as _time
+import urllib.request as _urlreq
+from decimal import Decimal as _Decimal
 
 CODE_HINT = _re.compile(r"\b(code|python|javascript|script|function|bug|debug|error|regex|sql|algorithm|api|class|compile|stack ?trace|"
                         r"calculate|math|equation|prove|proof|derive|optimi[sz]e|solve|integral|probability|big-?o|refactor)\b|\[Computer output\]", _re.I)
@@ -147,18 +178,147 @@ def or_key() -> str:
     return os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
+OR_CATALOG_URL = "https://openrouter.ai/api/v1/models"
+# Freshness policy: catalog metadata is a pre-filter, NOT a spend guarantee - a
+# warm cache can be stale in both directions (model went paid, or outage hides a
+# change). Execution-time max_price=0 (below) adds the five DOCUMENTED acceptance
+# filters (prompt/completion/image/audio/request) as a second layer; it is not a
+# zero-spend cap, other fee fields are catalog-prefilter-only, and live
+# paid-refusal is UNRUN. Cache TTL is 5 min.
+OR_CATALOG_TTL_S = 300
+# Execution-time price protection: passed as extra_body on every OpenRouter call.
+# Scope: the five documented acceptance filters only; not a total-spend cap.
+OR_MAX_PRICE_ZERO = {"prompt": "0", "completion": "0", "image": "0", "audio": "0", "request": "0"}
+# Pinned free defaults, verified zero-price in the live OpenRouter catalog on 2026-10-13.
+PINNED_FREE_CODE_MODELS = ["nvidia/nemotron-3-ultra-550b-a55b:free", "cohere/north-mini-code:free", "openrouter/free"]
+
+_FREE_CACHE = {"ts": 0.0, "ids": None}
+
+
+def invalidate_free_cache():
+    """Drop the cached catalog (e.g. after any OpenRouter call error)."""
+    _FREE_CACHE.update(ts=0.0, ids=None)
+
+
+def _dec_zero(v) -> bool:
+    """True only if v parses to a finite Decimal exactly equal to zero.
+    Numeric 0 and "0"/"0.0" pass; "1e-999" (float would underflow) fails;
+    NaN/Infinity/unparseable fail."""
+    if isinstance(v, bool):
+        return False
+    try:
+        d = _Decimal(str(v).strip())
+    except Exception:
+        return False
+    return d.is_finite() and d == 0
+
+
+# Keys inside tiered 'overrides' entries that are thresholds, not prices. Any
+# other key - including price fields we do not recognize yet - must be exactly
+# zero, so a new paid component fails closed instead of slipping through.
+_NON_PRICE_TIER_KEYS = {"min_prompt_tokens", "max_prompt_tokens", "min_completion_tokens", "max_completion_tokens"}
+
+
+def _pricing_is_zero(pr) -> bool:
+    """True only when pricing COMPLETELY verifies as free: the base prompt AND
+    completion prices must both be present and exactly zero, every other charge
+    component (request/image/audio fees, cache rates) must be exactly zero, and
+    any tiered 'overrides' must themselves carry present-and-zero base prices.
+    Missing base prices, absent/empty/unknown/unparseable pricing = NOT free:
+    threshold-only entries are not free, and token price zero is not total zero."""
+    if not isinstance(pr, dict) or not pr:
+        return False
+    for base in ("prompt", "completion"):
+        if base not in pr or not _dec_zero(pr[base]):
+            return False
+    for k, v in pr.items():
+        if k in ("prompt", "completion"):
+            continue
+        if k == "overrides":
+            if not isinstance(v, list) or not v or not all(_pricing_is_zero(t) for t in v):
+                return False
+            continue
+        if k in _NON_PRICE_TIER_KEYS:
+            continue
+        if not _dec_zero(v):
+            return False
+    return True
+
+
+def free_model_ids(force: bool = False):
+    """Ids whose FULL pricing verifies as exactly zero in the live OpenRouter
+    catalog, cached for OR_CATALOG_TTL_S. Returns None when the catalog cannot be
+    fetched or parsed - that means 'unverifiable', and callers must fail closed."""
+    now = _time.time()
+    if not force and _FREE_CACHE["ids"] is not None and now - _FREE_CACHE["ts"] < OR_CATALOG_TTL_S:
+        return _FREE_CACHE["ids"]
+    try:
+        req = _urlreq.Request(OR_CATALOG_URL, headers={"User-Agent": "crayon-free-check"})
+        with _urlreq.urlopen(req, timeout=10) as r:
+            # parse_float=Decimal: raw JSON numbers stay lossless, so a tiny
+            # numeric like 1e-999 cannot underflow to float 0.0 before the check.
+            data = _json.load(r, parse_float=_Decimal)
+        ids = set()
+        for m in data.get("data", []):
+            if m.get("id") and _pricing_is_zero(m.get("pricing")):
+                ids.add(m["id"])
+        _FREE_CACHE.update(ts=now, ids=ids)
+        return ids
+    except Exception:
+        return None
+
+
+def _require_free(name: str):
+    """Fail closed: only models verified zero-price in the live catalog may run."""
+    ids = free_model_ids()
+    if ids is None:
+        raise RuntimeError(
+            f"OpenRouter catalog unreachable; refusing unverifiable model {name!r} (free-only rule).")
+    if name not in ids:
+        raise RuntimeError(
+            f"OpenRouter model {name!r} is not zero-price in the live catalog (free-only rule); refusing to run it.")
+
+
 def code_models():
-    # DeepSeek is paid on OpenRouter; only used if CRAYON_DEEPSEEK_MODEL is set explicitly.
+    # Free-only, fail closed. Env-supplied models run only when the live OpenRouter
+    # catalog verifies them as zero-price; when the catalog is unreachable, NOTHING
+    # is returned (env entries AND pinned defaults are unverifiable then) and
+    # plan() falls back to the Gemini chain. CRAYON_DEEPSEEK_MODEL activates the moment a genuinely free
+    # DeepSeek is listed - as of 2026-10-13 the catalog has none, so a paid id
+    # here is refused, not run. Do NOT strip :free suffixes to force a match.
     ds = os.environ.get("CRAYON_DEEPSEEK_MODEL", "").strip()
-    raw = os.environ.get("CRAYON_CODE_MODELS", "nvidia/nemotron-3-ultra-550b-a55b:free,cohere/north-mini-code:free,openrouter/free")
-    names = ([ds] if ds else []) + [x.strip() for x in raw.split(",") if x.strip()]
-    return names
+    raw = os.environ.get("CRAYON_CODE_MODELS", "")
+    env_names = ([ds] if ds else []) + [x.strip() for x in raw.split(",") if x.strip()]
+    ids = free_model_ids()
+    names = []
+    if ids is not None:
+        names.extend(n for n in env_names if n in ids)
+        names.extend(n for n in PINNED_FREE_CODE_MODELS if n in ids)
+    # ids is None: catalog unverifiable -> return NOTHING. Pinned metadata is not
+    # a spend guarantee; plan() then falls back to the Gemini chain only, and any
+    # direct build_or call is refused by _require_free before construction.
+    seen = set()
+    out = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _or_extra_body():
+    # Execution-time layer: asks OpenRouter to accept only providers within
+    # max_price=0 for the five documented filter fields. Covers those fields
+    # only - not a zero-spend cap; live paid-refusal UNRUN.
+    return {"provider": {"max_price": dict(OR_MAX_PRICE_ZERO)}}
 
 
 def build_or(name: str):
+    _require_free(name)  # fail closed BEFORE importing/constructing anything
     from langchain_openai import ChatOpenAI
     return ChatOpenAI(model=name, api_key=or_key(), base_url="https://openrouter.ai/api/v1",
-                      streaming=True, temperature=0.4, timeout=60, max_retries=0)
+                      streaming=True, temperature=0.4, timeout=60, max_retries=0,
+                      extra_body=_or_extra_body())
 
 
 def plan(text: str):
