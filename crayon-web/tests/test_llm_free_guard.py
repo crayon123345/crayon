@@ -338,13 +338,14 @@ def test_app_model_cache_is_provider_aware(real_app, monkeypatch):
 
 
 def test_app_model_cached_or_client_reverified(real_app, monkeypatch):
-    """A cached OR client must not outlive its price verification."""
+    """A cached OR client must not outlive its price verification. The ACTUAL
+    model is what OPENROUTER_MODEL resolves to (requested name is ignored)."""
     monkeypatch.setattr(llm, "build_model", lambda streaming=True, name=None: object())
-    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"g"})
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"openrouter/free"})
     monkeypatch.setenv("LLM_PROVIDER", "openrouter")
-    real_app.model("g")  # cached under verified-free 'g'
+    real_app.model("g")  # cached; actual model openrouter/free verified free
 
-    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"openrouter/free"})  # 'g' went paid
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"g"})  # actual model went paid; alias free is irrelevant
     with pytest.raises(RuntimeError, match="not zero-price"):
         real_app.model("g")
 
@@ -385,3 +386,110 @@ def test_twilio_drift_scenario_real_app_model(real_app, monkeypatch):
     out = asyncio.run(twilio_wa.think([], "hi"))
     assert out == "gemini answer"
     assert built[-1] is not or_client and built[-1].prov == "gemini"  # fresh Gemini client, not the stale OR one
+
+
+# ---- round 7: actual constructor identity (real llm + stubbed ChatOpenAI) ----
+
+@pytest.fixture
+def stub_or_client(monkeypatch):
+    """Stub langchain_openai so the REAL build_model constructs a recorder."""
+    import types
+    captured = []
+    fake = types.ModuleType("langchain_openai")
+
+    class FakeChatOpenAI:
+        def __init__(self, **kw):
+            self.kw = kw
+            captured.append(kw)
+            self.model_name = kw.get("model")
+
+    fake.ChatOpenAI = FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "langchain_openai", fake)
+    return captured
+
+
+def test_resolve_model_or_ignores_requested_name(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+    assert llm.resolve_model("g") == ("openrouter", "openrouter/free")  # owning behavior: name ignored
+    monkeypatch.setenv("OPENROUTER_MODEL", "x/y:free")
+    assert llm.resolve_model("g") == ("openrouter", "x/y:free")
+    assert llm.resolve_model(None) == ("openrouter", "x/y:free")
+
+
+def test_resolve_model_gemini_honors_name(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    assert llm.resolve_model("g2") == ("gemini", "g2")
+    assert llm.resolve_model(None) == ("gemini", llm.model_names()[0])
+
+
+def test_removed_actual_model_blocked_alias_not_trusted(real_app, stub_or_client, monkeypatch):
+    """The reviewer's repro: requested 'g', but the real constructor builds
+    OPENROUTER_MODEL. The guard must verify the ACTUAL model, not the alias."""
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)  # actual = openrouter/free
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"openrouter/free"})
+
+    c1 = real_app.model("g")
+    assert stub_or_client[0]["model"] == "openrouter/free"      # constructed the real model
+    assert stub_or_client[0]["extra_body"]["provider"]["max_price"]["prompt"] == "0"
+    assert c1.model_name == "openrouter/free"
+
+    # catalog now lists ONLY the alias 'g' free; the actual model is gone
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"g"})
+    with pytest.raises(RuntimeError, match="not zero-price"):
+        real_app.model("g")  # must NOT return the stale free client under the alias check
+    assert len(stub_or_client) == 1  # nothing new constructed
+
+
+def test_or_env_model_change_forces_rebuild(real_app, stub_or_client, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"a/x:free", "b/y:free"})
+
+    monkeypatch.setenv("OPENROUTER_MODEL", "a/x:free")
+    c1 = real_app.model("g")   # explicit name, actual = a/x:free
+    monkeypatch.setenv("OPENROUTER_MODEL", "b/y:free")
+    c2 = real_app.model("g")   # same requested name, env changed -> must rebuild
+    assert c1 is not c2
+    assert stub_or_client[0]["model"] == "a/x:free"
+    assert stub_or_client[1]["model"] == "b/y:free"
+
+
+def test_credential_rotation_forces_rebuild(real_app, stub_or_client, monkeypatch):
+    """Key rotation under the same model must not silently reuse the old
+    account's client; the fingerprint must not expose the raw secret."""
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setattr(llm, "free_model_ids", lambda force=False: {"openrouter/free"})
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-key-AAAA")
+    c1 = real_app.model()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-key-BBBB")
+    c2 = real_app.model()
+    assert c1 is not c2
+    assert len(stub_or_client) == 2
+    fp = llm.cred_fingerprint("openrouter")
+    assert fp != "sk-key-BBBB" and "sk-key" not in fp and len(fp) == 12
+    for k in real_app._models:
+        assert "sk-key" not in k  # raw secret never in a cache key
+
+
+def test_gemini_credential_rotation_forces_rebuild(real_app, monkeypatch):
+    import types
+    captured = []
+    fake = types.ModuleType("langchain_google_genai")
+
+    class FakeGem:
+        def __init__(self, **kw): captured.append(kw); self.kw = kw
+
+    fake.ChatGoogleGenerativeAI = FakeGem
+    monkeypatch.setitem(sys.modules, "langchain_google_genai", fake)
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+
+    monkeypatch.setenv("GEMINI_API_KEY", "gm-key-1")
+    c1 = real_app.model()
+    monkeypatch.setenv("GEMINI_API_KEY", "gm-key-2")
+    c2 = real_app.model()
+    assert c1 is not c2 and len(captured) == 2
+    assert captured[0]["model"] == captured[1]["model"]  # same model, new generation

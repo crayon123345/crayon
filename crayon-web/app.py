@@ -68,13 +68,14 @@ _models: dict = {}
 
 
 def model(name=None):
-    # Cache is bound to the ACTUAL backend identity (provider + resolved model),
-    # not just the requested name: a config flip (gemini <-> openrouter) must
-    # never hand back a client built under the other backend.
-    prov = llm.provider()
-    resolved = name or (os.environ.get("OPENROUTER_MODEL", "openrouter/free") if prov == "openrouter"
-                        else llm.model_names()[0])
-    key = f"{prov}|{resolved}"
+    # Cache is bound to the ACTUAL constructor identity - provider, the model
+    # llm.resolve_model says will really be built (the OpenRouter branch ignores
+    # `name`), and an opaque credential fingerprint - so config flips, env model
+    # changes, and key rotation each force a rebuild instead of silently reusing
+    # a client from another backend/model/account generation. (A rotated-in
+    # client is built fresh; verification cannot retrofit an old client's policy.)
+    prov, resolved = llm.resolve_model(name)
+    key = f"{prov}|{resolved}|{llm.cred_fingerprint(prov)}"
     entry = _models.get(key)
     if entry is None:
         client = llm.build_model(name=name) if name else llm.build_model()

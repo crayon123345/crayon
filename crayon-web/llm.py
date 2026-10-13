@@ -52,6 +52,29 @@ def provider() -> str:
     return os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
 
 
+def resolve_model(name: str | None = None):
+    """The ACTUAL (provider, model) a build_model call will construct right now.
+    Single source of truth: the constructor, app.model's cache key, and the
+    price guard must all use THIS identity. Note the OpenRouter branch
+    intentionally ignores `name` (single-model bypass) - resolve_model encodes
+    that owning behavior instead of letting callers assume otherwise."""
+    p = provider()
+    if p == "openrouter":
+        return p, os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+    return p, (name or model_names()[0])
+
+
+def cred_fingerprint(p: str) -> str:
+    """Opaque generation marker for the active credential of provider p.
+    Lets caches rebuild on key rotation without ever logging the raw secret."""
+    import hashlib
+    if p == "openrouter":
+        cred = os.environ.get("OPENROUTER_API_KEY", "")
+    else:
+        cred = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+    return hashlib.sha256(cred.encode()).hexdigest()[:12] if cred else "none"
+
+
 def model_names():
     raw = os.environ.get("GEMINI_MODELS") or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
     names = [x.strip() for x in raw.split(",") if x.strip()]
@@ -67,7 +90,7 @@ def build_model(streaming: bool = True, name: str | None = None):
         key = os.environ.get("OPENROUTER_API_KEY")
         if not key:
             raise RuntimeError("OPENROUTER_API_KEY missing")
-        name = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+        _, name = resolve_model(name)  # actual identity (this branch ignores the requested name)
         _require_free(name)
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
@@ -84,8 +107,9 @@ def build_model(streaming: bool = True, name: str | None = None):
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY missing")
+    _, resolved = resolve_model(name)
     return ChatGoogleGenerativeAI(
-        model=name or model_names()[0],
+        model=resolved,
         google_api_key=key,
         temperature=0.6,
         timeout=60,
