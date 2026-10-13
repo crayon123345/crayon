@@ -198,3 +198,69 @@ def test_free_model_ids_network_error_returns_none(monkeypatch):
         raise OSError("down")
     monkeypatch.setattr(llm._urlreq, "urlopen", boom)
     assert llm.free_model_ids(force=True) is None
+
+
+# ---- round 4: complete-base-price admission, raw-JSON boundary, wired invalidation ----
+
+def test_incomplete_pricing_not_admitted():
+    # only a zero request fee, no base token prices -> not free
+    assert llm._pricing_is_zero({"request": "0"}) is False
+    # threshold-only entry -> not free
+    assert llm._pricing_is_zero({"min_prompt_tokens": 100}) is False
+    # tier present but no top-level base prices -> not free
+    assert llm._pricing_is_zero({"overrides": [{"prompt": "0", "completion": "0"}]}) is False
+    # tier missing its own base prices -> not free
+    assert llm._pricing_is_zero({"prompt": "0", "completion": "0",
+                                 "overrides": [{"min_prompt_tokens": 100, "request": "0"}]}) is False
+    # complete and zero -> free
+    assert llm._pricing_is_zero({"prompt": "0", "completion": "0", "request": "0",
+                                 "overrides": [{"min_prompt_tokens": 100, "prompt": "0", "completion": "0"}]}) is True
+
+
+def test_raw_json_numeric_boundary(monkeypatch):
+    """RAW JSON numbers, not strings: 1e-999 must survive transport as a nonzero
+    Decimal and be rejected; raw numeric 0 must be accepted."""
+    import io as _io
+    raw = b'{"data": [' \
+          b'{"id": "tiny/raw", "pricing": {"prompt": 1e-999, "completion": 0}}, ' \
+          b'{"id": "zero/raw", "pricing": {"prompt": 0, "completion": 0.0}}, ' \
+          b'{"id": "fee/raw", "pricing": {"prompt": 0, "completion": 0, "request": 0.02}}' \
+          b']}'
+
+    class FakeResp:
+        def __enter__(self): return _io.BytesIO(raw)
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(llm._urlreq, "urlopen", lambda req, timeout=10: FakeResp())
+    ids = llm.free_model_ids(force=True)
+    assert ids == {"zero/raw"}
+
+
+def test_twilio_or_failure_invalidates_cache(monkeypatch):
+    """Mirrors the review scenario: Twilio path, OpenRouter step fails, Gemini serves.
+    The error path must drop the catalog cache so the next plan re-verifies."""
+    import types
+    import asyncio
+
+    fake_app = types.ModuleType("app")
+
+    class FakeResp2:
+        content = "gemini answer"
+
+    class FakeGemini:
+        async def ainvoke(self, msgs): return FakeResp2()
+
+    fake_app.model = lambda nm=None: FakeGemini()
+    monkeypatch.setitem(sys.modules, "app", fake_app)
+
+    monkeypatch.setattr(llm, "plan", lambda text: [("or", "some/model:free", "m"), ("gemini", "g", "g")])
+    monkeypatch.setattr(llm, "to_messages", lambda h, t, m, a=False: [types.SimpleNamespace(content="sys")])
+    def boom(name):
+        raise RuntimeError("openrouter down")
+    monkeypatch.setattr(llm, "build_or", boom)
+    llm._FREE_CACHE.update(ts=llm._time.time(), ids={"some/model:free"})  # warm cache
+
+    import twilio_wa
+    out = asyncio.run(twilio_wa.think([], "hi"))
+    assert out == "gemini answer"
+    assert llm._FREE_CACHE["ids"] is None  # invalidated by the failing OR step

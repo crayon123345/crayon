@@ -194,13 +194,20 @@ _NON_PRICE_TIER_KEYS = {"min_prompt_tokens", "max_prompt_tokens", "min_completio
 
 
 def _pricing_is_zero(pr) -> bool:
-    """True only when pricing is a non-empty dict and EVERY charge component is
-    exactly zero - token prices, request/image/audio fees, cache rates, and any
-    tiered 'overrides'. Absent, empty, unknown, or unparseable pricing is NOT
-    free: token price zero is not total zero."""
+    """True only when pricing COMPLETELY verifies as free: the base prompt AND
+    completion prices must both be present and exactly zero, every other charge
+    component (request/image/audio fees, cache rates) must be exactly zero, and
+    any tiered 'overrides' must themselves carry present-and-zero base prices.
+    Missing base prices, absent/empty/unknown/unparseable pricing = NOT free:
+    threshold-only entries are not free, and token price zero is not total zero."""
     if not isinstance(pr, dict) or not pr:
         return False
+    for base in ("prompt", "completion"):
+        if base not in pr or not _dec_zero(pr[base]):
+            return False
     for k, v in pr.items():
+        if k in ("prompt", "completion"):
+            continue
         if k == "overrides":
             if not isinstance(v, list) or not v or not all(_pricing_is_zero(t) for t in v):
                 return False
@@ -222,7 +229,9 @@ def free_model_ids(force: bool = False):
     try:
         req = _urlreq.Request(OR_CATALOG_URL, headers={"User-Agent": "crayon-free-check"})
         with _urlreq.urlopen(req, timeout=10) as r:
-            data = _json.load(r)
+            # parse_float=Decimal: raw JSON numbers stay lossless, so a tiny
+            # numeric like 1e-999 cannot underflow to float 0.0 before the check.
+            data = _json.load(r, parse_float=_Decimal)
         ids = set()
         for m in data.get("data", []):
             if m.get("id") and _pricing_is_zero(m.get("pricing")):

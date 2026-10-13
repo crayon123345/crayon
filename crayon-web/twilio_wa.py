@@ -67,6 +67,8 @@ async def think(history, text):
             return llm.chunk_text(r) if not isinstance(r.content, str) else r.content
         except Exception as e:
             last = e
+            if kind == "or":
+                llm.invalidate_free_cache()  # re-verify catalog on next plan
     raise last
 
 

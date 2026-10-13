@@ -84,6 +84,8 @@ def register():
                     except Exception as e2:
                         last = e2
                         print("discord model fail:", type(e2).__name__)
+                        if kind == "or":
+                            llm.invalidate_free_cache()  # re-verify catalog on next plan
                         if out:
                             break
                 if last is not None and not out:

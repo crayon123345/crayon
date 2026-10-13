@@ -211,6 +211,8 @@ async def chat(req: Request):
                 except Exception as e2:
                     last = e2
                     print("model fail:", kind, nm, type(e2).__name__)
+                    if kind == "or":
+                        llm.invalidate_free_cache()  # a failed OR call may mean catalog drift; re-verify next plan
                     if out:
                         break
             if last is not None and not out:
