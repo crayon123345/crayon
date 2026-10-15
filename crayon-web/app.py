@@ -262,32 +262,59 @@ _scache: dict = {}
 _stcache: dict = {}
 
 
+# Free search engines fail independently and often (rate limits, engine outages):
+# on 2026-10-13 live probes found duckduckgo/bing text and duckduckgo/yahoo news
+# returning "No results found" while yahoo text and bing news answered. Trying a
+# short ordered chain per family keeps /api/search working when one engine is down.
+_SEARCH_TEXT_BACKENDS = ("auto", "yahoo")
+_SEARCH_NEWS_BACKENDS = ("auto", "bing")
+
+
 def _do_search(q: str):
     from concurrent.futures import ThreadPoolExecutor
     from ddgs import DDGS
 
+    # One attempt per backend keeps the worst case at len(chain) * timeout, the
+    # same order as the previous 2-retry single-backend version. An empty result
+    # moves to the next backend: engines return empty on soft failures, and a
+    # genuinely empty answer is cheap to re-ask of one more engine.
     def get_news():
-        for _ in range(2):
+        empty = False
+        for backend in _SEARCH_NEWS_BACKENDS:
             try:
-                return [{"title": str(r.get("title", ""))[:140], "url": str(r.get("url", ""))[:300], "snippet": str(r.get("body", ""))[:300], "date": str(r.get("date", ""))[:10]}
-                        for r in DDGS(timeout=8).news(q, max_results=6, safesearch="moderate")]
+                rows = [{"title": str(r.get("title", ""))[:140], "url": str(r.get("url", ""))[:300], "snippet": str(r.get("body", ""))[:300], "date": str(r.get("date", ""))[:10]}
+                        for r in DDGS(timeout=8).news(q, max_results=6, safesearch="moderate", backend=backend)]
+                # Filter first: rows the dedupe step would drop (non-http URLs)
+                # must count as empty so the chain still tries the next backend.
+                rows = [r for r in rows if r["url"].startswith(("http://", "https://"))]
+                if rows:
+                    return rows
+                empty = True
             except Exception as e:
-                print("search news error:", type(e).__name__)
-        return None
+                print("search news error:", type(e).__name__, backend)
+        return [] if empty else None
 
     def get_text():
-        for _ in range(2):
+        empty = False
+        for backend in _SEARCH_TEXT_BACKENDS:
             try:
-                return [{"title": str(r.get("title", ""))[:140], "url": str(r.get("href", ""))[:300], "snippet": str(r.get("body", ""))[:300], "date": ""}
-                        for r in DDGS(timeout=8).text(q, max_results=6, region="wt-wt", safesearch="moderate")]
+                rows = [{"title": str(r.get("title", ""))[:140], "url": str(r.get("href", ""))[:300], "snippet": str(r.get("body", ""))[:300], "date": ""}
+                        for r in DDGS(timeout=8).text(q, max_results=6, region="wt-wt", safesearch="moderate", backend=backend)]
+                # Same filter-first rule as get_news.
+                rows = [r for r in rows if r["url"].startswith(("http://", "https://"))]
+                if rows:
+                    return rows
+                empty = True
             except Exception as e:
-                print("search text error:", type(e).__name__)
-        return None
+                print("search text error:", type(e).__name__, backend)
+        return [] if empty else None
 
     with ThreadPoolExecutor(2) as ex:
         fn, ft = ex.submit(get_news), ex.submit(get_text)
         news, text = fn.result(), ft.result()
-    ok = news is not None and text is not None
+    # ok stays a cache-quality gate: True when at least one family answered
+    # (partial results are still useful; caching additionally requires >=3 rows).
+    ok = news is not None or text is not None
     news, text = news or [], text or []
     seen, res = set(), []
     for r in news[:5] + text + news[5:]:
