@@ -49,6 +49,23 @@ Design invariants:
    no state on reads; breaker state lives in the caller-owned
    models.CircuitBreaker.
 6. READ-ONLY, NOT MOUNTED: no network, no downloads, no action paths.
+
+VARIANT: make_retrying_support_fn adds two strictly-subtractive safety
+behaviors and one recall behavior, benchmarked on the v2 probe set
+(80 citation probes) with a local DeBERTa-v3-base NLI model:
+
+- RESTRICTION GUARD: a premise with a scope/quantity restriction the
+  claim omits can never verify. Motivation: measured false-verifies on
+  partial-entailment traps ("children under five" vs "children";
+  "twenty minutes from the beach" vs "near the beach") at EVERY usable
+  threshold on both xsmall and base models - no threshold keeps
+  false-verify at 0 there, so the fix is structural, not numeric.
+- SINGLE RETRY: one extra bounded pass over re-segmented content
+  (clauses, sentence pairs) before refusing, recovering claims whose
+  evidence is split across or buried inside sentences. The
+  MAX_NLI_PREMISES budget is shared across both passes.
+
+make_support_fn behavior is unchanged; the variant is opt-in.
 """
 
 import os
@@ -69,6 +86,52 @@ from models import (ModelsError, CapabilityUnavailable, ProviderConfig,
 
 MAX_NLI_PREMISES = 25
 
+# Scope/quantity restriction markers: a premise carrying one the claim omits
+# is the classic partial-entailment trap ("children under five" does NOT
+# support "children"; "twenty minutes from the beach" does NOT support
+# "near the beach"). A model score can never override an unrestricted
+# reading of a restricted premise. Used ONLY by the retrying variant.
+_RESTRICTION_MARKERS = frozenset({
+    "under", "over", "only", "except", "fewer", "below", "above",
+    "maximum", "minimum", "barely", "almost", "nearly",
+})
+_RESTRICTION_PHRASES = ("at least", "at most", "up to", "no more than",
+                        "less than", "more than")
+
+
+def _restriction_gap(premise_tokens, claim_tokens):
+    """True when the premise carries a restriction the claim omits."""
+    claim_set = set(claim_tokens)
+    for m in _RESTRICTION_MARKERS:
+        if m in premise_tokens and m not in claim_set:
+            return True
+    ptext = " ".join(premise_tokens)
+    ctext = " ".join(claim_tokens)
+    for ph in _RESTRICTION_PHRASES:
+        if ph in ptext and ph not in ctext:
+            return True
+    return False
+
+
+def _retry_variants(sentences):
+    """Re-segmented source for the single retry pass: comma/semicolon
+    clauses (evidence buried in a long sentence) and consecutive sentence
+    pairs (evidence split across two sentences). Same gate tokens."""
+    variants = []
+    for sent in sentences:
+        clause = []
+        for tok in sent:
+            if tok in (",", ";", ":") and clause:
+                variants.append(clause)
+                clause = []
+            else:
+                clause.append(tok)
+        if clause:
+            variants.append(clause)
+    for i in range(len(sentences) - 1):
+        variants.append(sentences[i] + sentences[i + 1])
+    return variants
+
 
 class FindSupportNliError(ModelsError):
     """Adapter wiring error: invalid arguments to make_support_fn."""
@@ -80,6 +143,66 @@ def _numeric_tokens(tokens):
 
 def _marks(tokens):
     return set(tokens) & (_NEG | _NEG_STEMS | _HEDGE)
+
+
+def _nli_scores(provider, premise_text, hypothesis_text):
+    """Module-level twin of the nested scorer in make_support_fn: same
+    backend call, same ModelsError wrapping, same strict validation."""
+    try:
+        raw = provider.nli(premise_text, hypothesis_text)
+    except CapabilityUnavailable:
+        raise
+    except ModelsError as exc:
+        raise CapabilityUnavailable("backend raised ModelsError: %s" % exc)
+    return _validate_nli_response(raw)
+
+
+def _validate_nli_response(raw):
+    """Contract-check one backend response; returns (entailment, contra)."""
+    if not isinstance(raw, dict):
+        raise CapabilityUnavailable("nli response must be a mapping")
+    score = raw.get("entailment")
+    if isinstance(score, bool) or not isinstance(score, (int, float)) \
+            or not (0.0 <= float(score) <= 1.0):
+        raise CapabilityUnavailable("nli response needs entailment in [0, 1]")
+    score = float(score)
+    contra = raw.get("contradiction")
+    if contra is not None:
+        if isinstance(contra, bool) or not isinstance(contra, (int, float)) \
+                or not (0.0 <= float(contra) <= 1.0):
+            raise CapabilityUnavailable(
+                "nli contradiction must be in [0, 1] when present")
+        contra = float(contra)
+    return score, contra
+
+
+def _scan(config, breaker, provider, threshold, hypothesis, claim_numbers,
+          claim_marks, premise_variants, scored, restriction_guard):
+    """One bounded pass over premise variants; returns (verdict, scored).
+    Never raises on backend failure - a bad answer is no answer."""
+    for sent_tokens in premise_variants:
+        if scored >= MAX_NLI_PREMISES:
+            break
+        if not sent_tokens:
+            continue
+        # Gate safeguards, reused - the model cannot override them.
+        if _marks(sent_tokens) != claim_marks:
+            continue
+        sent_token_set = set(sent_tokens)
+        if any(n not in sent_token_set for n in claim_numbers):
+            continue
+        if restriction_guard and _restriction_gap(sent_tokens, hypothesis.split()):
+            continue
+        scored += 1
+        premise = " ".join(sent_tokens)
+        pair = guarded_call(
+            config, breaker, provider, "nli",
+            lambda p=premise: _nli_scores(provider, p, hypothesis),
+            lambda: None)
+        if pair is not None and pair[0] >= threshold \
+                and not (pair[1] is not None and pair[1] >= threshold):
+            return True, scored
+    return False, scored
 
 
 def make_support_fn(config, breaker, provider, threshold=None):
@@ -172,5 +295,71 @@ def make_support_fn(config, breaker, provider, threshold=None):
                     and not (pair[1] is not None and pair[1] >= threshold):
                 return True
         return False
+
+    return support_fn
+
+
+def make_retrying_support_fn(config, breaker, provider, threshold=None):
+    """Variant of make_support_fn that retries ONCE with a re-segmented
+    source before refusing, and refuses restricted-premise matches.
+
+    Same constructor contract as make_support_fn. Differences:
+
+    1. RESTRICTION GUARD: a candidate premise carrying a scope/quantity
+       restriction marker the claim omits ("under", "only", "at least",
+       ...) is never a verification - the classic partial-entailment
+       trap ("children under five" does not support "children"). The
+       guard can only REMOVE model verdicts, never add one.
+    2. SINGLE RETRY: when the sentence-level pass finds no verdict, one
+       bounded second pass runs over re-segmented content - comma/
+       semicolon clauses (evidence buried in a long sentence) and
+       consecutive sentence pairs (evidence split across two
+       sentences). The MAX_NLI_PREMISES budget is SHARED across both
+       passes, so worst-case model use stays bounded.
+    3. FAIL-CLOSED UNCHANGED: backend failure in either pass is no
+       verdict; the deterministic base still answers first with zero
+       model calls.
+    """
+    if not isinstance(config, ProviderConfig):
+        raise FindSupportNliError("config must be a ProviderConfig")
+    if not isinstance(breaker, CircuitBreaker):
+        raise FindSupportNliError("breaker must be a CircuitBreaker")
+    if not callable(getattr(provider, "capabilities", None)) or \
+            not callable(getattr(provider, "nli", None)):
+        raise FindSupportNliError("provider must expose capabilities() and nli()")
+    if threshold is None:
+        threshold = config.nli_entailment_min
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) \
+            or not (0.0 <= float(threshold) <= 1.0):
+        raise FindSupportNliError("threshold must be a number in [0, 1]")
+    threshold = float(threshold)
+
+    def support_fn(claim_text, content):
+        if not isinstance(claim_text, str) or not isinstance(content, str):
+            return False
+        # 1. Deterministic base: verbatim quote evidence needs no model.
+        if reference_support(claim_text, content):
+            return True
+        # 2. Guarded semantic upgrade with restriction guard + one retry.
+        claim_tokens = _gate_tokens(claim_text)
+        if len(_evidence_tokens(claim_text)) < MIN_EVIDENCE_TOKENS:
+            return False
+        claim_numbers = _numeric_tokens(claim_tokens)
+        claim_marks = _marks(claim_tokens)
+        hypothesis = " ".join(claim_tokens)
+        if not hypothesis:
+            return False
+        sentences = _gate_sent_tokens(content)
+        verdict, scored = _scan(
+            config, breaker, provider, threshold, hypothesis,
+            claim_numbers, claim_marks, sentences, 0, True)
+        if verdict:
+            return True
+        # 3. Single retry over re-segmented content before refusing.
+        verdict, scored = _scan(
+            config, breaker, provider, threshold, hypothesis,
+            claim_numbers, claim_marks, _retry_variants(sentences),
+            scored, True)
+        return verdict
 
     return support_fn
