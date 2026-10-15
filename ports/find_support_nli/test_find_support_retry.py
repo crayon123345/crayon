@@ -149,3 +149,35 @@ class FailClosedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NumericMatchTests(unittest.TestCase):
+    def test_time_unit_conversion_recovers_paraphrase(self):
+        # "two hours" in the claim == "120 minutes" in the premise.
+        s = make_retry(lambda a, b: dict(HIGH))
+        self.assertTrue(s("the exam lasts two hours",
+                          "students have 120 minutes to finish the exam."))
+
+    def test_word_digit_equivalence(self):
+        s = make_retry(lambda a, b: dict(HIGH))
+        self.assertTrue(s("the exam lasts two hours",
+                          "the exam lasts 2 hours in the main hall."))
+
+    def test_quantity_mismatch_still_refuses(self):
+        # 120 minutes is NOT three hours - conversion is exact, never
+        # approximate, so a mismatched quantity refuses.
+        s = make_retry(lambda a, b: dict(HIGH))
+        self.assertFalse(s("the exam lasts three hours",
+                           "students have 120 minutes to finish the exam."))
+
+    def test_symbol_token_falls_back_to_exact_match(self):
+        s = make_retry(lambda a, b: dict(HIGH))
+        self.assertTrue(s("our rooms cost $200 a night",
+                          "our rooms run $200 a night including taxes."))
+        self.assertFalse(s("our rooms cost $300 a night",
+                           "our rooms run $200 a night including taxes."))
+
+    def test_unitless_claim_number_must_appear(self):
+        s = make_retry(lambda a, b: dict(HIGH))
+        self.assertFalse(s("the flight leaves at 7 pm",
+                           "the flight leaves at 9 pm from the north terminal."))
