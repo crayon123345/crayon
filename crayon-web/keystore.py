@@ -51,7 +51,8 @@ def page():
 @router.post("/setup/key")
 async def save(req: Request):
     tok = os.environ.get("SETUP_TOKEN", "")
-    if not tok or _tries["n"] > 20 or req.headers.get("x-requested-with") != "crayon":
+    # Cap is 20 attempts: check before incrementing admitted 21 (n=0..20).
+    if not tok or _tries["n"] >= 20 or req.headers.get("x-requested-with") != "crayon":
         return JSONResponse({"error": "no"}, status_code=403)
     _tries["n"] += 1
     try:
@@ -59,23 +60,31 @@ async def save(req: Request):
         t, k, nm = str(b.get("t", "")), str(b.get("k", "")).strip(), str(b.get("n", "OPENROUTER_API_KEY"))
     except Exception:
         return JSONResponse({"error": "bad"}, status_code=400)
-    if not hmac.compare_digest(t, tok) or nm not in ALLOWED or not ALLOWED[nm].match(k):
+    # compare_digest on str raises TypeError for non-ASCII; compare as UTF-8
+    # bytes so a unicode setup-token guess fails closed (403), never 500.
+    if not hmac.compare_digest(t.encode("utf-8"), tok.encode("utf-8")) or nm not in ALLOWED or not ALLOWED[nm].match(k):
         return JSONResponse({"error": "no"}, status_code=403)
-    _init()
-    enc = gmail_auth._fernet().encrypt(k.encode()).decode()
-    gmail_auth.db("DELETE FROM cw_secrets WHERE name=%s", (nm,))
-    gmail_auth.db("INSERT INTO cw_secrets (name, val) VALUES (%s, %s)", (nm, enc))
-    os.environ[nm] = k
     if nm == "NEON_DATABASE_URL":
+        # Validate BEFORE any mutation: a rejected repoint must not leave the
+        # new URL stored in cw_secrets / os.environ (partial-mutation fix).
         try:
             import psycopg
             psycopg.connect(k, connect_timeout=8).close()
-            gmail_auth._DB = k
-            gmail_auth._ready = False
-            gmail_auth.migrate_if_needed()
         except Exception as e:
             print("neon repoint rejected:", type(e).__name__)
             return JSONResponse({"error": "Could not connect to that Postgres URL."}, status_code=400)
+    _init()
+    enc = gmail_auth._fernet().encrypt(k.encode()).decode()
+    # One atomic upsert (single commit in gmail_auth.db): the old DELETE+INSERT
+    # pair committed separately, so an INSERT failure after DELETE lost the OLD
+    # secret. ON CONFLICT works on both Postgres and SQLite (name is the PK).
+    gmail_auth.db("INSERT INTO cw_secrets (name, val) VALUES (%s, %s) "
+                  "ON CONFLICT (name) DO UPDATE SET val=EXCLUDED.val", (nm, enc))
+    os.environ[nm] = k
+    if nm == "NEON_DATABASE_URL":
+        gmail_auth._DB = k
+        gmail_auth._ready = False
+        gmail_auth.migrate_if_needed()
     if nm == "TELEGRAM_BOT_TOKEN":
         try:
             import telegram_bot
