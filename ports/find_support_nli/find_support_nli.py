@@ -224,6 +224,42 @@ def _numeric_match(claim_tokens, sent_token_set, sent_tokens):
     return True
 
 
+_FREQ_WORDS = {"once": 1, "twice": 2, "thrice": 3}
+_TIME_TOKENS = frozenset(_TIME_UNITS) | {"pm", "am"}
+
+
+def _count_veto(claim_tokens, sent_tokens):
+    """Count/frequency mismatch veto (ut02 class): when the claim carries
+    a count expression ("once", "twice", a number before a noun) and the
+    premise carries an explicit DIFFERENT count directly before a noun
+    the claim shares ("two pills"), the premise cannot support the
+    claim - no model score overrides a count contradiction. Never a
+    verification by itself; veto-only, fail-closed. Aggregation cases
+    ("one tablet in the morning and one at night" == "twice a day")
+    have no single count-before-shared-noun in the premise, so they
+    fall through to the model untouched."""
+    claim_counts = [_FREQ_WORDS[t] for t in claim_tokens if t in _FREQ_WORDS]
+    for i, t in enumerate(claim_tokens[:-1]):
+        v = _parse_number(t)
+        if v is not None and claim_tokens[i + 1] not in _TIME_TOKENS:
+            claim_counts.append(v)
+    if not claim_counts:
+        return False
+    claim_nouns = {t[:-1] if t.endswith("s") and len(t) > 1 else t
+                   for t in claim_tokens
+                   if t.isalpha() and t not in _NUM_WORDS
+                   and t not in _FREQ_WORDS}
+    for j, t in enumerate(sent_tokens[:-1]):
+        v = _parse_number(t)
+        if v is None or sent_tokens[j + 1] in _TIME_TOKENS:
+            continue
+        nxt = sent_tokens[j + 1]
+        nxt = nxt[:-1] if nxt.endswith("s") and len(nxt) > 1 else nxt
+        if nxt in claim_nouns and any(c != v for c in claim_counts):
+            return True
+    return False
+
+
 def _nli_scores(provider, premise_text, hypothesis_text):
     """Module-level twin of the nested scorer in make_support_fn: same
     backend call, same ModelsError wrapping, same strict validation."""
@@ -273,6 +309,8 @@ def _scan(config, breaker, provider, threshold, hypothesis, claim_numbers,
                                   sent_tokens):
                 continue
             if _restriction_gap(sent_tokens, hypothesis.split()):
+                continue
+            if _count_veto(hypothesis.split(), sent_tokens):
                 continue
         elif any(n not in sent_token_set for n in claim_numbers):
             continue
