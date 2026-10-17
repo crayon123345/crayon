@@ -1,0 +1,2 @@
+-r ../../integrated/private/requirements.txt
+discord.py>=2.6,<3
