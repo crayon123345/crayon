@@ -156,7 +156,7 @@ def tick(out,only_user=None):
             if not claimed:continue
             try:
                 import cr_accounts
-                if cr_accounts.telegram_destination(uid) is None:
+                if not __import__('cr_discord').destination(uid) and cr_accounts.telegram_destination(uid) is None:
                     import cr_web_notifications as N
                     N.publish(uid,view(fresh),'work:'+str(item['id']))
                 else:out.send(item['chat_id'],view(fresh),markup=controls_markup(fresh))
