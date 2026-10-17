@@ -34,7 +34,7 @@ def tick(out=None, only_user=None):
             else:
                 text = "Reminder: " + r["text"] + late_note
             import cr_accounts
-            if cr_accounts.telegram_destination(r['user_id']) is None:
+            if not __import__('cr_discord').destination(r['user_id']) and cr_accounts.telegram_destination(r['user_id']) is None:
                 import cr_web_notifications as N
                 N.publish(r['user_id'],text,'reminder:'+str(r['id'])+':'+r['due_at'].isoformat())
             else:out.send(r['chat_id'],text)
