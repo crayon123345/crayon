@@ -462,7 +462,10 @@ def _handle_text(uid, chat_id, name, text, message_id, out):
 
 def handle_callback(cb, out):
     try:
-        api("answerCallbackQuery", callback_query_id=cb["id"])
+        if hasattr(out, 'acknowledge_callback'):
+            out.acknowledge_callback(cb["id"])
+        else:
+            api("answerCallbackQuery", callback_query_id=cb["id"])
     except Exception:
         pass
     data=cb.get("data","")

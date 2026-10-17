@@ -199,6 +199,7 @@ def delete_all(uid):
     __import__('cr_account_merge').delete_review_data(uid)
     for table in ("web_conversations", "web_notifications", "web_requests", "web_sessions", "web_login_codes", "web_action_reviews", "web_send_decisions", "channel_history", "web_google_identities", "web_google_reviews", "account_identities", "web_email_sessions", "web_email_reviews"):
         db.q("DELETE FROM " + table + " WHERE user_id=%s", (uid,), "none")
+    __import__('cr_discord').cleanup(uid)
     db.q("DELETE FROM users WHERE user_id=%s", (uid,), "none")  # first: blocks late background writes
     for t in ("facts", "messages", "notes", "reminders"):
         db.q(f"DELETE FROM {t} WHERE user_id=%s", (uid,), "none")

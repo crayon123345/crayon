@@ -16,7 +16,7 @@ def set_option(uid, chat_id, key, value):
     s = settings(uid)
     s[key] = value
     s["chat_id"] = chat_id
-    s["delivery"] = "telegram"
+    s["delivery"] = "discord" if __import__("cr_channel").channel.get()=="discord" else "telegram"
     db.q("UPDATE users SET settings=%s::jsonb WHERE user_id=%s", (json.dumps(s), uid), "none")
     return settings(uid).get(key) == value
 

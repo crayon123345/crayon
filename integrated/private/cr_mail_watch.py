@@ -15,7 +15,7 @@ def status(uid):
     return ('Email checks: '+('paused' if state.get('paused') else 'on')+'\nAccount: '+str(state.get('email','unknown'))+'\nLast check/configuration (UTC): '+when+'\nHourly during awake hours, metadata and bounded snippets only. Host timing is best-effort. No email sent or calendar changed. A timestamp alone does not prove a notification was delivered.')
 def configure(uid,chat,on):
     if type(uid) is not int or uid<=0:raise G.GoogleError('A valid authenticated account is required.')
-    if on and (uid!=chat or uid>=10**15):raise G.GoogleError('Enable email checks from your own private Telegram chat. Browser-only background delivery is not enabled.')
+    if on and (uid!=chat or (uid>=10**15 and not __import__('cr_discord').destination(uid))):raise G.GoogleError('Enable email checks from your own private Telegram chat. Browser-only background delivery is not enabled.')
     if not on:db.kv_set(KEY(uid),None);return 'Email checks off.'
     row=G.status(uid)
     if not row:raise G.GoogleError('Connect Google first.')
